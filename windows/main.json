@@ -1,0 +1,56 @@
+{
+  "layout": "stack",
+  "regions": [
+    {
+      "id": "status",
+      "widgets": [
+        { "type": "markdown", "value": "## Knowledgeable Connector" },
+        {
+          "type": "auth_status",
+          "bind": "GET /api/apps/knowledgeable/status",
+          "logout_action": { "call": "POST /api/apps/knowledgeable/logout" },
+          "loading_text": "Checking service secret…",
+          "logged_in_text": "Secret saved — 6 tools live on aw-gateway as aw__aw_knowledgeable__* against {base_url}.",
+          "logged_out_text": "No service secret yet. The tools are registered and will tell any agent that calls them to come here."
+        }
+      ]
+    },
+    {
+      "id": "setup",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "### Setup\nBase URL is a plain config field, edited from this app's own Settings gear (defaults to `http://aw-knowledgeable:8090` — a container **name**, never an IP, so it only resolves once aw-knowledgeable's compose service declares a matching alias).\n\nThe secret below must equal aw-knowledgeable's own `KNOWLEDGEABLE_SERVICE_SECRET` — that service maps it 1:1 to one `KNOWLEDGEABLE_SERVICE_TENANT_ID`, never to a caller-supplied header."
+        },
+        {
+          "type": "form",
+          "id": "knowledgeable_settings",
+          "submit": { "call": "POST /api/apps/knowledgeable/settings" },
+          "submit_label": "Save",
+          "fields": [
+            {
+              "key": "service_secret",
+              "label": "Service secret",
+              "input": "password",
+              "description": "Stored in the workspace secret store. Takes effect on the next tool call — no restart."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "### Verify\nA saved secret is not a working one — wrong value, wrong tenant mapping on the aw-knowledgeable side, or a DNS name that does not resolve from this container all look identical until something calls out. This calls `list_documents` for real."
+        },
+        {
+          "type": "button",
+          "label": "Test the connection",
+          "action": { "call": "POST /api/apps/knowledgeable/test" }
+        }
+      ]
+    }
+  ]
+}

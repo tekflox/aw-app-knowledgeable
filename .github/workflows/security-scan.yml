@@ -1,0 +1,85 @@
+name: Security scan
+
+# Free SAST + SCA + Secrets pilot (Semgrep + Trivy + Gitleaks), same shape as
+# every other aw-app-* repo's pilot (see aw-app-google-maps). Runs on its own
+# weekly cron (staggered per repo to avoid all 50+ repos hammering the 4
+# shared self-hosted runners at once) rather than on every push. Additive
+# only: does not touch release.yml. Report-only — continue-on-error on every
+# scan step, findings surface in Security > Code scanning, nothing fails the
+# build.
+
+on:
+  schedule:
+    - cron: "12 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    runs-on: [self-hosted, aw-baremetal]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run Semgrep (SAST)
+        continue-on-error: true
+        run: |
+          semgrep scan --config p/security-audit --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif .
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  trivy:
+    runs-on: [self-hosted, aw-baremetal]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run Trivy (SCA + secrets + IaC/Dockerfile misconfig)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  gitleaks:
+    runs-on: [self-hosted, aw-baremetal]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install Gitleaks
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) GL_ARCH=x64 ;;
+            aarch64) GL_ARCH=arm64 ;;
+            *) GL_ARCH="$ARCH" ;;
+          esac
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+            | tar -xz gitleaks
+      - name: Run Gitleaks (secrets in git history)
+        run: ./gitleaks detect --source . --report-format sarif --report-path gitleaks.sarif -v || true
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
