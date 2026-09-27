@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "knowledgeable",
   "name": "Knowledgeable Connector",
-  "version": "0.1.0",
-  "description": "Ingestion MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service — 6 tools mapped 1:1 onto its M6 API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes. This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md §10 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
+  "version": "0.2.0",
+  "description": "Ingestion MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 6 tools mapped 1:1 onto its M6 API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes. This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
   "icon": "share-2",
   "tier": "inprocess",
   "requires_ui_refresh": true,
@@ -68,14 +68,14 @@
         "type": "string",
         "default": "http://aw-knowledgeable:8090",
         "title": "aw-knowledgeable base URL",
-        "description": "Reached by container NAME on aw-stack-net, never an IP (docs/design/aw-knowledgeable-infra.md §10, D2 Q2). aw-host sits on aw-stack's own Docker network, so this resolves from inside aw-app-mcp-gateway as long as the aw-knowledgeable compose service declares an explicit container_name/alias matching this host."
+        "description": "Reached by container NAME on aw-stack-net, never an IP (docs/design/aw-knowledgeable-infra.md \u00a710, D2 Q2). aw-host sits on aw-stack's own Docker network, so this resolves from inside aw-app-mcp-gateway as long as the aw-knowledgeable compose service declares an explicit container_name/alias matching this host."
       },
       "service_secret": {
         "type": "string",
         "x-secret": true,
         "default": "",
         "title": "Service secret",
-        "description": "The X-Internal-Secret this connector authenticates every call with. Must equal aw-knowledgeable's own KNOWLEDGEABLE_SERVICE_SECRET, which that service maps 1:1 to one KNOWLEDGEABLE_SERVICE_TENANT_ID — never a caller-supplied header (D2 §Q3). Stored in the workspace secret store, read fresh on every tool call so a rotated secret needs no restart."
+        "description": "The X-Internal-Secret this connector authenticates every call with. Must equal aw-knowledgeable's own KNOWLEDGEABLE_SERVICE_SECRET, which that service maps 1:1 to one KNOWLEDGEABLE_SERVICE_TENANT_ID \u2014 never a caller-supplied header (D2 \u00a7Q3). Stored in the workspace secret store, read fresh on every tool call so a rotated secret needs no restart."
       }
     },
     "required": []
