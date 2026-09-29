@@ -74,11 +74,11 @@ def _fresh_fake_client(monkeypatch):
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: "")
 
 
-def test_all_six_tools_are_advertised_and_dispatchable():
+def test_all_seven_tools_are_advertised_and_dispatchable():
     names = {t["name"] for t in client.TOOLS_SCHEMA}
     assert names == {
         "upload_document", "create_node", "create_link",
-        "get_graph", "list_documents", "search_nodes",
+        "get_graph", "list_documents", "search_nodes", "search_graph",
     }
     assert names == set(http_handler._DISPATCH)
 
@@ -174,6 +174,47 @@ def test_search_nodes_builds_bounded_query_params():
     assert call["params"] == {"q": "sushi", "exclude": "doc-1", "limit": 5}
 
 
+def test_search_graph_defaults_mode_to_tree():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [], "mode": "tree"}))
+    _run(client.search_graph({"q": "sushi"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"q": "sushi", "mode": "tree"}
+
+
+def test_search_graph_coerces_types_and_joins_related_vias():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({
+        "q": "sushi", "mode": "tree", "limit": "10", "beam_width": "5",
+        "min_score": "0.5", "related_vias": ["topic", "entity"], "bucket": "recipes",
+    }))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {
+        "q": "sushi", "mode": "tree", "limit": 10, "beam_width": 5,
+        "min_score": 0.5, "related_vias": "topic,entity", "bucket": "recipes",
+    }
+
+
+def test_search_graph_only_forwards_known_fields():
+    """Same rule as create_node — a gateway-injected extra key must never
+    reach the outbound query params (D2 risk 4)."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({"q": "sushi", "_gateway_caller_run_id": "run-xyz"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"q": "sushi", "mode": "tree"}
+
+
+def test_search_graph_surfaces_backend_400_verbatim():
+    """§5/§12's declared-contract rule: the backend's validation matrix is the
+    one source of truth for knob×mode mismatches — this tool must not
+    pre-validate and must not swallow the detail."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(
+        400, {"detail": "beam_width is only valid with mode=tree"},
+    ))
+    text, is_error = _run(client.search_graph({"q": "sushi", "mode": "lexical", "beam_width": "5"}))
+    assert is_error is True
+    assert "beam_width is only valid with mode=tree" in text
+
+
 def test_upload_document_requires_filename_and_content():
     text, is_error = _run(client.upload_document({}))
     assert is_error is True and "filename is required" in text
@@ -217,7 +258,7 @@ def test_initialize_and_tools_list():
     init = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
     assert init["result"]["serverInfo"]["name"] == "aw-knowledgeable"
     listed = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-    assert len(listed["result"]["tools"]) == 6
+    assert len(listed["result"]["tools"]) == 7
 
 
 def test_initialized_notification_gets_no_response():

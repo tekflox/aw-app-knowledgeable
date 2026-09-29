@@ -196,6 +196,48 @@ async def search_nodes(args: dict) -> tuple[str, bool]:
     return _as_text(data), False
 
 
+async def search_graph(args: dict) -> tuple[str, bool]:
+    """GET /api/search with the §12 (docs/design/aw-knowledgeable-v2-retrieval.md)
+    retrieval knobs — lexical/semantic/tree, beam_width, min_score,
+    related_vias, bucket. Distinct from ``search_nodes``, which stays
+    lexical-only for the link picker (§6.4) and never grows these knobs.
+
+    Types are coerced field-by-field here; knob×mode semantics are the
+    backend's own validation matrix (§12) — a 400 from there reaches the
+    caller verbatim via ``_describe_error``, never re-validated here, so
+    there is exactly one source of truth for what is a valid combination.
+    """
+    q = args.get("q") or ""
+    params: dict = {"q": q, "mode": args.get("mode") or "tree"}
+    if args.get("limit") is not None:
+        try:
+            params["limit"] = int(args["limit"])
+        except (TypeError, ValueError):
+            pass
+    if args.get("beam_width") is not None:
+        try:
+            params["beam_width"] = int(args["beam_width"])
+        except (TypeError, ValueError):
+            pass
+    if args.get("min_score") is not None:
+        try:
+            params["min_score"] = float(args["min_score"])
+        except (TypeError, ValueError):
+            pass
+    related_vias = args.get("related_vias")
+    if related_vias:
+        if isinstance(related_vias, str):
+            params["related_vias"] = related_vias
+        else:
+            params["related_vias"] = ",".join(str(v) for v in related_vias)
+    if args.get("bucket"):
+        params["bucket"] = args["bucket"]
+    data, err = await _get("/api/search", params)
+    if err:
+        return f"search_graph failed: {err}", True
+    return _as_text(data), False
+
+
 def _as_text(data) -> str:
     import json
 
@@ -281,6 +323,77 @@ TOOLS_SCHEMA = [
                 "q": {"type": "string", "description": "Substring to search for in node labels."},
                 "exclude": {"type": "string", "description": "Optional node id to exclude from results (e.g. the node you're linking from)."},
                 "limit": {"type": "integer", "description": "Max results. Default 20."},
+            },
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "search_graph",
+        "description": (
+            "Retrieval search over the knowledge graph — lexical, semantic (vector "
+            "similarity), or tree (beam-descend the bucket's topic tree). Unlike "
+            "search_nodes (name matching for the link picker), this tool defaults "
+            "to mode=tree because it is for knowledge retrieval, not label lookup. "
+            "The response envelope echoes the params that actually ran, plus "
+            "strategy/not_applied/dropped_below_min_score — a knob the chosen mode "
+            "can't honour is either a 400 (the knob does not exist for this mode "
+            "or is out of range) or declared in the envelope (the request was valid "
+            "but the world couldn't honour it, e.g. a bucket with no tree falling "
+            "back to flat search). Always read the envelope; never assume the knob "
+            "you set is the knob that ran."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {
+                    "type": "string",
+                    "description": "Query text. Required for every mode — semantic and tree embed it; lexical substring-matches it against node labels.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["lexical", "semantic", "tree"],
+                    "description": (
+                        "Retrieval algorithm. 'lexical': case-insensitive substring match on node "
+                        "labels. 'semantic': embed q and vector-search with a tenant/bucket filter. "
+                        "'tree': beam-descend the bucket's topic tree, reporting topic_path per "
+                        "result (falls back to flat semantic search if the bucket has no tree yet — "
+                        "declared as strategy='flat' in the response, not silent). Default 'tree'."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results. Range 1-100 (backend-validated). Default 20.",
+                },
+                "beam_width": {
+                    "type": "integer",
+                    "description": (
+                        "mode=tree only — rejected with 400 on any other mode. How many branches "
+                        "survive each descent level. Range 1-10. Omit to use the server's configured "
+                        "default (TOPIC_SEARCH_BEAM_WIDTH, 3)."
+                    ),
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": (
+                        "mode=semantic or mode=tree only — rejected with 400 on mode=lexical. Drop "
+                        "results below this cosine score, applied AFTER the top-`limit` results are "
+                        "already chosen. Range 0.0-1.0. The response declares how many were dropped "
+                        "as dropped_below_min_score."
+                    ),
+                },
+                "related_vias": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["topic", "embedding", "entity"]},
+                    "description": (
+                        "mode=semantic or mode=tree only — rejected with 400 on mode=lexical. For "
+                        "each result's document, attach its RELATED_TO neighbours restricted to "
+                        "these edge kinds, returned as `related` in the response."
+                    ),
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to scope this search to. Omit to use the connector's default bucket.",
+                },
             },
             "required": ["q"],
         },

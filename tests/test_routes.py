@@ -87,7 +87,7 @@ def test_mcp_post_tools_list(app_client):
     resp = tc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert resp.status_code == 200
     tools = resp.json()["result"]["tools"]
-    assert len(tools) == 6
+    assert len(tools) == 7
 
 
 def test_mcp_json_endpoint(app_client):

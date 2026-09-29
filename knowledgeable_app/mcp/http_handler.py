@@ -25,6 +25,7 @@ _DISPATCH = {
     "get_graph": client.get_graph,
     "list_documents": client.list_documents,
     "search_nodes": client.search_nodes,
+    "search_graph": client.search_graph,
 }
 
 _NO_SECRET = (

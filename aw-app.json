@@ -3,7 +3,7 @@
   "id": "knowledgeable",
   "name": "Knowledgeable Connector",
   "version": "0.2.0",
-  "description": "Ingestion MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 6 tools mapped 1:1 onto its M6 API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes. This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
+  "description": "Ingestion + retrieval MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 7 tools mapped onto its API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes (lexical name matching, for the link picker), search_graph (lexical/semantic/tree retrieval with the \u00a712 knobs \u2014 beam_width, min_score, related_vias, bucket). This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
   "icon": "share-2",
   "tier": "inprocess",
   "requires_ui_refresh": true,
@@ -57,7 +57,8 @@
         "create_link",
         "get_graph",
         "list_documents",
-        "search_nodes"
+        "search_nodes",
+        "search_graph"
       ]
     }
   },
