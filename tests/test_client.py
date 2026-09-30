@@ -241,6 +241,32 @@ def test_upload_document_sends_real_multipart_bytes():
     assert call["files"]["file"] == ("notes.pdf", raw)
 
 
+def test_push_playground_key_sends_the_value_and_secret_header():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"ok": True, "configured": True}))
+    ok, err = _run(client.push_playground_key("apmt-scoped-key"))
+    assert ok is True
+    assert err is None
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/playground/key"
+    assert call["json"] == {"api_key": "apmt-scoped-key"}
+    assert call["headers"] == {"X-Internal-Secret": "s3cr3t"}
+
+
+def test_push_playground_key_reports_a_backend_refusal():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(401, {"detail": "unauthorized"}))
+    ok, err = _run(client.push_playground_key("apmt-scoped-key"))
+    assert ok is False
+    assert "unauthorized" in err
+
+
+def test_push_playground_key_reports_an_ok_false_body_as_failure():
+    """A 200 whose body says `{"ok": false}` must not read as success — the
+    only thing this function's caller checks before logging "re-asserted"."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"ok": False}))
+    ok, err = _run(client.push_playground_key("apmt-scoped-key"))
+    assert ok is False
+
+
 def test_unreachable_host_is_a_tool_error_not_a_crash(monkeypatch):
     class _Boom(_FakeAsyncClient):
         async def get(self, *a, **k):

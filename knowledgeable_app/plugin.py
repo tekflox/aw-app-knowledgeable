@@ -10,10 +10,12 @@ connector at a different aw-knowledgeable deployment is also restart-free.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import suppress
 
-from . import mcp_config, routes as routes_mod
+from . import mcp_config, playground_key_push, routes as routes_mod
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable")
@@ -36,13 +38,26 @@ class KnowledgeableAppPlugin:
         # workspace container is recreated.
         doc = mcp_config.write_mcp_json(ctx.package_dir, port)
 
+        # Card 3ea5bf3b: re-assert the Playground's ap-mt key into production
+        # aw-knowledgeable on a loop, starting now (the boot re-assert) —
+        # see playground_key_push.py's module docstring for why this has to
+        # be a loop rather than a push at install time only.
+        self._playground_key_task = asyncio.create_task(playground_key_push.run_forever())
+
         log.info(
-            "aw-app-knowledgeable activated: mcp server=%s, tools=%s, base_url=%s, secret=%s",
+            "aw-app-knowledgeable activated: mcp server=%s, tools=%s, base_url=%s, secret=%s, "
+            "playground-key re-assert every %ss",
             sorted(doc["mcpServers"]),
             len(client.TOOLS_SCHEMA),
             client.base_url(),
             "saved" if client.configured() else "NOT SET (tools will explain how)",
+            playground_key_push.PUSH_INTERVAL_S,
         )
 
     async def deactivate(self) -> None:
+        task = getattr(self, "_playground_key_task", None)
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         log.info("aw-app-knowledgeable deactivated")
