@@ -203,6 +203,24 @@ def test_search_graph_only_forwards_known_fields():
     assert call["params"] == {"q": "sushi", "mode": "tree"}
 
 
+def test_search_graph_forwards_include_traversal():
+    """§12 traversal provenance
+    (docs/design/aw-knowledgeable-v2-retrieval.md §12, card
+    feature:aw-knowledgeable-retrieval-traversal-provenance) — plain
+    passthrough, default false so an agent pays for it only when it asks."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({"q": "sushi", "mode": "tree", "include_traversal": True}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"q": "sushi", "mode": "tree", "include_traversal": True}
+
+
+def test_search_graph_omits_include_traversal_when_absent():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({"q": "sushi"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert "include_traversal" not in call["params"]
+
+
 def test_search_graph_surfaces_backend_400_verbatim():
     """§5/§12's declared-contract rule: the backend's validation matrix is the
     one source of truth for knob×mode mismatches — this tool must not

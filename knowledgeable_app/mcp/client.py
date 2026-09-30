@@ -249,6 +249,8 @@ async def search_graph(args: dict) -> tuple[str, bool]:
             params["related_vias"] = ",".join(str(v) for v in related_vias)
     if args.get("bucket"):
         params["bucket"] = args["bucket"]
+    if args.get("include_traversal") is not None:
+        params["include_traversal"] = bool(args["include_traversal"])
     data, err = await _get("/api/search", params)
     if err:
         return f"search_graph failed: {err}", True
@@ -410,6 +412,19 @@ TOOLS_SCHEMA = [
                 "bucket": {
                     "type": "string",
                     "description": "Knowledge bucket to scope this search to. Omit to use the connector's default bucket.",
+                },
+                "include_traversal": {
+                    "type": "boolean",
+                    "description": (
+                        "mode=semantic or mode=tree only — rejected with 400 on mode=lexical. "
+                        "Attach `traversal` to the response: on mode=tree with a real tree, "
+                        "kind='beam_descent' with the levels the beam actually walked (which "
+                        "topics survived each descent, which were pruned and why, plus the "
+                        "final chunk re-score); otherwise kind='flat' with a reason. Emitted by "
+                        "the backend that actually walked the graph, never reconstructed. "
+                        "Default false — this costs tokens, so ask only when you need to explain "
+                        "how a result was found, not just what it is."
+                    ),
                 },
             },
             "required": ["q"],
