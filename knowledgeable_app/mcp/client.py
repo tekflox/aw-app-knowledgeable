@@ -148,6 +148,28 @@ async def push_playground_key(value: str) -> tuple[bool, str | None]:
     return bool(data and data.get("ok")), None
 
 
+async def push_ingest_key(value: str) -> tuple[bool, str | None]:
+    """POST /api/ingest/key — hand production the extractor's ap-mt ApiKey,
+    over the same ``X-Internal-Secret`` channel every other call in this
+    module already uses.
+
+    The twin of ``push_playground_key`` (card 3ec5bf3b): same shape, same
+    channel, different endpoint and different credential — the extractor and
+    the Playground reach different ap-mt agents, so one may be revoked,
+    rotated or scoped differently without touching the other. Not one of
+    ``TOOLS_SCHEMA`` below, for the same reason ``push_playground_key`` isn't:
+    this is the connector's own re-assertion path
+    (``ingest_key_push.py``), called from a background loop rather than from
+    a tool call. Returns ``(True, None)`` on success, ``(False,
+    <description>)`` otherwise — the caller logs the value never echoed here
+    and by ``_describe_error``.
+    """
+    data, err = await _post_json("/api/ingest/key", {"api_key": value})
+    if err:
+        return False, err
+    return bool(data and data.get("ok")), None
+
+
 async def create_node(args: dict) -> tuple[str, bool]:
     label = (args.get("label") or "").strip()
     node_type = (args.get("type") or "").strip()
