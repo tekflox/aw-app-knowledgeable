@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "knowledgeable",
   "name": "Knowledgeable Connector",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Ingestion + retrieval MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 7 tools mapped onto its API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes (lexical name matching, for the link picker), search_graph (lexical/semantic/tree retrieval with the \u00a712 knobs \u2014 beam_width, min_score, related_vias, bucket). This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
   "icon": "share-2",
   "tier": "inprocess",
@@ -67,12 +67,14 @@
     },
     "tasks": [
       {
-        "name": "KB bulk-ingest — tick",
+        "name": "KB bulk-ingest \u2014 tick",
         "type": "agentic_output",
         "command": "aw-workspace-cli knowledgeable-ingest run --max-uploads 200",
-        "notify_exit_codes": [1],
+        "notify_exit_codes": [
+          1
+        ],
         "agent_slug": "coder-sonnet",
-        "prompt": "The `KB bulk-ingest — tick` task (docs/design/aw-knowledgeable-v2-retrieval.md §13) just exited non-zero. Run `aw-workspace-cli knowledgeable-ingest status` and read the command's own stderr above to tell which case this is: (1) the §13.5.2 ignition guard blocked it because entity extraction is claiming — expected and fine, do not re-enable or disable anything, just note it; (2) a real HTTP/transport failure reaching aw-knowledgeable; (3) a batch of upload failures piling up in the journal. Report which one, and only open a blocker if it's (2) or (3) and looks ongoing rather than a single transient blip. Never run `aw-workspace-cli restart core` or touch `EXTRACTION_ENABLED`.",
+        "prompt": "The `KB bulk-ingest \u2014 tick` task (docs/design/aw-knowledgeable-v2-retrieval.md \u00a713) just exited non-zero. Run `aw-workspace-cli knowledgeable-ingest status` and read the command's own stderr above to tell which case this is: (1) the \u00a713.5.2 ignition guard blocked it because entity extraction is claiming \u2014 expected and fine, do not re-enable or disable anything, just note it; (2) a real HTTP/transport failure reaching aw-knowledgeable; (3) a batch of upload failures piling up in the journal. Report which one, and only open a blocker if it's (2) or (3) and looks ongoing rather than a single transient blip. Never run `aw-workspace-cli restart core` or touch `EXTRACTION_ENABLED`.",
         "reuse_session": false,
         "schedules": [
           {
