@@ -264,6 +264,19 @@ def _pending_counts_by_bucket(conn: sqlite3.Connection) -> dict[str, int]:
     return {row["bucket"]: row["n"] for row in rows}
 
 
+async def _ensure_buckets() -> str | None:
+    """§13.1 — ``POST /api/buckets`` before the first upload into any of the
+    four. Idempotent across ticks (``client.create_bucket`` treats a 409 as
+    steady state, not a failure) — cheap enough to just call every tick
+    rather than tracking "did I already do this" as separate state that
+    could drift from the server's own registry."""
+    for bucket, _subtree in BUCKET_ORDER:
+        _data, err = await client.create_bucket(bucket)
+        if err:
+            return f"could not ensure bucket {bucket!r} exists: {err}"
+    return None
+
+
 async def run_tick(max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
     """One bounded tick — the only entrypoint either door (CLI `run`, the
     contributed scheduled task) ever calls. Enforces §13.5's three
@@ -282,6 +295,19 @@ async def run_tick(max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
                 "deduplicated": 0,
                 "failed": 0,
                 "note": "nothing pending — run scan() first, or the pass is already complete",
+            }
+
+        # §13.1 — the buckets must exist before anything else touches them
+        # (GET /api/ingest/status?bucket=... 404s on an unregistered bucket
+        # exactly like POST /api/documents would).
+        bucket_err = await _ensure_buckets()
+        if bucket_err:
+            return {
+                "blocked": True,
+                "reason": bucket_err,
+                "uploaded": 0,
+                "deduplicated": 0,
+                "failed": 0,
             }
 
         # §13.5.2 — the ignition guard, checked BEFORE any upload. `claiming`

@@ -55,9 +55,17 @@ class _FakeAsyncClient:
         _FakeAsyncClient._CALLS.append({"method": "GET", "url": url, "params": params, "headers": headers})
         return _FakeAsyncClient._QUEUE.pop(0)
 
-    async def post(self, url, json=None, headers=None, files=None):
+    async def post(self, url, json=None, headers=None, files=None, params=None, data=None):
         _FakeAsyncClient._CALLS.append(
-            {"method": "POST", "url": url, "json": json, "headers": headers, "files": files}
+            {
+                "method": "POST",
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "files": files,
+                "params": params,
+                "data": data,
+            }
         )
         return _FakeAsyncClient._QUEUE.pop(0)
 
@@ -257,6 +265,74 @@ def test_upload_document_sends_real_multipart_bytes():
     call = _FakeAsyncClient._CALLS[0]
     assert call["method"] == "POST"
     assert call["files"]["file"] == ("notes.pdf", raw)
+
+
+def test_create_bucket_sends_the_name():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(201, {"bucket": "kb-crispal", "name": "kb-crispal"}))
+    data, err = _run(client.create_bucket("kb-crispal"))
+    assert err is None
+    assert data["bucket"] == "kb-crispal"
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/buckets"
+    assert call["json"] == {"name": "kb-crispal"}
+
+
+def test_create_bucket_treats_a_409_as_already_existing_not_an_error():
+    """§13.1 — the driver calls this every tick; "already exists" has to
+    read as steady state, not a failure, even though the route itself
+    answers a real 409 on a name collision."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(409, {"detail": "bucket 'kb-crispal' already exists"})
+    )
+    data, err = _run(client.create_bucket("kb-crispal"))
+    assert err is None
+    assert data == {"bucket": "kb-crispal", "already_existed": True}
+
+
+def test_create_bucket_surfaces_a_genuine_error():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(500, {"detail": "internal error"}))
+    data, err = _run(client.create_bucket("kb-crispal"))
+    assert data is None
+    assert "internal error" in err
+
+
+def test_get_ingest_status_forwards_the_bucket():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"extraction": {"claiming": False}}))
+    data, err = _run(client.get_ingest_status("kb-crispal"))
+    assert err is None
+    assert data["extraction"]["claiming"] is False
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/ingest/status"
+    assert call["params"] == {"bucket": "kb-crispal"}
+
+
+def test_get_ingest_status_omits_bucket_param_when_absent():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"extraction": {}}))
+    _run(client.get_ingest_status())
+    assert _FakeAsyncClient._CALLS[0]["params"] is None
+
+
+def test_upload_bytes_sends_real_bytes_bucket_and_source_path():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(201, {"id": "doc-1", "deduplicated": False}))
+    data, err = _run(
+        client.upload_bytes(
+            "notes.md", b"kb body", bucket="kb-crispal", source_path="crispal/notes.md"
+        )
+    )
+    assert err is None
+    assert data == {"id": "doc-1", "deduplicated": False}
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/documents"
+    assert call["params"] == {"bucket": "kb-crispal"}
+    assert call["data"] == {"source_path": "crispal/notes.md"}
+    assert call["files"] == {"file": ("notes.md", b"kb body")}
+
+
+def test_upload_bytes_surfaces_a_backend_error():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(413, {"detail": "File exceeds the 10MB limit"}))
+    data, err = _run(client.upload_bytes("huge.md", b"x", bucket="kb-crispal"))
+    assert data is None
+    assert "10MB" in err
 
 
 def test_push_playground_key_sends_the_value_and_secret_header():

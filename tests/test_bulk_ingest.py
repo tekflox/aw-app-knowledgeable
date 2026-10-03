@@ -29,6 +29,17 @@ def _workspace_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _buckets_already_exist(monkeypatch):
+    """§13.1's precondition, satisfied by default in every test — the one
+    test that cares about a bucket-creation failure overrides this itself."""
+
+    async def fake_create_bucket(name):
+        return {"bucket": name, "already_existed": True}, None
+
+    monkeypatch.setattr(client, "create_bucket", fake_create_bucket)
+
+
 def _write(root: Path, relpath: str, content: str) -> None:
     path = root / relpath
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +214,35 @@ def test_run_tick_ignition_guard_blocks_when_extraction_is_claiming(_workspace_h
 
     assert result["blocked"] is True
     assert "claiming" in result["reason"]
+    assert upload_calls == []
+
+
+def test_run_tick_blocks_when_a_bucket_cannot_be_ensured(_workspace_home, monkeypatch):
+    """§13.1 — the four buckets must exist before anything else touches
+    them. Found live against production (2026-10-03): the buckets had never
+    been created, and every subsequent call 404'd on 'bucket not found'
+    until this guard existed."""
+    root = bulk_ingest.kb_root()
+    _write(root, "crispal/a.md", "content")
+    bulk_ingest.scan()
+
+    async def fake_create_bucket(name):
+        return None, "HTTP 500: internal error"
+
+    upload_calls = []
+
+    async def fake_upload(*a, **k):
+        upload_calls.append((a, k))
+        return {"id": "doc-1", "deduplicated": False}, None
+
+    monkeypatch.setattr(client, "create_bucket", fake_create_bucket)
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+
+    result = _run(bulk_ingest.run_tick())
+
+    assert result["blocked"] is True
+    assert "could not ensure bucket" in result["reason"]
     assert upload_calls == []
 
 

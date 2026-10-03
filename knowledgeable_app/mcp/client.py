@@ -131,6 +131,21 @@ async def upload_document(args: dict) -> tuple[str, bool]:
     return _as_text(resp.json()), False
 
 
+async def create_bucket(name: str) -> tuple[dict | None, str | None]:
+    """POST /api/buckets — §13.1's precondition for the bulk-ingest driver's
+    four buckets: each must exist before the first upload into it. Treated
+    as idempotent from THIS caller's point of view even though the route
+    itself answers a real 409 on a name collision (`api/buckets.py`'s own
+    docstring: "already exists" is a real conflict, not a no-op, because an
+    empty bucket is meaningful the moment it's created) — the driver calls
+    this on every tick, so "already exists" has to read as steady state,
+    not a failure."""
+    data, err = await _post_json("/api/buckets", {"name": name})
+    if err and err.startswith("HTTP 409"):
+        return {"bucket": name, "already_existed": True}, None
+    return data, err
+
+
 async def get_ingest_status(bucket: str | None = None) -> tuple[dict | None, str | None]:
     """GET /api/ingest/status — the bulk-ingest driver's (§13.4-§13.6) two
     uses of this one route: the ignition guard (`extraction.claiming`,
