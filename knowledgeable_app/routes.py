@@ -10,9 +10,10 @@ split as ``aw-app-google-maps``'s API key.
 from __future__ import annotations
 
 from fastapi import Body, FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import mcp_config
+from . import bulk_ingest, mcp_config
 from .mcp import client
 
 SECRET_KEY = "service_secret"
@@ -61,6 +62,34 @@ def build_routes(ctx) -> FastAPI:
     @app.get("/mcp.json")
     async def mcp_json() -> dict:
         return {"mcpServers": mcp_config.build_mcp_servers()}
+
+    # ------------------------------------------------------------------
+    # §13 — the KB bulk-ingest driver. Both doors (the `knowledgeable-ingest`
+    # CLI command and the contributed scheduled task, which just runs that
+    # same CLI command) reach the engine through these routes, never by
+    # importing `bulk_ingest` into a separate process — the engine has to
+    # run here, in-process, to reuse this app's already-configured
+    # `mcp/client.py` (base_url + X-Internal-Secret).
+    # ------------------------------------------------------------------
+
+    @app.post("/bulk-ingest/scan")
+    async def bulk_ingest_scan() -> dict:
+        return await run_in_threadpool(bulk_ingest.scan)
+
+    @app.post("/bulk-ingest/run")
+    async def bulk_ingest_run(data: dict = Body(default={})) -> dict:
+        max_uploads = data.get("max_uploads")
+        if max_uploads is not None:
+            return await bulk_ingest.run_tick(max_uploads=int(max_uploads))
+        return await bulk_ingest.run_tick()
+
+    @app.get("/bulk-ingest/status")
+    async def bulk_ingest_status() -> dict:
+        return await run_in_threadpool(bulk_ingest.status)
+
+    @app.get("/bulk-ingest/report")
+    async def bulk_ingest_report() -> dict:
+        return await run_in_threadpool(bulk_ingest.report)
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

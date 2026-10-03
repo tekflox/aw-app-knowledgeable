@@ -131,6 +131,51 @@ async def upload_document(args: dict) -> tuple[str, bool]:
     return _as_text(resp.json()), False
 
 
+async def get_ingest_status(bucket: str | None = None) -> tuple[dict | None, str | None]:
+    """GET /api/ingest/status — the bulk-ingest driver's (§13.4-§13.6) two
+    uses of this one route: the ignition guard (`extraction.claiming`,
+    global regardless of `bucket`) and the per-bucket upload-backlog
+    backpressure signal (`processing`, genuinely scoped to `bucket`)."""
+    params = {"bucket": bucket} if bucket else None
+    return await _get("/api/ingest/status", params)
+
+
+async def upload_bytes(
+    filename: str,
+    raw: bytes,
+    *,
+    bucket: str,
+    source_path: str | None = None,
+    title: str | None = None,
+) -> tuple[dict | None, str | None]:
+    """POST /api/documents with real bytes, not base64 — the bulk-ingest
+    driver's own upload path (§13.4/§13.6 item 4), distinct from the
+    `upload_document` MCP tool below. The driver reads files straight off
+    this process's own filesystem (the KB tree), so the base64 round trip
+    that tool needs for an agent's wire format would only double memory for
+    every file in a 181MB corpus, for no reason this caller has."""
+    params: dict = {"bucket": bucket}
+    data: dict = {}
+    if source_path:
+        data["source_path"] = source_path
+    if title:
+        data["title"] = title
+    async with httpx.AsyncClient(timeout=45) as http_client:
+        try:
+            resp = await http_client.post(
+                f"{base_url()}/api/documents",
+                params=params,
+                data=data,
+                files={"file": (filename, raw)},
+                headers=_headers(),
+            )
+        except httpx.HTTPError as exc:
+            return None, f"could not reach aw-knowledgeable at {base_url()}: {exc}"
+    if resp.status_code >= 400:
+        return None, _describe_error(resp)
+    return resp.json(), None
+
+
 async def push_playground_key(value: str) -> tuple[bool, str | None]:
     """POST /api/playground/key — hand production the Playground's ap-mt
     ApiKey, over the same ``X-Internal-Secret`` channel every other call in
