@@ -15,7 +15,7 @@ import logging
 import os
 from contextlib import suppress
 
-from . import ingest_key_push, mcp_config, playground_key_push, routes as routes_mod
+from . import ingest_key_push, label_key_push, mcp_config, playground_key_push, routes as routes_mod
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable")
@@ -50,19 +50,27 @@ class KnowledgeableAppPlugin:
         # ingest_key_push.py's module docstring.
         self._ingest_key_task = asyncio.create_task(ingest_key_push.run_forever())
 
+        # 2026-10-03 — the third re-assert loop, for the topic labeller's
+        # ap-mt key. Closes the LLM-key veto: topics/label.py was the last
+        # caller still going straight at a provider. See
+        # label_key_push.py's module docstring.
+        self._label_key_task = asyncio.create_task(label_key_push.run_forever())
+
         log.info(
             "aw-app-knowledgeable activated: mcp server=%s, tools=%s, base_url=%s, secret=%s, "
-            "playground-key re-assert every %ss, ingest-key re-assert every %ss",
+            "playground-key re-assert every %ss, ingest-key re-assert every %ss, "
+            "label-key re-assert every %ss",
             sorted(doc["mcpServers"]),
             len(client.TOOLS_SCHEMA),
             client.base_url(),
             "saved" if client.configured() else "NOT SET (tools will explain how)",
             playground_key_push.PUSH_INTERVAL_S,
             ingest_key_push.PUSH_INTERVAL_S,
+            label_key_push.PUSH_INTERVAL_S,
         )
 
     async def deactivate(self) -> None:
-        for attr in ("_playground_key_task", "_ingest_key_task"):
+        for attr in ("_playground_key_task", "_ingest_key_task", "_label_key_task"):
             task = getattr(self, attr, None)
             if task is not None:
                 task.cancel()

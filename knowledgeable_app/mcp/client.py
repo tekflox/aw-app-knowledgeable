@@ -230,6 +230,29 @@ async def push_ingest_key(value: str) -> tuple[bool, str | None]:
     return bool(data and data.get("ok")), None
 
 
+async def push_label_key(value: str) -> tuple[bool, str | None]:
+    """POST /api/topics/key — hand production the topic labeller's ap-mt
+    ApiKey, over the same ``X-Internal-Secret`` channel every other call in
+    this module already uses.
+
+    The third of the three pushed credentials (2026-10-03, closing the
+    LLM-key veto): same shape as ``push_playground_key`` and
+    ``push_ingest_key``, different endpoint and different credential — the
+    labeller, the extractor and the Playground each reach a different ap-mt
+    agent, so any one may be revoked, rotated or scoped differently without
+    touching the others. Not one of ``TOOLS_SCHEMA`` below, for the same
+    reason the other two pushes aren't: this is the connector's own
+    re-assertion path (``label_key_push.py``), called from a background loop
+    rather than from a tool call. Returns ``(True, None)`` on success,
+    ``(False, <description>)`` otherwise — the caller logs the value never
+    echoed here and by ``_describe_error``.
+    """
+    data, err = await _post_json("/api/topics/key", {"api_key": value})
+    if err:
+        return False, err
+    return bool(data and data.get("ok")), None
+
+
 async def create_node(args: dict) -> tuple[str, bool]:
     label = (args.get("label") or "").strip()
     node_type = (args.get("type") or "").strip()
