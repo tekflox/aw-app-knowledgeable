@@ -480,8 +480,11 @@ TOOLS_SCHEMA = [
                         "Retrieval algorithm. 'lexical': case-insensitive substring match on node "
                         "labels. 'semantic': embed q and vector-search with a tenant/bucket filter. "
                         "'tree': beam-descend the bucket's topic tree, reporting topic_path per "
-                        "result (falls back to flat semantic search if the bucket has no tree yet — "
-                        "declared as strategy='flat' in the response, not silent). Default 'tree'."
+                        "result — requires an explicit bucket. Falls back to flat semantic search "
+                        "if that bucket has no tree yet, or if bucket is omitted entirely (an "
+                        "unscoped query spans every readable bucket, so there is no single tree to "
+                        "descend); either way the fallback is declared as strategy='flat' in the "
+                        "response, not silent. Default 'tree'."
                     ),
                 },
                 "limit": {
