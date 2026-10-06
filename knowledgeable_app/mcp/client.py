@@ -516,7 +516,7 @@ TOOLS_SCHEMA = [
                 },
                 "bucket": {
                     "type": "string",
-                    "description": "Knowledge bucket to scope this search to. Omit to use the connector's default bucket.",
+                    "description": "Knowledge bucket to scope this search to. Omit to search every bucket your token can read.",
                 },
                 "include_traversal": {
                     "type": "boolean",
