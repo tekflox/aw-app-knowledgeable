@@ -51,10 +51,21 @@ from .mcp import client
 log = logging.getLogger("aw_apps.knowledgeable.bulk_ingest")
 
 # §13.3 — ingest order: curated subtrees first, mapped_folders/ last.
+#
+# kb-cli-reference/kb-skills (card quality:procedural-genre-absent-from-
+# both-knowledge-indexes) are the procedural genre neither store had: one
+# doc per `aw-workspace-cli` command/subcommand captured from its own
+# --help (src/libs/cli_reference.py in aw-workspace core), and the
+# materialized skills/*/SKILL.md tree indexed as content for the first
+# time (previously only reachable via the separate search_skills surface).
+# Small, curated, hand-structured sources — same tier as crispal/memory/
+# notion, ingested before mapped_folders/ for the same reason those are.
 BUCKET_ORDER: tuple[tuple[str, str], ...] = (
     ("kb-crispal", "crispal"),
     ("kb-memory", "memory"),
     ("kb-notion", "notion"),
+    ("kb-cli-reference", "cli_reference"),
+    ("kb-skills", "skills"),
     ("kb-mapped-folders", "mapped_folders"),
 )
 BUCKETS: tuple[str, ...] = tuple(bucket for bucket, _subtree in BUCKET_ORDER)

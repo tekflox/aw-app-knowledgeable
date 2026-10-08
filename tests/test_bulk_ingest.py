@@ -81,22 +81,26 @@ def test_priority_real_repo_beats_apps_slug_mirror():
 # ---------------------------------------------------------------------------
 
 
-def test_scan_finds_files_across_all_four_buckets(_workspace_home):
+def test_scan_finds_files_across_all_six_buckets(_workspace_home):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "crispal body")
     _write(root, "memory/b.md", "memory body")
     _write(root, "notion/c.md", "notion body")
+    _write(root, "cli_reference/restart.md", "cli reference body")
+    _write(root, "skills/aw-demo.md", "skill body")
     _write(root, "mapped_folders/repos/x/d.md", "mapped body")
 
     counts = bulk_ingest.scan()
-    assert counts["scanned"] == 4
-    assert counts["canonical"] == 4
+    assert counts["scanned"] == 6
+    assert counts["canonical"] == 6
     assert counts["alias"] == 0
 
     status = bulk_ingest.status()
     assert status["by_bucket"]["kb-crispal"] == {"pending": 1}
     assert status["by_bucket"]["kb-memory"] == {"pending": 1}
     assert status["by_bucket"]["kb-notion"] == {"pending": 1}
+    assert status["by_bucket"]["kb-cli-reference"] == {"pending": 1}
+    assert status["by_bucket"]["kb-skills"] == {"pending": 1}
     assert status["by_bucket"]["kb-mapped-folders"] == {"pending": 1}
 
 
