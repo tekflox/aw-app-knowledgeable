@@ -39,6 +39,7 @@ directly off it.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -87,6 +88,17 @@ MAX_UPLOADS_PER_TICK = 200
 #: pending` backlog is already at or past this is skipped for the tick,
 #: never pushed further into backlog.
 MAX_PENDING_BACKLOG = 500
+
+#: Found live 2026-10-08: a slow tick (e.g. `max_uploads=200`, which can run
+#: long enough for the CLIENT to give up with an `httpx.ReadTimeout`) keeps
+#: running server-side — nothing cancels the coroutine just because the
+#: caller disconnected — holding its sqlite write transaction open across
+#: every upload's network round trip. A second tick starting while the first
+#: is still mid-flight then hits `sqlite3.OperationalError: database is
+#: locked` on its own first `UPDATE`, surfaced to the caller as a bare 500.
+#: Serializing here turns that crash into the same declared `blocked` shape
+#: every other non-negotiable in this function already uses.
+_tick_lock = asyncio.Lock()
 
 
 def _workspace_home() -> str:
@@ -294,7 +306,24 @@ async def run_tick(max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
     non-negotiables in order: the ignition guard, the per-tick ceiling, and
     the per-bucket backlog ceiling. Advances buckets in §13.3's order,
     stopping early once the ceiling is spent.
+
+    Refuses to overlap with another in-flight tick (see ``_tick_lock``)
+    rather than queuing behind it — a caller that already timed out once
+    waiting on a slow tick should not be left waiting on a second one.
     """
+    if _tick_lock.locked():
+        return {
+            "blocked": True,
+            "reason": "another tick is already in progress — wait for it to finish",
+            "uploaded": 0,
+            "deduplicated": 0,
+            "failed": 0,
+        }
+    async with _tick_lock:
+        return await _run_tick_locked(max_uploads)
+
+
+async def _run_tick_locked(max_uploads: int) -> dict:
     max_uploads = max(0, min(max_uploads, MAX_UPLOADS_PER_TICK))
     conn = _connect()
     try:

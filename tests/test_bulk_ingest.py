@@ -263,6 +263,44 @@ def test_run_tick_blocks_when_status_check_itself_fails(_workspace_home, monkeyp
     assert result["blocked"] is True
 
 
+def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home, monkeypatch):
+    """Found live 2026-10-08: a slow tick still running server-side after its
+    caller gave up (`httpx.ReadTimeout`) held its sqlite write transaction
+    open long enough that a second tick's own first `UPDATE` hit
+    `sqlite3.OperationalError: database is locked`, surfaced as a bare 500.
+    MUTATION CHECK: dropping the `_tick_lock` check would let the second
+    call's `fake_upload` get called too — it asserts exactly one call."""
+    root = bulk_ingest.kb_root()
+    _write(root, "crispal/a.md", "content")
+    bulk_ingest.scan()
+
+    first_may_finish = asyncio.Event()
+    upload_calls = []
+
+    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+        upload_calls.append(source_path)
+        await first_may_finish.wait()
+        return {"id": "doc-1", "deduplicated": False}, None
+
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+
+    async def scenario():
+        first = asyncio.ensure_future(bulk_ingest.run_tick())
+        await asyncio.sleep(0)  # let the first tick acquire _tick_lock and start uploading
+        second_result = await bulk_ingest.run_tick()
+        first_may_finish.set()
+        first_result = await first
+        return first_result, second_result
+
+    first_result, second_result = _run(scenario())
+
+    assert second_result["blocked"] is True
+    assert "already in progress" in second_result["reason"]
+    assert first_result["uploaded"] == 1
+    assert upload_calls == ["crispal/a.md"], "the second tick must never reach upload_bytes"
+
+
 def test_run_tick_respects_the_per_bucket_backlog_ceiling(_workspace_home, monkeypatch):
     """§13.5.3 — a bucket already at/over the backlog ceiling is skipped for
     the tick rather than pushed further into backlog; buckets under the
