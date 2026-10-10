@@ -4,10 +4,18 @@ pytest-asyncio — same style as ``test_ingest_key_push.py``: a plain ``_run``
 helper driving coroutines, and ``client``'s own async functions monkeypatched
 rather than ``httpx`` itself, since what's under test here is the engine's
 own decisions, not the HTTP shaping (that's ``test_client.py``'s job).
+
+``_FakeDb``/``_FakeLease`` are minimal doubles for ``ctx.db``/``ctx.state.
+lease`` (docs/design/aw-knowledgeable-sqlite-exit.md) — real enough to
+exercise the actual SQL ``bulk_ingest.py`` sends (named ``:param`` binding,
+``{table}`` substitution, the Postgres ``ON CONFLICT ... DO UPDATE SET
+... excluded.col`` upsert, which stdlib sqlite3 also accepts since 3.24) so a
+SQL typo still fails a test, without a live workspace Postgres.
 """
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -21,6 +29,56 @@ from knowledgeable_app.mcp import client  # noqa: E402
 
 def _run(coro):
     return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
+
+
+class _FakeDb:
+    """Double for ``ctx.db`` — in-memory sqlite, kept open for the test's
+    duration like the real lazy-singleton Postgres engine. ``{table}`` is
+    substituted with the literal table name (no schema qualification needed
+    here); name-prefix validation is the real facade's job, not this
+    module's, so it is not reproduced here."""
+
+    def __init__(self) -> None:
+        # check_same_thread=False: production `run_tick` dispatches each sync
+        # db call to a threadpool worker via `run_in_threadpool` — the real
+        # SQLAlchemy engine hands each thread its own pooled connection, but
+        # this double is one shared sqlite3.Connection, so it needs the same
+        # opt-out tenant_store.py's own sqlite test engine uses.
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+    def create(self, name: str, columns_sql: str) -> str:
+        self._conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns_sql})")
+        self._conn.commit()
+        return name
+
+    def execute(self, name: str, sql: str, params: dict | None = None):
+        stmt = sql.replace("{table}", name)
+        cur = self._conn.execute(stmt, params or {})
+        if stmt.strip().lower().startswith("select"):
+            rows = cur.fetchall()
+            self._conn.commit()
+            return rows
+        self._conn.commit()
+        return cur
+
+
+class _FakeLease:
+    """Double for ``ctx.state.lease`` — single-process, non-blocking,
+    exclusive-by-flag (the real one is flock-backed; this test never needs
+    more than "is somebody already holding this name")."""
+
+    def __init__(self) -> None:
+        self._held = False
+
+    def claim(self, name: str) -> bool:
+        if self._held:
+            return False
+        self._held = True
+        return True
+
+    def release(self, name: str) -> None:
+        self._held = False
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +98,25 @@ def _buckets_already_exist(monkeypatch):
     monkeypatch.setattr(client, "create_bucket", fake_create_bucket)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_table_flag(monkeypatch):
+    """`_ensure_table`'s guard is a module-level flag — each test gets a
+    fresh `_FakeDb` (a fresh, empty sqlite backing), so the flag must reset
+    too or a test after the first would skip CREATE TABLE against a
+    connection that was never given one."""
+    monkeypatch.setattr(bulk_ingest, "_table_ensured", False)
+
+
+@pytest.fixture()
+def db() -> _FakeDb:
+    return _FakeDb()
+
+
+@pytest.fixture()
+def lease() -> _FakeLease:
+    return _FakeLease()
+
+
 def _write(root: Path, relpath: str, content: str) -> None:
     path = root / relpath
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,12 +130,8 @@ def _ok_status(claiming: bool = False, pending: int = 0):
     return fake
 
 
-def _journal_rows() -> list[dict]:
-    conn = bulk_ingest._connect()
-    try:
-        return [dict(r) for r in conn.execute("SELECT * FROM files")]
-    finally:
-        conn.close()
+def _journal_rows(db: _FakeDb) -> list[dict]:
+    return [dict(r) for r in db.execute(bulk_ingest.TABLE, "SELECT * FROM {table}")]
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +162,7 @@ def test_priority_real_repo_beats_apps_slug_mirror():
 # ---------------------------------------------------------------------------
 
 
-def test_scan_finds_files_across_all_six_subtrees_into_one_bucket(_workspace_home):
+def test_scan_finds_files_across_all_six_subtrees_into_one_bucket(_workspace_home, db):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "crispal body")
     _write(root, "memory/b.md", "memory body")
@@ -98,12 +171,12 @@ def test_scan_finds_files_across_all_six_subtrees_into_one_bucket(_workspace_hom
     _write(root, "skills/aw-demo.md", "skill body")
     _write(root, "mapped_folders/docs/design/d.md", "mapped design body")
 
-    counts = bulk_ingest.scan()
+    counts = bulk_ingest.scan(db)
     assert counts["scanned"] == 6
     assert counts["canonical"] == 6
     assert counts["alias"] == 0
 
-    status = bulk_ingest.status()
+    status = bulk_ingest.status(db)
     assert status["bucket"] == "main"
     assert status["by_subtree"] == {
         "crispal": {"pending": 1},
@@ -115,7 +188,7 @@ def test_scan_finds_files_across_all_six_subtrees_into_one_bucket(_workspace_hom
     }
 
 
-def test_scan_never_walks_the_skipped_code_map_subtrees(_workspace_home):
+def test_scan_never_walks_the_skipped_code_map_subtrees(_workspace_home, db):
     """The §8 skip rule, as a property of the WALK. These two subtrees are
     generated code maps codegraph answers better (Frederico, 2026-10-10) and
     were 79% of the ingested corpus before the collapse.
@@ -130,58 +203,13 @@ def test_scan_never_walks_the_skipped_code_map_subtrees(_workspace_home):
     _write(root, "mapped_folders/repos/aw-stack/scripts/drop.md", "code map")
     _write(root, "mapped_folders/aw-workspace/src/also-drop.md", "code map")
 
-    counts = bulk_ingest.scan()
+    counts = bulk_ingest.scan(db)
     assert counts["scanned"] == 1
-    relpaths = sorted(r["relpath"] for r in _journal_rows())
+    relpaths = sorted(r["relpath"] for r in _journal_rows(db))
     assert relpaths == ["mapped_folders/docs/design/keep.md"]
 
 
-def test_journal_migration_drops_skipped_rows_and_rebuckets_the_rest(_workspace_home):
-    """§8 step 4. A pre-collapse journal names `kb-*` buckets and holds rows
-    for the code maps; both would survive `scan()`'s own `frozen` set
-    forever, because an `uploaded` row is never second-guessed by a rescan.
-
-    MUTATION: drop either statement in `_migrate_journal_to_main` and this
-    goes red — on the leftover `kb-crispal` bucket, or on the code-map row
-    still being in the journal.
-    """
-    conn = bulk_ingest._connect()
-    try:
-        now = 1.0
-        for relpath, bucket in (
-            ("crispal/a.md", "kb-crispal"),
-            ("notion/b.md", "kb-notion"),
-            ("mapped_folders/docs/c.md", "kb-mapped-folders"),
-            ("mapped_folders/repos/x/d.md", "kb-mapped-folders"),
-            ("mapped_folders/aw-workspace/e.md", "kb-mapped-folders"),
-        ):
-            conn.execute(
-                "INSERT INTO files (relpath, sha256, bucket, status, scanned_at, updated_at) "
-                "VALUES (?, 'deadbeef', ?, ?, ?, ?)",
-                (relpath, bucket, bulk_ingest.STATUS_UPLOADED, now, now),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    # A fresh connect is what runs the migration — same door every caller uses.
-    rows = _journal_rows()
-    assert sorted(r["relpath"] for r in rows) == [
-        "crispal/a.md",
-        "mapped_folders/docs/c.md",
-        "notion/b.md",
-    ]
-    assert {r["bucket"] for r in rows} == {"main"}
-
-    # And it is idempotent: a second connect changes nothing.
-    conn = bulk_ingest._connect()
-    try:
-        assert bulk_ingest._migrate_journal_to_main(conn) == {"dropped": 0, "rebucketed": 0}
-    finally:
-        conn.close()
-
-
-def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home):
+def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home, db):
     """§13.2's cross-prefix canonicalization: the same content reachable from
     more than one place, uploaded exactly once.
 
@@ -198,50 +226,48 @@ def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home):
     _write(root, "mapped_folders/docs/design/notes.md", same)
     _write(root, "mapped_folders/apps/crispal/docs/knowledge_base/notes.md", same)
 
-    counts = bulk_ingest.scan()
+    counts = bulk_ingest.scan(db)
     assert counts["scanned"] == 3
     assert counts["canonical"] == 1
     assert counts["alias"] == 2
 
-    conn = bulk_ingest._connect()
-    try:
-        canonical = conn.execute(
-            "SELECT relpath FROM files WHERE status = ?", (bulk_ingest.STATUS_PENDING,)
-        ).fetchall()
-        assert [r["relpath"] for r in canonical] == ["crispal/atendimento/notes.md"]
-        aliases = conn.execute(
-            "SELECT relpath, canonical_relpath FROM files WHERE status = ? ORDER BY relpath",
-            (bulk_ingest.STATUS_ALIAS,),
-        ).fetchall()
-        assert [r["canonical_relpath"] for r in aliases] == [
-            "crispal/atendimento/notes.md",
-            "crispal/atendimento/notes.md",
-        ]
-    finally:
-        conn.close()
+    canonical = db.execute(
+        bulk_ingest.TABLE, "SELECT relpath FROM {table} WHERE status = :status",
+        {"status": bulk_ingest.STATUS_PENDING},
+    )
+    assert [r["relpath"] for r in canonical] == ["crispal/atendimento/notes.md"]
+    aliases = db.execute(
+        bulk_ingest.TABLE,
+        "SELECT relpath, canonical_relpath FROM {table} WHERE status = :status ORDER BY relpath",
+        {"status": bulk_ingest.STATUS_ALIAS},
+    )
+    assert [r["canonical_relpath"] for r in aliases] == [
+        "crispal/atendimento/notes.md",
+        "crispal/atendimento/notes.md",
+    ]
 
 
-def test_scan_skips_oversized_files_with_a_reason(_workspace_home):
+def test_scan_skips_oversized_files_with_a_reason(_workspace_home, db):
     root = bulk_ingest.kb_root()
     big = "x" * (bulk_ingest.MAX_FILE_BYTES + 1)
     _write(root, "memory/huge.md", big)
 
-    counts = bulk_ingest.scan()
+    counts = bulk_ingest.scan(db)
     assert counts["skipped"] == 1
 
-    conn = bulk_ingest._connect()
-    try:
-        row = conn.execute("SELECT status, error FROM files WHERE relpath = ?", ("memory/huge.md",)).fetchone()
-        assert row["status"] == bulk_ingest.STATUS_SKIPPED
-        assert "10MB" in row["error"]
-    finally:
-        conn.close()
+    rows = db.execute(
+        bulk_ingest.TABLE, "SELECT status, error FROM {table} WHERE relpath = :relpath",
+        {"relpath": "memory/huge.md"},
+    )
+    row = rows[0]
+    assert row["status"] == bulk_ingest.STATUS_SKIPPED
+    assert "10MB" in row["error"]
 
 
-def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, monkeypatch):
+def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "stable content")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     uploaded = {"calls": 0}
 
@@ -251,13 +277,13 @@ def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, m
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
     assert result["uploaded"] == 1
     assert uploaded["calls"] == 1
 
     # Re-scan: the uploaded row must not flip back to pending.
-    bulk_ingest.scan()
-    status = bulk_ingest.status()
+    bulk_ingest.scan(db)
+    status = bulk_ingest.status(db)
     assert status["by_subtree"]["crispal"] == {"uploaded": 1}
 
 
@@ -266,10 +292,10 @@ def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, m
 # ---------------------------------------------------------------------------
 
 
-def test_run_tick_with_nothing_pending_is_a_noop(_workspace_home, monkeypatch):
+def test_run_tick_with_nothing_pending_is_a_noop(_workspace_home, db, lease, monkeypatch):
     calls = []
     monkeypatch.setattr(client, "get_ingest_status", lambda bucket=None: calls.append(bucket))
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
     assert result == {
         "blocked": False,
         "uploaded": 0,
@@ -280,13 +306,13 @@ def test_run_tick_with_nothing_pending_is_a_noop(_workspace_home, monkeypatch):
     assert calls == [], "must not even check ingest status with nothing to upload"
 
 
-def test_run_tick_ignition_guard_blocks_when_extraction_is_claiming(_workspace_home, monkeypatch):
+def test_run_tick_ignition_guard_blocks_when_extraction_is_claiming(_workspace_home, db, lease, monkeypatch):
     """§13.5.2 — the non-negotiable: never upload while extraction is
     claiming work. MUTATION CHECK: dropping this check would let the next
     assertion's upload fake get called — it asserts zero calls."""
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     upload_calls = []
 
@@ -297,21 +323,21 @@ def test_run_tick_ignition_guard_blocks_when_extraction_is_claiming(_workspace_h
     monkeypatch.setattr(client, "get_ingest_status", _ok_status(claiming=True))
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert result["blocked"] is True
     assert "claiming" in result["reason"]
     assert upload_calls == []
 
 
-def test_run_tick_blocks_when_a_bucket_cannot_be_ensured(_workspace_home, monkeypatch):
+def test_run_tick_blocks_when_a_bucket_cannot_be_ensured(_workspace_home, db, lease, monkeypatch):
     """§13.1 — the four buckets must exist before anything else touches
     them. Found live against production (2026-10-03): the buckets had never
     been created, and every subsequent call 404'd on 'bucket not found'
     until this guard existed."""
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     async def fake_create_bucket(name):
         return None, "HTTP 500: internal error"
@@ -326,36 +352,36 @@ def test_run_tick_blocks_when_a_bucket_cannot_be_ensured(_workspace_home, monkey
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert result["blocked"] is True
     assert "could not ensure bucket" in result["reason"]
     assert upload_calls == []
 
 
-def test_run_tick_blocks_when_status_check_itself_fails(_workspace_home, monkeypatch):
+def test_run_tick_blocks_when_status_check_itself_fails(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     async def fake_status(bucket=None):
         return None, "could not reach aw-knowledgeable"
 
     monkeypatch.setattr(client, "get_ingest_status", fake_status)
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
     assert result["blocked"] is True
 
 
-def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home, monkeypatch):
+def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home, db, lease, monkeypatch):
     """Found live 2026-10-08: a slow tick still running server-side after its
     caller gave up (`httpx.ReadTimeout`) held its sqlite write transaction
     open long enough that a second tick's own first `UPDATE` hit
     `sqlite3.OperationalError: database is locked`, surfaced as a bare 500.
-    MUTATION CHECK: dropping the `_tick_lock` check would let the second
-    call's `fake_upload` get called too — it asserts exactly one call."""
+    MUTATION CHECK: dropping the lease check would let the second call's
+    `fake_upload` get called too — it asserts exactly one call."""
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     first_may_finish = asyncio.Event()
     upload_calls = []
@@ -369,9 +395,9 @@ def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home,
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
     async def scenario():
-        first = asyncio.ensure_future(bulk_ingest.run_tick())
-        await asyncio.sleep(0)  # let the first tick acquire _tick_lock and start uploading
-        second_result = await bulk_ingest.run_tick()
+        first = asyncio.ensure_future(bulk_ingest.run_tick(db, lease))
+        await asyncio.sleep(0)  # let the first tick claim the lease and start uploading
+        second_result = await bulk_ingest.run_tick(db, lease)
         first_may_finish.set()
         first_result = await first
         return first_result, second_result
@@ -384,7 +410,7 @@ def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home,
     assert upload_calls == ["crispal/a.md"], "the second tick must never reach upload_bytes"
 
 
-def test_run_tick_respects_the_backlog_ceiling(_workspace_home, monkeypatch):
+def test_run_tick_respects_the_backlog_ceiling(_workspace_home, db, lease, monkeypatch):
     """§13.5.3 — the bucket at/over the backlog ceiling is not pushed further
     into backlog. One bucket now, so this is the whole tick rather than a
     per-bucket skip.
@@ -397,7 +423,7 @@ def test_run_tick_respects_the_backlog_ceiling(_workspace_home, monkeypatch):
     """
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     uploaded = []
 
@@ -410,14 +436,14 @@ def test_run_tick_respects_the_backlog_ceiling(_workspace_home, monkeypatch):
     )
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert uploaded == []
     assert result["blocked"] is False
     assert "backlog" in result["skipped_reason"]
 
 
-def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, monkeypatch):
+def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, db, lease, monkeypatch):
     """The collapse, as a behavioural assertion: six subtrees, one `bucket=`
     argument, and the subtree carried by `source_path` instead.
 
@@ -429,7 +455,7 @@ def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, mon
     _write(root, "crispal/a.md", "a")
     _write(root, "notion/b.md", "b")
     _write(root, "mapped_folders/docs/c.md", "c")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     seen = []
 
@@ -440,7 +466,7 @@ def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, mon
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert result["uploaded"] == 3
     assert result["bucket"] == "main"
@@ -453,13 +479,13 @@ def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, mon
     assert set(result["per_subtree"]) == {"crispal", "notion", "mapped_folders"}
 
 
-def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_home, monkeypatch):
+def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     for i in range(3):
         _write(root, f"crispal/c{i}.md", f"content {i}")
     for i in range(3):
         _write(root, f"memory/m{i}.md", f"other content {i}")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     uploaded = []
 
@@ -470,7 +496,7 @@ def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_hom
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(max_uploads=4))
+    result = _run(bulk_ingest.run_tick(db, lease, max_uploads=4))
 
     assert result["uploaded"] == 4
     assert len(uploaded) == 4
@@ -480,11 +506,11 @@ def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_hom
     assert uploaded[3] == "memory/m0.md"
 
 
-def test_run_tick_counts_a_server_dedup_hit_separately_from_a_fresh_upload(_workspace_home, monkeypatch):
+def test_run_tick_counts_a_server_dedup_hit_separately_from_a_fresh_upload(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
     _write(root, "crispal/b.md", "content b")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
         dedup = source_path == "crispal/b.md"
@@ -493,18 +519,18 @@ def test_run_tick_counts_a_server_dedup_hit_separately_from_a_fresh_upload(_work
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert result["uploaded"] == 1
     assert result["deduplicated"] == 1
     assert result["failed"] == 0
 
 
-def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_home, monkeypatch):
+def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
     _write(root, "crispal/b.md", "content b")
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
         if source_path == "crispal/a.md":
@@ -514,18 +540,18 @@ def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_hom
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
-    result = _run(bulk_ingest.run_tick())
+    result = _run(bulk_ingest.run_tick(db, lease))
 
     assert result["failed"] == 1
     assert result["uploaded"] == 1
 
-    conn = bulk_ingest._connect()
-    try:
-        row = conn.execute("SELECT status, error FROM files WHERE relpath = ?", ("crispal/a.md",)).fetchone()
-        assert row["status"] == bulk_ingest.STATUS_FAILED
-        assert row["error"] == "HTTP 500: internal error"
-    finally:
-        conn.close()
+    rows = db.execute(
+        bulk_ingest.TABLE, "SELECT status, error FROM {table} WHERE relpath = :relpath",
+        {"relpath": "crispal/a.md"},
+    )
+    row = rows[0]
+    assert row["status"] == bulk_ingest.STATUS_FAILED
+    assert row["error"] == "HTTP 500: internal error"
 
 
 # ---------------------------------------------------------------------------
@@ -533,21 +559,21 @@ def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_hom
 # ---------------------------------------------------------------------------
 
 
-def test_report_tallies_scanned_uploaded_deduplicated_and_pending(_workspace_home, monkeypatch):
+def test_report_tallies_scanned_uploaded_deduplicated_and_pending(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
     _write(root, "crispal/b.md", "content b")
     _write(root, "mapped_folders/docs/c.md", "content a")  # alias of a.md's content
-    bulk_ingest.scan()
+    bulk_ingest.scan(db)
 
     async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
         return {"id": "doc-a", "deduplicated": False}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
-    _run(bulk_ingest.run_tick(max_uploads=1))
+    _run(bulk_ingest.run_tick(db, lease, max_uploads=1))
 
-    report = bulk_ingest.report()
+    report = bulk_ingest.report(db)
     assert report["bucket"] == "main"
     crispal = report["subtrees"]["crispal"]
     assert crispal["scanned"] == 2

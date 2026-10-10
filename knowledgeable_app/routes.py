@@ -74,22 +74,22 @@ def build_routes(ctx) -> FastAPI:
 
     @app.post("/bulk-ingest/scan")
     async def bulk_ingest_scan() -> dict:
-        return await run_in_threadpool(bulk_ingest.scan)
+        return await run_in_threadpool(bulk_ingest.scan, ctx.db)
 
     @app.post("/bulk-ingest/run")
     async def bulk_ingest_run(data: dict = Body(default={})) -> dict:
         max_uploads = data.get("max_uploads")
         if max_uploads is not None:
-            return await bulk_ingest.run_tick(max_uploads=int(max_uploads))
-        return await bulk_ingest.run_tick()
+            return await bulk_ingest.run_tick(ctx.db, ctx.state.lease, max_uploads=int(max_uploads))
+        return await bulk_ingest.run_tick(ctx.db, ctx.state.lease)
 
     @app.get("/bulk-ingest/status")
     async def bulk_ingest_status() -> dict:
-        return await run_in_threadpool(bulk_ingest.status)
+        return await run_in_threadpool(bulk_ingest.status, ctx.db)
 
     @app.get("/bulk-ingest/report")
     async def bulk_ingest_report() -> dict:
-        return await run_in_threadpool(bulk_ingest.report)
+        return await run_in_threadpool(bulk_ingest.report, ctx.db)
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.
