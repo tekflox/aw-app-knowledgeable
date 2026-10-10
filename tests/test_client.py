@@ -128,6 +128,18 @@ def test_list_documents_sends_the_secret_header():
     call = _FakeAsyncClient._CALLS[0]
     assert call["url"] == "http://aw-knowledgeable:8090/api/documents"
     assert call["headers"] == {"X-Internal-Secret": "s3cr3t"}
+    assert call["params"] is None, "omitted bucket must not be forced to a literal 'default'"
+
+
+def test_list_documents_passes_an_explicit_bucket_through():
+    """bug:knowledgeable-list-documents-pinned-to-default-bucket — the fix's
+    optional narrowing knob, mirroring search_graph's own `bucket` param."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"documents": [{"id": "doc-2"}]}))
+    text, is_error = _run(client.list_documents({"bucket": "main"}))
+    assert is_error is False
+    assert "doc-2" in text
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"bucket": "main"}
 
 
 def test_get_graph_requires_focus():

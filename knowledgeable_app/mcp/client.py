@@ -296,7 +296,13 @@ async def get_graph(args: dict) -> tuple[str, bool]:
 
 
 async def list_documents(args: dict) -> tuple[str, bool]:
-    data, err = await _get("/api/documents")
+    # bug:knowledgeable-list-documents-pinned-to-default-bucket — mirrors
+    # search_graph's `bucket` knob: omitted spans every bucket this token can
+    # read (GET /api/documents' own `resolve_search_scope` dependency),
+    # passed narrows to that one bucket.
+    bucket = (args.get("bucket") or "").strip()
+    params = {"bucket": bucket} if bucket else None
+    data, err = await _get("/api/documents", params)
     if err:
         return f"list_documents failed: {err}", True
     return _as_text(data), False
@@ -444,8 +450,19 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "list_documents",
-        "description": "List every document node in this connector's tenant.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "List every document node in this connector's tenant, across every "
+            "bucket your token can read. Pass bucket to narrow to just one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to narrow this listing to. Omit to list every bucket your token can read.",
+                },
+            },
+        },
     },
     {
         "name": "search_nodes",
