@@ -53,6 +53,14 @@ def _ok_status(claiming: bool = False, pending: int = 0):
     return fake
 
 
+def _journal_rows() -> list[dict]:
+    conn = bulk_ingest._connect()
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM files")]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # _priority — the canonical-copy rule (§13.2)
 # ---------------------------------------------------------------------------
@@ -81,14 +89,14 @@ def test_priority_real_repo_beats_apps_slug_mirror():
 # ---------------------------------------------------------------------------
 
 
-def test_scan_finds_files_across_all_six_buckets(_workspace_home):
+def test_scan_finds_files_across_all_six_subtrees_into_one_bucket(_workspace_home):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "crispal body")
     _write(root, "memory/b.md", "memory body")
     _write(root, "notion/c.md", "notion body")
     _write(root, "cli_reference/restart.md", "cli reference body")
     _write(root, "skills/aw-demo.md", "skill body")
-    _write(root, "mapped_folders/repos/x/d.md", "mapped body")
+    _write(root, "mapped_folders/docs/design/d.md", "mapped design body")
 
     counts = bulk_ingest.scan()
     assert counts["scanned"] == 6
@@ -96,21 +104,98 @@ def test_scan_finds_files_across_all_six_buckets(_workspace_home):
     assert counts["alias"] == 0
 
     status = bulk_ingest.status()
-    assert status["by_bucket"]["kb-crispal"] == {"pending": 1}
-    assert status["by_bucket"]["kb-memory"] == {"pending": 1}
-    assert status["by_bucket"]["kb-notion"] == {"pending": 1}
-    assert status["by_bucket"]["kb-cli-reference"] == {"pending": 1}
-    assert status["by_bucket"]["kb-skills"] == {"pending": 1}
-    assert status["by_bucket"]["kb-mapped-folders"] == {"pending": 1}
+    assert status["bucket"] == "main"
+    assert status["by_subtree"] == {
+        "crispal": {"pending": 1},
+        "memory": {"pending": 1},
+        "notion": {"pending": 1},
+        "cli_reference": {"pending": 1},
+        "skills": {"pending": 1},
+        "mapped_folders": {"pending": 1},
+    }
+
+
+def test_scan_never_walks_the_skipped_code_map_subtrees(_workspace_home):
+    """The §8 skip rule, as a property of the WALK. These two subtrees are
+    generated code maps codegraph answers better (Frederico, 2026-10-10) and
+    were 79% of the ingested corpus before the collapse.
+
+    MUTATION: drop the `is_skipped(relpath)` guard in `scan()` and this goes
+    red on `scanned == 1` — the journal would hold the two code-map paths as
+    `pending`, which is exactly how the next tick re-creates documents the
+    migration deleted.
+    """
+    root = bulk_ingest.kb_root()
+    _write(root, "mapped_folders/docs/design/keep.md", "hand-written design")
+    _write(root, "mapped_folders/repos/aw-stack/scripts/drop.md", "code map")
+    _write(root, "mapped_folders/aw-workspace/src/also-drop.md", "code map")
+
+    counts = bulk_ingest.scan()
+    assert counts["scanned"] == 1
+    relpaths = sorted(r["relpath"] for r in _journal_rows())
+    assert relpaths == ["mapped_folders/docs/design/keep.md"]
+
+
+def test_journal_migration_drops_skipped_rows_and_rebuckets_the_rest(_workspace_home):
+    """§8 step 4. A pre-collapse journal names `kb-*` buckets and holds rows
+    for the code maps; both would survive `scan()`'s own `frozen` set
+    forever, because an `uploaded` row is never second-guessed by a rescan.
+
+    MUTATION: drop either statement in `_migrate_journal_to_main` and this
+    goes red — on the leftover `kb-crispal` bucket, or on the code-map row
+    still being in the journal.
+    """
+    conn = bulk_ingest._connect()
+    try:
+        now = 1.0
+        for relpath, bucket in (
+            ("crispal/a.md", "kb-crispal"),
+            ("notion/b.md", "kb-notion"),
+            ("mapped_folders/docs/c.md", "kb-mapped-folders"),
+            ("mapped_folders/repos/x/d.md", "kb-mapped-folders"),
+            ("mapped_folders/aw-workspace/e.md", "kb-mapped-folders"),
+        ):
+            conn.execute(
+                "INSERT INTO files (relpath, sha256, bucket, status, scanned_at, updated_at) "
+                "VALUES (?, 'deadbeef', ?, ?, ?, ?)",
+                (relpath, bucket, bulk_ingest.STATUS_UPLOADED, now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # A fresh connect is what runs the migration — same door every caller uses.
+    rows = _journal_rows()
+    assert sorted(r["relpath"] for r in rows) == [
+        "crispal/a.md",
+        "mapped_folders/docs/c.md",
+        "notion/b.md",
+    ]
+    assert {r["bucket"] for r in rows} == {"main"}
+
+    # And it is idempotent: a second connect changes nothing.
+    conn = bulk_ingest._connect()
+    try:
+        assert bulk_ingest._migrate_journal_to_main(conn) == {"dropped": 0, "rebucketed": 0}
+    finally:
+        conn.close()
 
 
 def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home):
-    """§13.2's measured case: the same content under the monolith checkout,
-    a real repo, and the app's installed mirror — exactly one upload."""
+    """§13.2's cross-prefix canonicalization: the same content reachable from
+    more than one place, uploaded exactly once.
+
+    The three prefixes this originally measured (`mapped_folders/repos/
+    agentic-workspace/`, a real repo, and `mapped_folders/apps/`) are mostly
+    gone with the §8 skip rule — `mapped_folders/repos/` is never walked —
+    so the case is re-pinned on prefixes that still exist. The rule itself is
+    unchanged: curated subtrees (priority 0) beat anything under
+    `mapped_folders/`, and `apps/` loses to everything.
+    """
     root = bulk_ingest.kb_root()
     same = "duplicated across three prefixes"
-    _write(root, "mapped_folders/repos/agentic-workspace/docs/knowledge_base/crispal/notes.md", same)
-    _write(root, "mapped_folders/repos/aw-app-crispal/docs/knowledge_base/notes.md", same)
+    _write(root, "crispal/atendimento/notes.md", same)
+    _write(root, "mapped_folders/docs/design/notes.md", same)
     _write(root, "mapped_folders/apps/crispal/docs/knowledge_base/notes.md", same)
 
     counts = bulk_ingest.scan()
@@ -123,16 +208,14 @@ def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home):
         canonical = conn.execute(
             "SELECT relpath FROM files WHERE status = ?", (bulk_ingest.STATUS_PENDING,)
         ).fetchall()
-        assert [r["relpath"] for r in canonical] == [
-            "mapped_folders/repos/aw-app-crispal/docs/knowledge_base/notes.md"
-        ]
+        assert [r["relpath"] for r in canonical] == ["crispal/atendimento/notes.md"]
         aliases = conn.execute(
             "SELECT relpath, canonical_relpath FROM files WHERE status = ? ORDER BY relpath",
             (bulk_ingest.STATUS_ALIAS,),
         ).fetchall()
         assert [r["canonical_relpath"] for r in aliases] == [
-            "mapped_folders/repos/aw-app-crispal/docs/knowledge_base/notes.md",
-            "mapped_folders/repos/aw-app-crispal/docs/knowledge_base/notes.md",
+            "crispal/atendimento/notes.md",
+            "crispal/atendimento/notes.md",
         ]
     finally:
         conn.close()
@@ -175,7 +258,7 @@ def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, m
     # Re-scan: the uploaded row must not flip back to pending.
     bulk_ingest.scan()
     status = bulk_ingest.status()
-    assert status["by_bucket"]["kb-crispal"] == {"uploaded": 1}
+    assert status["by_subtree"]["crispal"] == {"uploaded": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -301,18 +384,20 @@ def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home,
     assert upload_calls == ["crispal/a.md"], "the second tick must never reach upload_bytes"
 
 
-def test_run_tick_respects_the_per_bucket_backlog_ceiling(_workspace_home, monkeypatch):
-    """§13.5.3 — a bucket already at/over the backlog ceiling is skipped for
-    the tick rather than pushed further into backlog; buckets under the
-    ceiling still proceed."""
+def test_run_tick_respects_the_backlog_ceiling(_workspace_home, monkeypatch):
+    """§13.5.3 — the bucket at/over the backlog ceiling is not pushed further
+    into backlog. One bucket now, so this is the whole tick rather than a
+    per-bucket skip.
+
+    It reports `blocked: False`, deliberately: `blocked` is what the CLI
+    turns into exit 1 and the scheduled task escalates to an agent, and a
+    full backlog is the ceiling doing its job. Pre-collapse this was a
+    per-bucket `skipped_reason` with exit 0 — pinned here so collapsing to
+    one bucket cannot quietly turn backpressure into a page.
+    """
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
-    _write(root, "memory/b.md", "content b")
     bulk_ingest.scan()
-
-    async def fake_status(bucket=None):
-        pending = bulk_ingest.MAX_PENDING_BACKLOG if bucket == "kb-crispal" else 0
-        return {"extraction": {"claiming": False}, "processing": {"pending": pending}}, None
 
     uploaded = []
 
@@ -320,14 +405,52 @@ def test_run_tick_respects_the_per_bucket_backlog_ceiling(_workspace_home, monke
         uploaded.append(bucket)
         return {"id": f"doc-{len(uploaded)}", "deduplicated": False}, None
 
-    monkeypatch.setattr(client, "get_ingest_status", fake_status)
+    monkeypatch.setattr(
+        client, "get_ingest_status", _ok_status(pending=bulk_ingest.MAX_PENDING_BACKLOG)
+    )
     monkeypatch.setattr(client, "upload_bytes", fake_upload)
 
     result = _run(bulk_ingest.run_tick())
 
-    assert uploaded == ["kb-memory"]
-    assert result["per_bucket"]["kb-crispal"]["skipped_reason"]
-    assert result["per_bucket"]["kb-memory"]["uploaded"] == 1
+    assert uploaded == []
+    assert result["blocked"] is False
+    assert "backlog" in result["skipped_reason"]
+
+
+def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, monkeypatch):
+    """The collapse, as a behavioural assertion: six subtrees, one `bucket=`
+    argument, and the subtree carried by `source_path` instead.
+
+    MUTATION: pass `bucket=subtree` to `upload_bytes` and this goes red on
+    the bucket set — which is the shape that would re-create per-folder
+    buckets one upload at a time.
+    """
+    root = bulk_ingest.kb_root()
+    _write(root, "crispal/a.md", "a")
+    _write(root, "notion/b.md", "b")
+    _write(root, "mapped_folders/docs/c.md", "c")
+    bulk_ingest.scan()
+
+    seen = []
+
+    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+        seen.append((bucket, source_path))
+        return {"id": f"doc-{len(seen)}", "deduplicated": False}, None
+
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+
+    result = _run(bulk_ingest.run_tick())
+
+    assert result["uploaded"] == 3
+    assert result["bucket"] == "main"
+    assert {bucket for bucket, _path in seen} == {"main"}
+    assert sorted(path for _bucket, path in seen) == [
+        "crispal/a.md",
+        "mapped_folders/docs/c.md",
+        "notion/b.md",
+    ]
+    assert set(result["per_subtree"]) == {"crispal", "notion", "mapped_folders"}
 
 
 def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_home, monkeypatch):
@@ -351,7 +474,8 @@ def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_hom
 
     assert result["uploaded"] == 4
     assert len(uploaded) == 4
-    # §13.3 order: kb-crispal's 3 pending go first, then 1 from kb-memory.
+    # §13.3 order survives the collapse, now over subtrees: crispal's 3
+    # pending go first, then 1 from memory.
     assert uploaded[:3] == ["crispal/c0.md", "crispal/c1.md", "crispal/c2.md"]
     assert uploaded[3] == "memory/m0.md"
 
@@ -413,7 +537,7 @@ def test_report_tallies_scanned_uploaded_deduplicated_and_pending(_workspace_hom
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "content a")
     _write(root, "crispal/b.md", "content b")
-    _write(root, "mapped_folders/repos/x/c.md", "content a")  # alias of a.md's content
+    _write(root, "mapped_folders/docs/c.md", "content a")  # alias of a.md's content
     bulk_ingest.scan()
 
     async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
@@ -424,10 +548,11 @@ def test_report_tallies_scanned_uploaded_deduplicated_and_pending(_workspace_hom
     _run(bulk_ingest.run_tick(max_uploads=1))
 
     report = bulk_ingest.report()
-    crispal = report["buckets"]["kb-crispal"]
+    assert report["bucket"] == "main"
+    crispal = report["subtrees"]["crispal"]
     assert crispal["scanned"] == 2
     assert crispal["uploaded_new"] == 1
     assert crispal["pending"] == 1
-    mapped = report["buckets"]["kb-mapped-folders"]
+    mapped = report["subtrees"]["mapped_folders"]
     assert mapped["driver_deduplicated_alias"] == 1
     assert report["totals"]["scanned"] == 3

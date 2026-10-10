@@ -21,7 +21,7 @@ unattended task sees.
 Usage:
     aw-workspace-cli knowledgeable-ingest scan                # (re)walk the KB tree, hash + canonicalize
     aw-workspace-cli knowledgeable-ingest run [--max-uploads N]  # one bounded tick (default 200)
-    aw-workspace-cli knowledgeable-ingest status               # journal counts by bucket/status
+    aw-workspace-cli knowledgeable-ingest status               # journal counts by subtree/status
     aw-workspace-cli knowledgeable-ingest report                # the §13 deliverable report
 
 Exit codes for `run`: 0 progressed or nothing pending, 1 the ignition guard

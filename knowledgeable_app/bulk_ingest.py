@@ -7,12 +7,33 @@ through two doors that both just POST to this app's own
 ``knowledgeable-ingest`` CLI command, and the ``contributes.tasks`` scheduled
 task that runs the identical CLI command as a shell job.
 
-**Four buckets, one per top-level KB subtree** (§13.1) — bucket is a
-permission boundary (§7bis), and the four subtrees are four genuinely
-different permission classes. Ingested in THIS order (§13.3): the curated
-subtrees first (crispal, memory, notion — 1,572 files, validatable the same
-day), `mapped_folders/` (the generated code-maps, 86% of the corpus and the
-most duplicated) last.
+**ONE bucket, `main`; the subtrees are COLLECTIONS** (card `3f55bf3b-9510-
+810c-99b4-cc473cd87815`, §8 + §15 of docs/design/aw-knowledgeable-fs-sync.md).
+
+This module used to map each top-level KB subtree to its own `kb-*` bucket
+(§13.1, "four genuinely different permission classes"). That was the wrong
+axis: a bucket is a VISIBILITY boundary (who may see this — §7bis), and six
+folders are not six audiences. They are one corpus with six source paths, and
+the price of the mistake was that every cross-cutting question had to be asked
+six times and merged by hand. The axis that answers "where did this come from"
+shipped separately as a **collection** — a `source_path` prefix inside one
+bucket, derived at read time from the `source_path` this driver already sends
+with every upload (§15.1). So nothing here needs to send a folder label: the
+upload carries the path, and the path IS the collection.
+
+§13.3's ingest ORDER survives the collapse and still matters — the curated
+subtrees go first because they are small and same-day validatable — which is
+why `SUBTREE_ORDER` is still an ordered tuple, now of subtrees rather than of
+(bucket, subtree) pairs.
+
+**Two subtrees are not ingested at all** (`SKIP_PREFIXES`). `mapped_folders/
+repos/` and `mapped_folders/aw-workspace/` are generated code maps that
+codegraph already indexes and answers better — Frederico's call, 2026-10-10:
+"I don't want to use the mapped code because we are using codegraph for those
+documents, let's rely on it." They were 7,329 of 9,216 ingested documents,
+~79% of the corpus. A skip here is structural, not a filter someone has to
+remember: `scan()` never walks them, so they can never re-enter the journal
+and no tick can re-upload what the §8 migration deleted.
 
 **Dedup lives in two layers, with different jobs (§13.2).** The server's own
 `content_hash` MERGE gate (`POST /api/documents`) is the idempotency safety
@@ -26,7 +47,7 @@ recorded as journal aliases, never POSTed at all.
 `run_tick()` — the one entrypoint both doors call — enforces, in order: the
 ignition guard (refuses to upload anything if entity extraction is
 claiming), a hard per-tick upload ceiling, and a per-bucket upload-backlog
-ceiling. It never touches `EXTRACTION_ENABLED`, never calls
+ceiling (now one bucket, so one backlog). It never touches `EXTRACTION_ENABLED`, never calls
 `/api/ingest/key`, and contributes no config that could flip either — the
 restriction the card requires be structural, not documental.
 
@@ -51,25 +72,47 @@ from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.bulk_ingest")
 
-# §13.3 — ingest order: curated subtrees first, mapped_folders/ last.
+#: The one bucket everything lands in — see this module's docstring for why
+#: six became one. The subtree a file came from is carried by `source_path`
+#: on the upload, and the server derives the collection from it; this driver
+#: therefore sends no folder label of its own.
+BUCKET = "main"
+
+# §13.3 — ingest order: curated subtrees first, mapped_folders/ last. Still an
+# ORDERED tuple after the collapse: the order was never about the buckets, it
+# was about validating the small curated corpora the same day.
 #
-# kb-cli-reference/kb-skills (card quality:procedural-genre-absent-from-
-# both-knowledge-indexes) are the procedural genre neither store had: one
-# doc per `aw-workspace-cli` command/subcommand captured from its own
-# --help (src/libs/cli_reference.py in aw-workspace core), and the
-# materialized skills/*/SKILL.md tree indexed as content for the first
-# time (previously only reachable via the separate search_skills surface).
-# Small, curated, hand-structured sources — same tier as crispal/memory/
-# notion, ingested before mapped_folders/ for the same reason those are.
-BUCKET_ORDER: tuple[tuple[str, str], ...] = (
-    ("kb-crispal", "crispal"),
-    ("kb-memory", "memory"),
-    ("kb-notion", "notion"),
-    ("kb-cli-reference", "cli_reference"),
-    ("kb-skills", "skills"),
-    ("kb-mapped-folders", "mapped_folders"),
+# cli_reference/skills (card quality:procedural-genre-absent-from-both-
+# knowledge-indexes) are the procedural genre neither store had: one doc per
+# `aw-workspace-cli` command/subcommand captured from its own --help
+# (src/libs/cli_reference.py in aw-workspace core), and the materialized
+# skills/*/SKILL.md tree indexed as content for the first time (previously
+# only reachable via the separate search_skills surface). Small, curated,
+# hand-structured sources — same tier as crispal/memory/notion, ingested
+# before mapped_folders/ for the same reason those are.
+SUBTREE_ORDER: tuple[str, ...] = (
+    "crispal",
+    "memory",
+    "notion",
+    "cli_reference",
+    "skills",
+    "mapped_folders",
 )
-BUCKETS: tuple[str, ...] = tuple(bucket for bucket, _subtree in BUCKET_ORDER)
+
+#: Subtrees never walked, never journalled, never uploaded. Generated code
+#: maps that codegraph indexes and answers better (Frederico, 2026-10-10) —
+#: see the module docstring. Checked against the KB-relative path, so the
+#: whole of `mapped_folders/` is NOT skipped: `mapped_folders/docs/` is
+#: hand-written design documentation and stays.
+SKIP_PREFIXES: tuple[str, ...] = (
+    "mapped_folders/repos/",
+    "mapped_folders/aw-workspace/",
+)
+
+
+def is_skipped(relpath: str) -> bool:
+    """True for a KB-relative path under one of :data:`SKIP_PREFIXES`."""
+    return relpath.startswith(SKIP_PREFIXES)
 
 STATUS_PENDING = "pending"
 STATUS_UPLOADED = "uploaded"
@@ -151,8 +194,52 @@ def _connect() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS files_status ON files(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS files_bucket ON files(bucket)")
     conn.execute("CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256)")
+    _migrate_journal_to_main(conn)
     conn.commit()
     return conn
+
+
+def _migrate_journal_to_main(conn: sqlite3.Connection) -> dict[str, int]:
+    """§8 step 4 of the fs-sync design — reconcile the journal with the
+    collapse, idempotently, on every connect.
+
+    Two statements, both no-ops after the first run:
+
+    * **Drop the skipped subtrees.** A row saying `mapped_folders/repos/x.md`
+      was `uploaded` into `kb-mapped-folders` describes a document that no
+      longer exists, and `scan()`'s `frozen` set would keep believing it
+      forever. Deleting the rows is what makes the skip rule a property of the
+      journal too, not only of the walk.
+    * **Rewrite `bucket` to `main`.** The alternative — leaving the old slug
+      and letting the server's `content_hash` MERGE gate re-dedup — was
+      rejected: the column is what `run_tick`'s own SELECT filters on, so a
+      stale value means those rows are simply never picked up again.
+
+    Deliberately NOT an ALTER: the schema is unchanged, the DATA is. Kept as
+    plain idempotent DML on connect rather than a one-shot migration marker,
+    which is this estate's house style for a store with no alembic — and the
+    table is ~2k rows, so the two scans cost nothing measurable.
+
+    The separate SQLite→Postgres card for this journal (`3f55bf3b-9510-8124-
+    ae31-d67ea0cc96dd`) moves the store, not its contents; leaving the bucket
+    column stale would have handed it a corpus it could not match.
+    """
+    skipped = 0
+    for prefix in SKIP_PREFIXES:
+        cur = conn.execute("DELETE FROM files WHERE relpath LIKE ?", (f"{prefix}%",))
+        skipped += cur.rowcount if cur.rowcount > 0 else 0
+    cur = conn.execute("UPDATE files SET bucket = ? WHERE bucket != ?", (BUCKET, BUCKET))
+    rebucketed = cur.rowcount if cur.rowcount > 0 else 0
+    if skipped or rebucketed:
+        log.info(
+            "journal reconciled with the §8 collapse: dropped %d row(s) under "
+            "%s, re-bucketed %d row(s) onto %r",
+            skipped,
+            list(SKIP_PREFIXES),
+            rebucketed,
+            BUCKET,
+        )
+    return {"dropped": skipped, "rebucketed": rebucketed}
 
 
 def _priority(relpath: str) -> int:
@@ -199,7 +286,7 @@ def scan() -> dict:
     by_hash: dict[str, list[tuple[str, str]]] = {}
     skipped: list[tuple[str, str, str]] = []  # (relpath, bucket, reason)
 
-    for bucket, subtree in BUCKET_ORDER:
+    for subtree in SUBTREE_ORDER:
         subtree_root = root / subtree
         if not subtree_root.is_dir():
             continue
@@ -207,12 +294,18 @@ def scan() -> dict:
             if not path.is_file():
                 continue
             relpath = str(path.relative_to(root))
+            # The code-map skip, enforced in the WALK — not as a status a
+            # later pass could reinterpret. A skipped path never gets hashed,
+            # never enters `by_hash`, and so can never win a canonical slot
+            # from a copy that IS kept.
+            if is_skipped(relpath):
+                continue
             size = path.stat().st_size
             if size > MAX_FILE_BYTES:
-                skipped.append((relpath, bucket, f"{size} bytes exceeds the 10MB cap"))
+                skipped.append((relpath, BUCKET, f"{size} bytes exceeds the 10MB cap"))
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            by_hash.setdefault(digest, []).append((relpath, bucket))
+            by_hash.setdefault(digest, []).append((relpath, BUCKET))
 
     conn = _connect()
     try:
@@ -279,24 +372,22 @@ def scan() -> dict:
         conn.close()
 
 
-def _pending_counts_by_bucket(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute(
-        "SELECT bucket, COUNT(*) AS n FROM files WHERE status = ? GROUP BY bucket",
-        (STATUS_PENDING,),
-    )
-    return {row["bucket"]: row["n"] for row in rows}
+def _pending_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE status = ?", (STATUS_PENDING,)
+    ).fetchone()
+    return row["n"] if row else 0
 
 
-async def _ensure_buckets() -> str | None:
-    """§13.1 — ``POST /api/buckets`` before the first upload into any of the
-    four. Idempotent across ticks (``client.create_bucket`` treats a 409 as
-    steady state, not a failure) — cheap enough to just call every tick
-    rather than tracking "did I already do this" as separate state that
-    could drift from the server's own registry."""
-    for bucket, _subtree in BUCKET_ORDER:
-        _data, err = await client.create_bucket(bucket)
-        if err:
-            return f"could not ensure bucket {bucket!r} exists: {err}"
+async def _ensure_bucket() -> str | None:
+    """§13.1 — ``POST /api/buckets`` before the first upload. Idempotent
+    across ticks (``client.create_bucket`` treats a 409 as steady state, not
+    a failure) — cheap enough to just call every tick rather than tracking
+    "did I already do this" as separate state that could drift from the
+    server's own registry."""
+    _data, err = await client.create_bucket(BUCKET)
+    if err:
+        return f"could not ensure bucket {BUCKET!r} exists: {err}"
     return None
 
 
@@ -304,7 +395,8 @@ async def run_tick(max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
     """One bounded tick — the only entrypoint either door (CLI `run`, the
     contributed scheduled task) ever calls. Enforces §13.5's three
     non-negotiables in order: the ignition guard, the per-tick ceiling, and
-    the per-bucket backlog ceiling. Advances buckets in §13.3's order,
+    the backlog ceiling — now checked once, against the one bucket, which is
+    what "per bucket" always meant. Advances SUBTREES in §13.3's order,
     stopping early once the ceiling is spent.
 
     Refuses to overlap with another in-flight tick (see ``_tick_lock``)
@@ -327,8 +419,7 @@ async def _run_tick_locked(max_uploads: int) -> dict:
     max_uploads = max(0, min(max_uploads, MAX_UPLOADS_PER_TICK))
     conn = _connect()
     try:
-        pending_by_bucket = _pending_counts_by_bucket(conn)
-        if not pending_by_bucket:
+        if not _pending_count(conn):
             return {
                 "blocked": False,
                 "uploaded": 0,
@@ -337,10 +428,10 @@ async def _run_tick_locked(max_uploads: int) -> dict:
                 "note": "nothing pending — run scan() first, or the pass is already complete",
             }
 
-        # §13.1 — the buckets must exist before anything else touches them
+        # §13.1 — the bucket must exist before anything else touches it
         # (GET /api/ingest/status?bucket=... 404s on an unregistered bucket
         # exactly like POST /api/documents would).
-        bucket_err = await _ensure_buckets()
+        bucket_err = await _ensure_bucket()
         if bucket_err:
             return {
                 "blocked": True,
@@ -350,11 +441,11 @@ async def _run_tick_locked(max_uploads: int) -> dict:
                 "failed": 0,
             }
 
-        # §13.5.2 — the ignition guard, checked BEFORE any upload. `claiming`
-        # is global state (ingest.py's own comment on the route) regardless
-        # of which bucket answers it.
-        probe_bucket = next(iter(pending_by_bucket))
-        status_payload, err = await client.get_ingest_status(probe_bucket)
+        # §13.5.2/§13.5.3 — the ignition guard and the backpressure ceiling,
+        # both read off ONE status call now that there is one bucket.
+        # `claiming` was always global state (ingest.py's own comment on the
+        # route); the backlog was always per bucket, and the bucket is `main`.
+        status_payload, err = await client.get_ingest_status(BUCKET)
         if err:
             return {
                 "blocked": True,
@@ -371,33 +462,43 @@ async def _run_tick_locked(max_uploads: int) -> dict:
                 "deduplicated": 0,
                 "failed": 0,
             }
+        backlog = ((status_payload or {}).get("processing") or {}).get(STATUS_PENDING, 0)
+        if backlog >= MAX_PENDING_BACKLOG:
+            # NOT `blocked`, deliberately: `blocked` is what the CLI turns
+            # into exit 1 and the scheduled task escalates to an agent, and a
+            # full backlog is the ceiling working as designed, not an
+            # incident. Pre-collapse this was a per-bucket `skipped_reason`
+            # with exit 0 for the same reason; one bucket must not turn it
+            # into a page.
+            return {
+                "blocked": False,
+                "uploaded": 0,
+                "deduplicated": 0,
+                "failed": 0,
+                "bucket": BUCKET,
+                "skipped_reason": (
+                    f"processing backlog {backlog} >= {MAX_PENDING_BACKLOG}"
+                ),
+            }
 
         budget = max_uploads
         uploaded = deduplicated = failed = 0
-        per_bucket: dict[str, dict] = {}
+        per_subtree: dict[str, dict] = {}
 
-        for bucket, _subtree in BUCKET_ORDER:
+        # §13.3's order, now over subtrees. The `relpath LIKE` prefix is what
+        # replaces the old `bucket = ?` filter: a subtree is a path prefix,
+        # which is the same thing a collection is on the server side.
+        for subtree in SUBTREE_ORDER:
             if budget <= 0:
                 break
-            if bucket not in pending_by_bucket:
-                continue
-
-            # §13.5.3 — the backpressure ceiling, genuinely per bucket.
-            bucket_status, err = await client.get_ingest_status(bucket)
-            if err:
-                per_bucket[bucket] = {"skipped_reason": f"status check failed: {err}"}
-                continue
-            backlog = ((bucket_status or {}).get("processing") or {}).get(STATUS_PENDING, 0)
-            if backlog >= MAX_PENDING_BACKLOG:
-                per_bucket[bucket] = {
-                    "skipped_reason": f"processing backlog {backlog} >= {MAX_PENDING_BACKLOG}"
-                }
-                continue
 
             rows = conn.execute(
-                "SELECT relpath FROM files WHERE bucket = ? AND status = ? ORDER BY relpath LIMIT ?",
-                (bucket, STATUS_PENDING, budget),
+                "SELECT relpath FROM files WHERE relpath LIKE ? AND status = ? "
+                "ORDER BY relpath LIMIT ?",
+                (f"{subtree}/%", STATUS_PENDING, budget),
             ).fetchall()
+            if not rows:
+                continue
 
             b_uploaded = b_dedup = b_failed = 0
             for row in rows:
@@ -414,8 +515,11 @@ async def _run_tick_locked(max_uploads: int) -> dict:
                     b_failed += 1
                     continue
 
+                # `source_path` is the load-bearing argument now: the server
+                # derives the collection from it (§15.1), so the subtree this
+                # file came from is carried by the path, not by the bucket.
                 data, err = await client.upload_bytes(
-                    Path(relpath).name, raw, bucket=bucket, source_path=relpath
+                    Path(relpath).name, raw, bucket=BUCKET, source_path=relpath
                 )
                 now = time.time()
                 if err:
@@ -452,7 +556,7 @@ async def _run_tick_locked(max_uploads: int) -> dict:
             uploaded += b_uploaded
             deduplicated += b_dedup
             failed += b_failed
-            per_bucket[bucket] = {
+            per_subtree[subtree] = {
                 "uploaded": b_uploaded,
                 "deduplicated": b_dedup,
                 "failed": b_failed,
@@ -463,7 +567,8 @@ async def _run_tick_locked(max_uploads: int) -> dict:
             "uploaded": uploaded,
             "deduplicated": deduplicated,
             "failed": failed,
-            "per_bucket": per_bucket,
+            "bucket": BUCKET,
+            "per_subtree": per_subtree,
         }
     finally:
         conn.close()
@@ -471,16 +576,28 @@ async def _run_tick_locked(max_uploads: int) -> dict:
 
 def status() -> dict:
     """A cheap journal-only snapshot — no network call — for the CLI `status`
-    subcommand and the task's own exit-code decision."""
+    subcommand and the task's own exit-code decision.
+
+    Keyed by SUBTREE, not by bucket: there is one bucket now, so a per-bucket
+    breakdown would be a single row and the axis an operator actually wants to
+    see — which part of the corpus is behind — would be gone. `bucket` is
+    still reported, once, so a reader can tell where it all landed.
+    """
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT bucket, status, COUNT(*) AS n FROM files GROUP BY bucket, status"
+            "SELECT relpath, status FROM files"
         ).fetchall()
-        by_bucket: dict[str, dict[str, int]] = {}
+        by_subtree: dict[str, dict[str, int]] = {}
         for row in rows:
-            by_bucket.setdefault(row["bucket"], {})[row["status"]] = row["n"]
-        return {"by_bucket": by_bucket, "journal_path": str(journal_path())}
+            subtree = row["relpath"].split("/", 1)[0]
+            counts = by_subtree.setdefault(subtree, {})
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        return {
+            "bucket": BUCKET,
+            "by_subtree": by_subtree,
+            "journal_path": str(journal_path()),
+        }
     finally:
         conn.close()
 
@@ -494,8 +611,8 @@ def report() -> dict:
     priority copy of the same content already was."""
     conn = _connect()
     try:
-        buckets: dict[str, dict] = {}
-        for bucket, _subtree in BUCKET_ORDER:
+        subtrees: dict[str, dict] = {}
+        for subtree in SUBTREE_ORDER:
             row = conn.execute(
                 """
                 SELECT
@@ -507,7 +624,7 @@ def report() -> dict:
                     SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS pending,
                     SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed,
                     SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS skipped
-                FROM files WHERE bucket = ?
+                FROM files WHERE relpath LIKE ?
                 """,
                 (
                     STATUS_UPLOADED,
@@ -516,12 +633,12 @@ def report() -> dict:
                     STATUS_PENDING,
                     STATUS_FAILED,
                     STATUS_SKIPPED,
-                    bucket,
+                    f"{subtree}/%",
                 ),
             ).fetchone()
             uploaded_total = row["uploaded_total"] or 0
             server_dedup = row["server_deduplicated"] or 0
-            buckets[bucket] = {
+            subtrees[subtree] = {
                 "scanned": row["scanned"] or 0,
                 "uploaded_new": uploaded_total - server_dedup,
                 "server_deduplicated": server_dedup,
@@ -531,9 +648,14 @@ def report() -> dict:
                 "skipped": row["skipped"] or 0,
             }
         totals: dict[str, int] = {}
-        for b in buckets.values():
+        for b in subtrees.values():
             for key, value in b.items():
                 totals[key] = totals.get(key, 0) + value
-        return {"buckets": buckets, "totals": totals, "journal_path": str(journal_path())}
+        return {
+            "bucket": BUCKET,
+            "subtrees": subtrees,
+            "totals": totals,
+            "journal_path": str(journal_path()),
+        }
     finally:
         conn.close()
