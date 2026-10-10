@@ -289,7 +289,15 @@ async def get_graph(args: dict) -> tuple[str, bool]:
         depth = int(depth)
     except (TypeError, ValueError):
         depth = 1
-    data, err = await _get("/api/graph", {"focus": focus, "depth": depth})
+    # bug:knowledgeable-get-graph-search-nodes-bucket-default — mirrors
+    # list_documents' `bucket` knob: omitted spans every bucket this token
+    # can read (GET /api/graph's own `resolve_search_scope` dependency),
+    # passed narrows to that one bucket.
+    params = {"focus": focus, "depth": depth}
+    bucket = (args.get("bucket") or "").strip()
+    if bucket:
+        params["bucket"] = bucket
+    data, err = await _get("/api/graph", params)
     if err:
         return f"get_graph failed: {err}", True
     return _as_text(data), False
@@ -318,6 +326,12 @@ async def search_nodes(args: dict) -> tuple[str, bool]:
             params["limit"] = int(args["limit"])
         except (TypeError, ValueError):
             pass
+    # bug:knowledgeable-get-graph-search-nodes-bucket-default — mirrors
+    # list_documents' `bucket` knob: omitted spans every bucket this token
+    # can read, passed narrows to that one bucket.
+    bucket = (args.get("bucket") or "").strip()
+    if bucket:
+        params["bucket"] = bucket
     data, err = await _get("/api/search", params)
     if err:
         return f"search_nodes failed: {err}", True
@@ -436,14 +450,21 @@ TOOLS_SCHEMA = [
         "name": "get_graph",
         "description": (
             "Get the neighbourhood graph (nodes + edges) around one focus node, 1 or 2 "
-            "hops out. `focus` is required — there is no endpoint that returns the "
-            "whole graph."
+            "hops out, across every bucket your token can read. Pass bucket to narrow "
+            "to just one. An unscoped neighbourhood is capped — the response declares "
+            "neighbors_truncated/neighbors_returned/neighbors_available so a caller "
+            "never has to guess. `focus` is required — there is no endpoint that "
+            "returns the whole graph."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "focus": {"type": "string", "description": "Id of the node to center the view on."},
                 "depth": {"type": "integer", "description": "1 or 2 hops. Default 1."},
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to narrow this view to. Omit to search every bucket your token can read.",
+                },
             },
             "required": ["focus"],
         },
@@ -467,8 +488,9 @@ TOOLS_SCHEMA = [
     {
         "name": "search_nodes",
         "description": (
-            "Lexical (case-insensitive substring) search over node labels. Bounded by "
-            "`limit` — this is deliberately not a whole-graph fanout."
+            "Lexical (case-insensitive substring) search over node labels, across "
+            "every bucket your token can read. Pass bucket to narrow to just one. "
+            "Bounded by `limit` — this is deliberately not a whole-graph fanout."
         ),
         "inputSchema": {
             "type": "object",
@@ -476,6 +498,10 @@ TOOLS_SCHEMA = [
                 "q": {"type": "string", "description": "Substring to search for in node labels."},
                 "exclude": {"type": "string", "description": "Optional node id to exclude from results (e.g. the node you're linking from)."},
                 "limit": {"type": "integer", "description": "Max results. Default 20."},
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to narrow this search to. Omit to search every bucket your token can read.",
+                },
             },
             "required": ["q"],
         },

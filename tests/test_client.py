@@ -156,6 +156,15 @@ def test_get_graph_passes_focus_and_clamped_depth():
     assert call["params"] == {"focus": "doc-1", "depth": 2}
 
 
+def test_get_graph_passes_an_explicit_bucket_through():
+    """bug:knowledgeable-get-graph-search-nodes-bucket-default — the fix's
+    optional narrowing knob, mirroring list_documents' own `bucket` param."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"nodes": [], "edges": []}))
+    _run(client.get_graph({"focus": "doc-1", "bucket": "main"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"focus": "doc-1", "depth": 1, "bucket": "main"}
+
+
 def test_create_node_requires_label_and_type():
     text, is_error = _run(client.create_node({"label": "x"}))
     assert is_error is True and "type is required" in text
@@ -192,6 +201,15 @@ def test_search_nodes_builds_bounded_query_params():
     _run(client.search_nodes({"q": "sushi", "exclude": "doc-1", "limit": "5"}))
     call = _FakeAsyncClient._CALLS[0]
     assert call["params"] == {"q": "sushi", "exclude": "doc-1", "limit": 5}
+
+
+def test_search_nodes_passes_an_explicit_bucket_through():
+    """bug:knowledgeable-get-graph-search-nodes-bucket-default — the fix's
+    optional narrowing knob, mirroring list_documents' own `bucket` param."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [], "relationship_types": []}))
+    _run(client.search_nodes({"q": "sushi", "bucket": "main"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {"q": "sushi", "bucket": "main"}
 
 
 def test_search_graph_defaults_mode_to_tree():
