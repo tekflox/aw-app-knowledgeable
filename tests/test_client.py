@@ -229,6 +229,30 @@ def test_search_graph_omits_include_traversal_when_absent():
     assert "include_traversal" not in call["params"]
 
 
+def test_search_graph_forwards_collection_anchor_and_anchor_depth():
+    """§15.6 — coerce-and-forward, same pattern as every other knob: the
+    backend's own validation matrix is the single source of truth."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({
+        "q": "sushi", "mode": "semantic", "bucket": "recipes",
+        "collection": "notion/kanban/done/", "anchor": "doc-1", "anchor_depth": "2",
+    }))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] == {
+        "q": "sushi", "mode": "semantic", "bucket": "recipes",
+        "collection": "notion/kanban/done/", "anchor": "doc-1", "anchor_depth": 2,
+    }
+
+
+def test_search_graph_omits_collection_and_anchor_when_absent():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_graph({"q": "sushi"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert "collection" not in call["params"]
+    assert "anchor" not in call["params"]
+    assert "anchor_depth" not in call["params"]
+
+
 def test_search_graph_surfaces_backend_400_verbatim():
     """§5/§12's declared-contract rule: the backend's validation matrix is the
     one source of truth for knob×mode mismatches — this tool must not

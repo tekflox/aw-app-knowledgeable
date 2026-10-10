@@ -356,6 +356,18 @@ async def search_graph(args: dict) -> tuple[str, bool]:
         params["bucket"] = args["bucket"]
     if args.get("include_traversal") is not None:
         params["include_traversal"] = bool(args["include_traversal"])
+    # §15.6 — coerce-and-forward, same pattern as every other knob above:
+    # the backend's own validation matrix is the single source of truth,
+    # never re-validated here.
+    if args.get("collection"):
+        params["collection"] = args["collection"]
+    if args.get("anchor"):
+        params["anchor"] = args["anchor"]
+    if args.get("anchor_depth") is not None:
+        try:
+            params["anchor_depth"] = int(args["anchor_depth"])
+        except (TypeError, ValueError):
+            pass
     data, err = await _get("/api/search", params)
     if err:
         return f"search_graph failed: {err}", True
@@ -458,6 +470,8 @@ TOOLS_SCHEMA = [
             "similarity), or tree (beam-descend the bucket's topic tree). Unlike "
             "search_nodes (name matching for the link picker), this tool defaults "
             "to mode=tree because it is for knowledge retrieval, not label lookup. "
+            "Two more scoping knobs, independent concepts: `collection` = stay inside "
+            "this source folder; `anchor` = start the traversal from this node. "
             "The response envelope echoes the params that actually ran, plus "
             "strategy/not_applied/dropped_below_min_score — a knob the chosen mode "
             "can't honour is either a 400 (the knob does not exist for this mode "
@@ -520,6 +534,45 @@ TOOLS_SCHEMA = [
                 "bucket": {
                     "type": "string",
                     "description": "Knowledge bucket to scope this search to. Omit to search every bucket your token can read.",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": (
+                        "mode=semantic or mode=tree only, and requires an explicit bucket — "
+                        "rejected with 400 otherwise. A source-path folder prefix (e.g. "
+                        "'notion/kanban/done/') to scope this search to — stay inside this "
+                        "folder, full depth. On mode=tree this SKIPS the topic-tree descent "
+                        "entirely (the human already supplied the scope the descent exists "
+                        "to find): the response declares strategy='flat' and carries no "
+                        "topic_path. Composes with `anchor` — the anchor's traversal still "
+                        "walks freely across folders, this filter only narrows what is kept."
+                    ),
+                },
+                "anchor": {
+                    "type": "string",
+                    "description": (
+                        "mode=semantic or mode=tree only, requires an explicit bucket and a "
+                        "non-empty q — rejected with 400 otherwise. The id of a Document, "
+                        "Entity or Collection to START a traversal from (never a Topic id — "
+                        "topics are rebuilt wholesale, so a saved anchor on one would die on "
+                        "the next rebuild). `path:<folder prefix>` is sugar for anchoring on "
+                        "that Collection. A 404 means the id does not resolve in your tenant. "
+                        "The response declares strategy='anchored', an `anchor` block "
+                        "(id/kind/depth/vias/expanded_documents/truncated), and an "
+                        "`anchor_hops` field per result — ranking is by query score alone, "
+                        "hops are informational, never blended into the score."
+                    ),
+                },
+                "anchor_depth": {
+                    "type": "integer",
+                    "description": (
+                        "Only valid with `anchor` — rejected with 400 without it. How many "
+                        "LINKS_TO/RELATED_TO expansion rounds past the anchor's own base set "
+                        "(the anchor itself for a Document, its direct members for a "
+                        "Collection, its mentioning documents for an Entity). Range 0-2, "
+                        "default 1. `related_vias` selects which RELATED_TO edges the "
+                        "expansion follows; LINKS_TO is always followed."
+                    ),
                 },
                 "include_traversal": {
                     "type": "boolean",
