@@ -86,7 +86,10 @@
         ],
         "enabled": false
       }
-    ]
+    ],
+    "knowledge": {
+      "path": "docs"
+    }
   },
   "config_schema": {
     "type": "object",
