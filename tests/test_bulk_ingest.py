@@ -209,6 +209,44 @@ def test_scan_never_walks_the_skipped_code_map_subtrees(_workspace_home, db):
     assert relpaths == ["mapped_folders/docs/design/keep.md"]
 
 
+def test_is_skipped_excludes_any_leading_dot_component():
+    """§16.1's rule, directly: any path component — directory or file, at
+    any depth — starting with `.` is skipped. Not a `.git` denylist."""
+    assert bulk_ingest.is_skipped("notion/.git/objects/pack/x.md")
+    assert bulk_ingest.is_skipped("notion/.github/README.md")
+    assert bulk_ingest.is_skipped("notion/subdir/.obsidian/cache.md")
+    assert bulk_ingest.is_skipped("notion/.env")
+    assert bulk_ingest.is_skipped("notion/.hidden.md")
+    assert not bulk_ingest.is_skipped("notion/normal.md")
+    assert not bulk_ingest.is_skipped("mapped_folders/docs/design/keep.md")
+
+
+def test_scan_prunes_every_dot_component_including_nested_dotfolders(_workspace_home, db):
+    """docs/design/aw-knowledgeable-fs-sync.md §16.1's own verification bar
+    — a `.git` (with a planted file inside its object store), a `.github`,
+    and a NESTED dotfolder several levels deep, plus a dot-file, all
+    produce zero journal rows. The nested case is the one that matters: a
+    root-only `.git` test would still pass if the walk only pruned at the
+    subtree's top level.
+
+    MUTATION: revert `_iter_markdown_files` to a plain `rglob("*.md")` (no
+    `dirnames[:]` pruning) and this goes red on `scanned == 1` — every
+    planted dot-path file reappears in the journal.
+    """
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/.git/objects/pack/x.md", "git object store")
+    _write(root, "notion/.github/README.md", "github workflow doc")
+    _write(root, "notion/subdir/.foo/bar/nested.md", "nested dotfolder, several levels deep")
+    _write(root, "notion/.env", "SECRET=leaked")
+    _write(root, "notion/.hidden.md", "dot-file with the ingested extension")
+    _write(root, "notion/normal.md", "a real document")
+
+    counts = bulk_ingest.scan(db)
+    assert counts["scanned"] == 1
+    relpaths = sorted(r["relpath"] for r in _journal_rows(db))
+    assert relpaths == ["notion/normal.md"]
+
+
 def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home, db):
     """§13.2's cross-prefix canonicalization: the same content reachable from
     more than one place, uploaded exactly once.

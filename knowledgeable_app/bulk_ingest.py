@@ -128,8 +128,16 @@ SKIP_PREFIXES: tuple[str, ...] = (
 
 
 def is_skipped(relpath: str) -> bool:
-    """True for a KB-relative path under one of :data:`SKIP_PREFIXES`."""
-    return relpath.startswith(SKIP_PREFIXES)
+    """True for a KB-relative path under one of :data:`SKIP_PREFIXES`, or
+    with any component — directory or file, at any depth — starting with
+    ``.`` (docs/design/aw-knowledgeable-fs-sync.md §16.1, the `kb_app/
+    kb_ops.py:162` idiom adopted here rather than reinvented). Not a `.git`
+    denylist: `.github`, `.obsidian`, `.env` are the same class, and the
+    git backend (§16.2) puts a `.git/` inside this very tree, so the rule
+    must already be in force before that directory ever appears."""
+    if relpath.startswith(SKIP_PREFIXES):
+        return True
+    return any(part.startswith(".") for part in relpath.split("/"))
 
 STATUS_PENDING = "pending"
 STATUS_UPLOADED = "uploaded"
@@ -222,6 +230,23 @@ def _priority(relpath: str) -> int:
     return 1
 
 
+def _iter_markdown_files(subtree_root: Path):
+    """Yield every ``*.md`` file under `subtree_root`, pruning any directory
+    whose name starts with ``.`` AT THE WALK (the `kb_app/kb_ops.py:162`
+    idiom: ``dirnames[:] = [...]`` before `os.walk` descends it) — not a
+    post-glob filter. §16.10 risk 1: filtering `.git` paths after an
+    `rglob` still visits every one of its tens of thousands of object-store
+    entries each tick; pruning means a dot-directory is never entered at
+    all. Dot-named files are skipped the same way."""
+    for dirpath, dirnames, filenames in os.walk(subtree_root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            if filename.endswith(".md"):
+                yield Path(dirpath) / filename
+
+
 def scan(db) -> dict:
     """Walk the whole KB tree, hash every file, decide canonical vs alias
     GLOBALLY — this driver is the only thing with full-corpus sight (§13.2)
@@ -248,7 +273,7 @@ def scan(db) -> dict:
         subtree_root = root / subtree
         if not subtree_root.is_dir():
             continue
-        for path in sorted(subtree_root.rglob("*.md")):
+        for path in _iter_markdown_files(subtree_root):
             if not path.is_file():
                 continue
             relpath = str(path.relative_to(root))
