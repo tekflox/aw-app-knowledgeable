@@ -107,12 +107,22 @@ BUCKET = "main"
 # only reachable via the separate search_skills surface). Small, curated,
 # hand-structured sources — same tier as crispal/memory/notion, ingested
 # before mapped_folders/ for the same reason those are.
+#
+# apps/ (docs/design/contributes-knowledge-and-cli-reference-split.md) is
+# core's exact-mirror of every installed app's own contributed docs plus its
+# per-command cli_reference — the same "curated, generated from live state"
+# tier as cli_reference/skills above it, not a raw code dump. It sits last
+# among the curated subtrees rather than beside cli_reference/skills because
+# it is the newest and, right now, the smallest/often-empty one (an
+# uninstalled app leaves nothing behind) — still ingested well before the
+# bulk of mapped_folders/.
 SUBTREE_ORDER: tuple[str, ...] = (
     "crispal",
     "memory",
     "notion",
     "cli_reference",
     "skills",
+    "apps",
     "mapped_folders",
 )
 

@@ -217,6 +217,7 @@ def test_is_skipped_excludes_any_leading_dot_component():
     assert bulk_ingest.is_skipped("notion/subdir/.obsidian/cache.md")
     assert bulk_ingest.is_skipped("notion/.env")
     assert bulk_ingest.is_skipped("notion/.hidden.md")
+    assert bulk_ingest.is_skipped("apps/.generated")
     assert not bulk_ingest.is_skipped("notion/normal.md")
     assert not bulk_ingest.is_skipped("mapped_folders/docs/design/keep.md")
 
@@ -245,6 +246,27 @@ def test_scan_prunes_every_dot_component_including_nested_dotfolders(_workspace_
     assert counts["scanned"] == 1
     relpaths = sorted(r["relpath"] for r in _journal_rows(db))
     assert relpaths == ["notion/normal.md"]
+
+
+def test_scan_skips_the_apps_generated_marker(_workspace_home, db):
+    """The live interaction the card calls out: core writes a dot-named
+    `.generated` marker directly into `knowledge_base/apps/` (aw-workspace
+    core `bd2073d`), and the connector's dot-rule (§16.1, v0.20.0) must prune
+    it like any other dot-path — `apps` being new to `SUBTREE_ORDER` must not
+    carve out an exception. A real app doc alongside it is still ingested.
+
+    MUTATION: drop the `is_skipped(relpath)` guard in `scan()` (same mutation
+    as the dot-component test above) and this goes red on `scanned == 1` —
+    `apps/.generated` would re-enter the journal as `pending`.
+    """
+    root = bulk_ingest.kb_root()
+    _write(root, "apps/.generated", "# generated — do not edit by hand")
+    _write(root, "apps/aw-app-crispal/docs/knowledge_base/notes.md", "a real app doc")
+
+    counts = bulk_ingest.scan(db)
+    assert counts["scanned"] == 1
+    relpaths = sorted(r["relpath"] for r in _journal_rows(db))
+    assert relpaths == ["apps/aw-app-crispal/docs/knowledge_base/notes.md"]
 
 
 def test_scan_canonicalizes_duplicate_content_across_prefixes(_workspace_home, db):
