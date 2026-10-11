@@ -82,11 +82,12 @@ def _fresh_fake_client(monkeypatch):
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: "")
 
 
-def test_all_seven_tools_are_advertised_and_dispatchable():
+def test_all_eight_tools_are_advertised_and_dispatchable():
     names = {t["name"] for t in client.TOOLS_SCHEMA}
     assert names == {
         "upload_document", "create_node", "create_link",
         "get_graph", "list_documents", "search_nodes", "search_graph",
+        "knowledge_search",
     }
     assert names == set(http_handler._DISPATCH)
 
@@ -458,7 +459,7 @@ def test_initialize_and_tools_list():
     init = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
     assert init["result"]["serverInfo"]["name"] == "aw-knowledgeable"
     listed = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-    assert len(listed["result"]["tools"]) == 7
+    assert len(listed["result"]["tools"]) == 8
 
 
 def test_initialized_notification_gets_no_response():
@@ -504,3 +505,60 @@ def test_mcp_json_write_is_skipped_when_unchanged(tmp_path):
     assert (tmp_path / "mcp.json").stat().st_mtime_ns == before
     mcp_config.write_mcp_json(str(tmp_path), 9999)
     assert (tmp_path / "mcp.json").stat().st_mtime_ns != before
+
+
+# ---------------------------------------------------------------------------
+# knowledge_search (feature:knowledge-search-tunable-endpoint) — POSTs to
+# /api/knowledge/search with a JSON body plus bucket/collection as query
+# params, same split the route itself uses.
+# ---------------------------------------------------------------------------
+
+
+def test_knowledge_search_requires_a_query():
+    text, is_error = _run(client.knowledge_search({}))
+    assert is_error
+    assert "query is required" in text
+    assert _FakeAsyncClient._CALLS == []
+
+
+def test_knowledge_search_posts_query_as_the_only_required_body_field():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"chunks": []}))
+    _run(client.knowledge_search({"query": "how do I restart the ingest worker"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/api/knowledge/search")
+    assert call["json"] == {"query": "how do I restart the ingest worker"}
+    assert call["params"] == {}
+
+
+def test_knowledge_search_forwards_every_tunable_knob():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"chunks": []}))
+    _run(client.knowledge_search({
+        "query": "sushi", "mode": "fused", "radius": 2, "limit": 20,
+        "subqueries": 5, "rounds": 1, "budget_ms": 15000, "synthesize": False,
+        "filters": {"document_ids": ["doc-1"]},
+        "bucket": "recipes", "collection": "notion/kanban/",
+    }))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["json"] == {
+        "query": "sushi", "mode": "fused", "radius": 2, "limit": 20,
+        "subqueries": 5, "rounds": 1, "budget_ms": 15000, "synthesize": False,
+        "filters": {"document_ids": ["doc-1"]},
+    }
+    assert call["params"] == {"bucket": "recipes", "collection": "notion/kanban/"}
+
+
+def test_knowledge_search_only_forwards_known_fields():
+    """Same D2-risk-4 rule as search_graph/create_node — a gateway-injected
+    extra key must never reach the outbound body."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"chunks": []}))
+    _run(client.knowledge_search({"query": "sushi", "_gateway_caller_run_id": "run-xyz"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["json"] == {"query": "sushi"}
+
+
+def test_knowledge_search_reports_the_backend_error_text():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(400, {"detail": "unsupported filter key(s): ['author']"}))
+    text, is_error = _run(client.knowledge_search({"query": "sushi", "filters": {"author": "x"}}))
+    assert is_error
+    assert "unsupported filter key(s)" in text

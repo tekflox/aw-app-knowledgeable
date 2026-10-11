@@ -1,7 +1,7 @@
 # aw-app-knowledgeable
 
-Ingestion MCP connector for [fredericowu/aw-knowledgeable](https://github.com/fredericowu/aw-knowledgeable),
-the standalone Neo4j knowledge-graph service. 6 tools, gateway-prefixed
+Ingestion + retrieval MCP connector for [fredericowu/aw-knowledgeable](https://github.com/fredericowu/aw-knowledgeable),
+the standalone Neo4j knowledge-graph service. 8 tools, gateway-prefixed
 `aw__aw_knowledgeable__*`, mapped 1:1 onto aw-knowledgeable's own API:
 
 | Tool | aw-knowledgeable endpoint |
@@ -12,6 +12,8 @@ the standalone Neo4j knowledge-graph service. 6 tools, gateway-prefixed
 | `get_graph` | `GET /api/graph?focus=&depth=` |
 | `list_documents` | `GET /api/documents` |
 | `search_nodes` | `GET /api/search?q=&exclude=&limit=` |
+| `search_graph` | `GET /api/search?q=&mode=&limit=&beam_width=&min_score=&related_vias=&collection=&anchor=&anchor_depth=` |
+| `knowledge_search` | `POST /api/knowledge/search` — multi-query, multi-arm, RRF-fused retrieval + optional synthesis |
 
 This app has **no Neo4j driver and no Cypher** — it is a thin HTTP client. See
 `docs/design/aw-knowledgeable-infra.md` §10 (decision D2) in `aw-workspace` for

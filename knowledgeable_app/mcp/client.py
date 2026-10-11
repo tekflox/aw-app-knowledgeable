@@ -78,10 +78,14 @@ async def _get(path: str, params: dict | None = None) -> tuple[dict | None, str 
     return resp.json(), None
 
 
-async def _post_json(path: str, body: dict) -> tuple[dict | None, str | None]:
-    async with httpx.AsyncClient(timeout=30) as http_client:
+async def _post_json(
+    path: str, body: dict, *, params: dict | None = None, timeout: float = 30
+) -> tuple[dict | None, str | None]:
+    async with httpx.AsyncClient(timeout=timeout) as http_client:
         try:
-            resp = await http_client.post(f"{base_url()}{path}", json=body, headers=_headers())
+            resp = await http_client.post(
+                f"{base_url()}{path}", json=body, params=params, headers=_headers()
+            )
         except httpx.HTTPError as exc:
             return None, f"could not reach aw-knowledgeable at {base_url()}: {exc}"
     if resp.status_code >= 400:
@@ -394,6 +398,50 @@ async def search_graph(args: dict) -> tuple[str, bool]:
     return _as_text(data), False
 
 
+async def knowledge_search(args: dict) -> tuple[str, bool]:
+    """POST /api/knowledge/search (feature:knowledge-search-tunable-
+    endpoint) — the bounded plan -> fan-out -> fuse -> synthesize pipeline,
+    distinct from `search_graph`'s single-arm retrieval: this tool runs
+    MULTIPLE sub-queries across MULTIPLE arms in parallel and fuses them
+    with Reciprocal Rank Fusion before optionally synthesizing an answer.
+
+    Every knob below is advisory — the backend clamps, never 400s, on an
+    out-of-floor value, and reports every override in the response's own
+    `effective`/`clamped` fields. This tool forwards every knob field-by-
+    field (never the raw `args` dict) and never re-validates a range
+    itself, same rule `search_graph` already follows: the backend's own
+    floors are the single source of truth.
+    """
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "query is required", True
+
+    body: dict = {"query": query}
+    for field in ("mode", "radius", "limit", "subqueries", "rounds", "budget_ms", "synthesize"):
+        if args.get(field) is not None:
+            body[field] = args[field]
+    if args.get("filters"):
+        body["filters"] = args["filters"]
+
+    params: dict = {}
+    if args.get("bucket"):
+        params["bucket"] = args["bucket"]
+    if args.get("collection"):
+        params["collection"] = args["collection"]
+
+    # Generous headroom over the server's own `budget_ms` (itself clamped
+    # at 25000) — this connector's own timeout must never be the thing that
+    # cuts the request before the server's own declared degradation gets a
+    # chance to run.
+    budget_ms = body.get("budget_ms") or 20000
+    timeout = min(45.0, max(30.0, budget_ms / 1000.0 + 10.0))
+
+    data, err = await _post_json("/api/knowledge/search", body, params=params, timeout=timeout)
+    if err:
+        return f"knowledge_search failed: {err}", True
+    return _as_text(data), False
+
+
 def _as_text(data) -> str:
     import json
 
@@ -632,6 +680,133 @@ TOOLS_SCHEMA = [
                 },
             },
             "required": ["q"],
+        },
+    },
+    {
+        "name": "knowledge_search",
+        "description": (
+            "Reasoning, multi-query retrieval: decomposes `query` into up to "
+            "`subqueries` sub-questions (one cheap planner call), retrieves each "
+            "in parallel across the modes below, fuses every arm with Reciprocal "
+            "Rank Fusion (on ranks, never on raw scores — vector/lexical/graph "
+            "scores are incomparable scales), and optionally synthesizes one "
+            "closed-book answer with citations. Bounded and NOT agentic — one "
+            "planning call, one fan-out, one fuse, one synthesis call (plus up to "
+            "`rounds` more fan-out+fuse cycles); it never loops on its own. Use "
+            "this instead of repeated search_graph calls when you want the model "
+            "to decompose the question and fuse multiple retrieval strategies "
+            "for you in one call. "
+            "EVERY KNOB BELOW IS ADVISORY — the server clamps out-of-floor values "
+            "rather than rejecting them, and the response's `effective` field is "
+            "what ACTUALLY ran; `clamped` lists every override, in plain English. "
+            "In particular: `limit` has a floor of 20 — a lower value is clamped "
+            "up because this corpus measurably returns a WORSE result SET below "
+            "that floor, not a prefix of a larger one. Always read `effective`/"
+            "`clamped`, never assume the value you sent is the value that ran. "
+            "The response also carries `chunks` (fused, ranked, with per-arm "
+            "provenance), `citations`, `answer` (null if `synthesize=false` or "
+            "if the synthesis door is degraded — retrieval still runs either way), "
+            "and `plan` (which sub-queries actually ran, and whether the planner "
+            "or a deterministic fallback produced them)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The question to search for. Required."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["vector", "lexical", "graph", "fused"],
+                    "description": (
+                        "Which retrieval arm(s) to fan every sub-query across. 'vector': "
+                        "embedding similarity only. 'lexical': BM25 full-text over chunk "
+                        "text (distinct from search_nodes' label-substring match). "
+                        "'graph': seed a few candidate documents by vector similarity, "
+                        "then widen via LINKS_TO/RELATED_TO out to `radius` hops and score "
+                        "the expanded set exactly — finds a differently-worded answer "
+                        "reachable only by document structure, not by content similarity "
+                        "alone. 'fused' (default): all three, RRF-merged."
+                    ),
+                },
+                "radius": {
+                    "type": "integer",
+                    "description": (
+                        "mode=graph or mode=fused only. LINKS_TO/RELATED_TO expansion hops "
+                        "from the graph arm's own seed documents. Floor 0, ceiling 2 — "
+                        "values outside that range are clamped, not rejected. Default 1."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Per-arm result count AND the final fused count fed to synthesis. "
+                        "FLOOR 20, NOT NEGOTIABLE — measured on this corpus, a lower limit "
+                        "returns a worse result SET, not a prefix of this one. A value "
+                        "below 20 is clamped up and declared in `clamped`, never honoured "
+                        "as sent. Default 20."
+                    ),
+                },
+                "subqueries": {
+                    "type": "integer",
+                    "description": (
+                        "Max sub-queries the planner may produce from `query`. Floor 1, "
+                        "HARD ceiling 5 (never raised above 5 regardless of value sent). "
+                        "Default 3."
+                    ),
+                },
+                "rounds": {
+                    "type": "integer",
+                    "description": (
+                        "Extra refine fan-out+fuse cycles beyond the first, each excluding "
+                        "sub-queries already tried. Floor 0, ceiling 2. Default 0 — raising "
+                        "this roughly multiplies latency/cost per round, so it should be "
+                        "requested deliberately, not as a default habit."
+                    ),
+                },
+                "filters": {
+                    "type": "object",
+                    "description": (
+                        "Optional post-retrieval narrowing, applied before fusion so ranks "
+                        "reflect the filtered set. Keys: `document_ids` (array of string — "
+                        "keep only these documents), `labels` (array of string — keep only "
+                        "documents whose label is in this set), `date_from`/`date_to` (ISO "
+                        "date strings — keep only documents created in this range). Any "
+                        "other key is REJECTED with an error, never silently ignored."
+                    ),
+                    "properties": {
+                        "document_ids": {"type": "array", "items": {"type": "string"}},
+                        "labels": {"type": "array", "items": {"type": "string"}},
+                        "date_from": {"type": "string"},
+                        "date_to": {"type": "string"},
+                    },
+                },
+                "budget_ms": {
+                    "type": "integer",
+                    "description": (
+                        "Wall-clock budget for the whole pipeline. Default 20000, server-"
+                        "capped at 25000 — stay under this, the production tunnel edge "
+                        "cuts requests around 30s regardless. Past budget, synthesis is "
+                        "skipped and the fused retrieval is still returned, declared in "
+                        "`clamped` — never a timeout, never a 500."
+                    ),
+                },
+                "synthesize": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. false skips the closed-book synthesis call entirely "
+                        "and returns just the fused chunks/citations — the cheap path for a "
+                        "caller that wants to do its own reading."
+                    ),
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to scope this search to. Omit to search every bucket your token can read.",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": "Source-path folder prefix to stay inside, full depth, e.g. 'notion/kanban/done/'.",
+                },
+            },
+            "required": ["query"],
         },
     },
 ]
