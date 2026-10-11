@@ -33,8 +33,23 @@
               "label": "Service secret",
               "input": "password",
               "description": "Stored in the workspace secret store. Takes effect on the next tool call — no restart."
+            },
+            {
+              "key": "git_token",
+              "label": "Git backend — token",
+              "input": "password",
+              "description": "Optional. A fine-grained GitHub PAT, Contents read/write on the one repo named below. Leave blank to clear it. Until this is set, each sync tick's git step reports git_state: no_secret and the mirror stays local-only."
             }
           ]
+        }
+      ]
+    },
+    {
+      "id": "git",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "### Git backend (§16)\nThe remote repo URL and branch are plain config fields, edited from this app's own Settings gear — `git_remote_url` (an HTTPS repo URL, no embedded credential) and `git_branch` (default `main`). Leaving the URL empty disables the git backend entirely.\n\nEach sync tick commits `knowledge_base/` (minus the generated `mapped_folders/repos/` and `mapped_folders/aw-workspace/` code maps) and pushes, fast-forward-only — a human edit to the mirror on GitHub, or handing this connector a non-empty repo, surfaces as `git_state: diverged` and is never force-pushed. Current state is in the `/status` payload above (`git.state`/`git.detail`) and in `aw-workspace-cli knowledgeable-ingest status`."
         }
       ]
     },

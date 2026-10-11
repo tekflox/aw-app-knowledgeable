@@ -32,9 +32,26 @@ class _FakeSecrets:
         self._store.pop(key, None)
 
 
+class _FakeKv:
+    """Double for `ctx.state.kv` — plain dict, no TTL semantics (not
+    needed for these route-level tests; TTL behavior itself is
+    state_facade.py's own concern, not this app's)."""
+
+    def __init__(self):
+        self._store: dict[str, object] = {}
+
+    async def put(self, name, value, ttl):
+        self._store[name] = value
+
+    async def get(self, name):
+        return self._store.get(name)
+
+
 @pytest.fixture()
 def app_client():
-    ctx = SimpleNamespace(secrets=_FakeSecrets(), config={})
+    ctx = SimpleNamespace(
+        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv())
+    )
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
     app = routes_mod.build_routes(ctx)
     return TestClient(app), ctx
@@ -74,6 +91,45 @@ def test_logout_clears_the_secret(app_client):
     assert resp.status_code == 200
     assert resp.json()["logged_in"] is False
     assert ctx.secrets.read("service_secret") is None
+
+
+def test_status_reports_git_disabled_by_default(app_client):
+    tc, _ = app_client
+    body = tc.get("/status").json()
+    assert body["git"] == {
+        "enabled": False, "configured": False, "state": None, "detail": None,
+    }
+
+
+def test_settings_saves_git_token_alongside_service_secret(app_client):
+    tc, ctx = app_client
+    resp = tc.post("/settings", json={"service_secret": "topsecret", "git_token": "ghp_abc"})
+    assert resp.status_code == 200
+    assert ctx.secrets.read("git_token") == "ghp_abc"
+    assert "git_token" not in ctx.config
+
+
+def test_settings_omitting_git_token_leaves_it_untouched(app_client):
+    tc, ctx = app_client
+    tc.post("/settings", json={"service_secret": "topsecret", "git_token": "ghp_abc"})
+    tc.post("/settings", json={"service_secret": "topsecret"})
+    assert ctx.secrets.read("git_token") == "ghp_abc"
+
+
+def test_settings_an_empty_git_token_clears_it(app_client):
+    tc, ctx = app_client
+    tc.post("/settings", json={"service_secret": "topsecret", "git_token": "ghp_abc"})
+    tc.post("/settings", json={"service_secret": "topsecret", "git_token": ""})
+    assert ctx.secrets.read("git_token") is None
+
+
+def test_status_reports_git_configured_once_remote_url_and_token_are_set(app_client):
+    tc, ctx = app_client
+    ctx.config["git_remote_url"] = "https://github.com/f/k.git"
+    tc.post("/settings", json={"service_secret": "topsecret", "git_token": "ghp_abc"})
+    body = tc.get("/status").json()
+    assert body["git"]["enabled"] is True
+    assert body["git"]["configured"] is True
 
 
 def test_mcp_get_is_405(app_client):

@@ -78,6 +78,7 @@ from pathlib import Path
 
 from fastapi.concurrency import run_in_threadpool
 
+from . import git_backend
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.bulk_ingest")
@@ -381,7 +382,34 @@ async def _ensure_bucket() -> str | None:
     return None
 
 
-async def run_tick(db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
+async def _run_git_step(git_config: dict | None) -> dict | None:
+    """docs/design/aw-knowledgeable-fs-sync.md §16.6/§16.7/§16.10 risk 8 —
+    the git commit+push runs strictly inside the lease holder's tick,
+    after the graph work, every tick (even one that uploaded nothing: the
+    tree can change from paths this driver doesn't own, e.g. a notion-sync
+    write). `git_config` is a plain dict (`remote_url`/`branch`/`token`/
+    `workspace_slug`) threaded in from `routes.py`, same seam as `db`/
+    `lease` above — this module has no dependency on `ctx`. `None` when
+    the caller didn't pass one (the feature isn't wired up at all), same
+    as `git_backend.sync_tick` returning `None` when `git_remote_url`
+    itself is unset."""
+    if not git_config:
+        return None
+    return await run_in_threadpool(
+        git_backend.sync_tick,
+        kb_root(),
+        git_config.get("remote_url") or "",
+        git_config.get("branch") or "main",
+        git_config.get("token") or "",
+        git_config.get("workspace_slug") or "",
+        BUCKET,
+        SKIP_PREFIXES,
+    )
+
+
+async def run_tick(
+    db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK, git_config: dict | None = None
+) -> dict:
     """One bounded tick — the only entrypoint either door (CLI `run`, the
     contributed scheduled task) ever calls. Enforces §13.5's three
     non-negotiables in order: the ignition guard, the per-tick ceiling, and
@@ -397,6 +425,12 @@ async def run_tick(db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
     synchronous flock syscalls (O(1), no meaningful blocking cost) — called
     directly, not through `run_in_threadpool`, same as every other `fs_lock`
     caller in this estate.
+
+    The git backend's commit+push (§16) runs here, after the graph tick,
+    still inside this same claim — never released and re-claimed, never a
+    second lease. A git failure never rolls back or re-runs the graph work
+    above it (§16.6): its outcome is folded into the result as `git_state`/
+    `git_detail`, not raised.
     """
     if not lease.claim(LEASE_NAME):
         return {
@@ -407,7 +441,12 @@ async def run_tick(db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK) -> dict:
             "failed": 0,
         }
     try:
-        return await _run_tick_locked(db, max_uploads)
+        result = await _run_tick_locked(db, max_uploads)
+        git_result = await _run_git_step(git_config)
+        if git_result is not None:
+            result["git_state"] = git_result["state"]
+            result["git_detail"] = git_result["detail"]
+        return result
     finally:
         lease.release(LEASE_NAME)
 

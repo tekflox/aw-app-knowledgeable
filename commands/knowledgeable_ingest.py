@@ -26,8 +26,10 @@ Usage:
 
 Exit codes for `run`: 0 progressed or nothing pending, 1 the ignition guard
 blocked the tick (extraction is claiming, or the status check itself
-failed) — the only code the contributed scheduled task escalates to an
-agent.
+failed), or the git backend's own tick (docs/design/aw-knowledgeable-fs-
+sync.md §16.3) came back anything other than `ok`/not-configured —
+`no_secret`/`auth_failed`/`diverged`/`push_failed` all exit 1 too, the same
+code the contributed scheduled task escalates to an agent on.
 """
 from __future__ import annotations
 
@@ -74,6 +76,10 @@ def run(args: list[str] | None = None) -> int:
         print(json.dumps(body, indent=2))
         if body.get("blocked"):
             print(f"blocked: {body.get('reason')}", file=sys.stderr)
+            return 1
+        git_state = body.get("git_state")
+        if git_state and git_state != "ok":
+            print(f"git backend: {git_state}: {body.get('git_detail')}", file=sys.stderr)
             return 1
         return 0
 

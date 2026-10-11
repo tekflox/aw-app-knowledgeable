@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import bulk_ingest  # noqa: E402
+from knowledgeable_app import bulk_ingest, git_backend  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -612,6 +612,98 @@ def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_hom
     row = rows[0]
     assert row["status"] == bulk_ingest.STATUS_FAILED
     assert row["error"] == "HTTP 500: internal error"
+
+
+# ---------------------------------------------------------------------------
+# run_tick ↔ git_backend wiring — docs/design/aw-knowledgeable-fs-sync.md §16
+# ---------------------------------------------------------------------------
+
+
+def test_run_tick_without_a_git_config_never_touches_the_git_backend(
+    _workspace_home, db, lease, monkeypatch
+):
+    """No `git_config` passed at all (the feature isn't wired up) must not
+    even import/call into git_backend — same "None means nothing to do"
+    contract `sync_tick` itself exposes."""
+    calls = []
+    monkeypatch.setattr(
+        git_backend, "sync_tick", lambda *a, **k: calls.append((a, k)) or None
+    )
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    result = _run(bulk_ingest.run_tick(db, lease))
+    assert calls == []
+    assert "git_state" not in result
+
+
+def test_run_tick_folds_a_configured_git_backends_state_into_the_result(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The git step runs after the graph work, inside the same lease hold,
+    and its outcome is folded into the tick's own result dict — this is
+    the wiring `routes.py` and the CLI's exit code both depend on."""
+    seen = {}
+
+    def fake_sync_tick(root, remote_url, branch, token, workspace_slug, bucket, skip_prefixes):
+        seen["args"] = (remote_url, branch, token, workspace_slug, bucket, skip_prefixes)
+        return {"state": git_backend.STATE_DIVERGED, "detail": "mirror edited on GitHub", "committed": True}
+
+    monkeypatch.setattr(git_backend, "sync_tick", fake_sync_tick)
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+
+    git_config = {
+        "remote_url": "https://github.com/f/k.git",
+        "branch": "main",
+        "token": "a-token",
+        "workspace_slug": "aw",
+    }
+    result = _run(bulk_ingest.run_tick(db, lease, git_config=git_config))
+
+    assert seen["args"] == (
+        "https://github.com/f/k.git", "main", "a-token", "aw",
+        bulk_ingest.BUCKET, bulk_ingest.SKIP_PREFIXES,
+    )
+    assert result["git_state"] == git_backend.STATE_DIVERGED
+    assert result["git_detail"] == "mirror edited on GitHub"
+
+
+def test_run_tick_runs_the_git_step_even_when_nothing_was_pending(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§16.6 — the git step runs every tick, not only when the upload loop
+    did something: the tree can change from paths this driver doesn't
+    own (e.g. a notion-sync write)."""
+    monkeypatch.setattr(
+        git_backend, "sync_tick",
+        lambda *a, **k: {"state": git_backend.STATE_OK, "detail": "pushed", "committed": True},
+    )
+    result = _run(bulk_ingest.run_tick(db, lease, git_config={"remote_url": "https://x/y.git"}))
+    assert result["note"] == "nothing pending — run scan() first, or the pass is already complete"
+    assert result["git_state"] == git_backend.STATE_OK
+
+
+def test_run_tick_a_git_failure_never_blocks_or_rolls_back_the_graph_work(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§16.6 — a git failure of any kind must not touch the upload result
+    that already happened this tick."""
+    root = bulk_ingest.kb_root()
+    _write(root, "crispal/a.md", "content")
+    bulk_ingest.scan(db)
+
+    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+        return {"id": "doc-1", "deduplicated": False}, None
+
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(
+        git_backend, "sync_tick",
+        lambda *a, **k: {"state": git_backend.STATE_PUSH_FAILED, "detail": "network unreachable", "committed": False},
+    )
+
+    result = _run(bulk_ingest.run_tick(db, lease, git_config={"remote_url": "https://x/y.git"}))
+
+    assert result["uploaded"] == 1
+    assert result["git_state"] == git_backend.STATE_PUSH_FAILED
 
 
 # ---------------------------------------------------------------------------
