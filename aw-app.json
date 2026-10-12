@@ -125,6 +125,12 @@
         "default": "",
         "title": "Git backend \u2014 token",
         "description": "A fine-grained GitHub PAT scoped to the one repo above, Contents read/write only. Stored in the workspace secret store (never in git_remote_url, never on disk, never in argv), injected per git invocation as an environment-only Authorization header. Read fresh every tick \u2014 rotation needs no restart."
+      },
+      "auth_required": {
+        "type": "boolean",
+        "default": true,
+        "title": "Require workspace identity on every route",
+        "description": "Must be set to false for GET /keys/{slot} (docs/design/knowledgeable-apmt-key-pull-through.md) to answer production aw-knowledgeable, which holds no workspace session or API key \u2014 only the shared X-Internal-Secret. This flag is app-wide, not per-route, so every OTHER route in routes.py carries its own explicit _require_identity dependency to stay protected once this is false; do not add a new route here without the same guard."
       }
     },
     "required": []
