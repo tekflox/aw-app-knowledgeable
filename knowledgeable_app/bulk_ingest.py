@@ -100,6 +100,12 @@ BUCKET = "main"
 # ORDERED tuple after the collapse: the order was never about the buckets, it
 # was about validating the small curated corpora the same day.
 #
+# NOT an allowlist (card e2e:kb-file-to-graph-to-answer, 2026-10-12) — every
+# reader of this tuple goes through `_discovered_subtrees()`, which appends
+# any top-level directory found on disk that isn't named here. A new folder
+# under `knowledge_base/` is ingestible the moment it exists; this tuple only
+# decides who goes first.
+#
 # cli_reference/skills (card quality:procedural-genre-absent-from-both-
 # knowledge-indexes) are the procedural genre neither store had: one doc per
 # `aw-workspace-cli` command/subcommand captured from its own --help
@@ -136,6 +142,21 @@ SKIP_PREFIXES: tuple[str, ...] = (
     "mapped_folders/repos/",
     "mapped_folders/aw-workspace/",
 )
+
+
+def _discovered_subtrees(root: Path) -> tuple[str, ...]:
+    """§13.3's curated order survives (card e2e:kb-file-to-graph-to-answer,
+    2026-10-12): `SUBTREE_ORDER` stopped being an allowlist the day a human
+    dropped a new top-level folder straight into `knowledge_base/` and
+    expected it ingested with no edit to this file. Returns the curated
+    names first, in their stated order (small, same-day validatable), then
+    any OTHER top-level directory actually present on disk, sorted, so a
+    folder nobody declared still gets walked — just last."""
+    try:
+        on_disk = {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    except FileNotFoundError:
+        return SUBTREE_ORDER
+    return SUBTREE_ORDER + tuple(sorted(on_disk - set(SUBTREE_ORDER)))
 
 
 def is_skipped(relpath: str) -> bool:
@@ -280,7 +301,7 @@ def scan(db) -> dict:
     by_hash: dict[str, list[tuple[str, str]]] = {}
     skipped: list[tuple[str, str, str]] = []  # (relpath, bucket, reason)
 
-    for subtree in SUBTREE_ORDER:
+    for subtree in _discovered_subtrees(root):
         subtree_root = root / subtree
         if not subtree_root.is_dir():
             continue
@@ -411,11 +432,16 @@ async def run_tick(
     db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK, git_config: dict | None = None
 ) -> dict:
     """One bounded tick — the only entrypoint either door (CLI `run`, the
-    contributed scheduled task) ever calls. Enforces §13.5's three
-    non-negotiables in order: the ignition guard, the per-tick ceiling, and
-    the backlog ceiling — now checked once, against the one bucket, which is
-    what "per bucket" always meant. Advances SUBTREES in §13.3's order,
-    stopping early once the ceiling is spent.
+    contributed scheduled task) ever calls. Re-`scan()`s first (card
+    e2e:kb-file-to-graph-to-answer, 2026-10-12 — the scheduled task only
+    ever calls `run`, so a tick that didn't scan itself would never see a
+    file someone dropped on disk since the last manual scan), then
+    enforces §13.5's three non-negotiables in order: the ignition guard,
+    the per-tick ceiling, and the backlog ceiling — now checked once,
+    against the one bucket, which is what "per bucket" always meant.
+    Advances subtrees in §13.3's order (curated first, then any undeclared
+    one `_discovered_subtrees` found on disk), stopping early once the
+    ceiling is spent.
 
     Refuses to overlap with another in-flight tick via `ctx.state.lease`
     (`lease`, a non-blocking, flock-backed claim — see
@@ -454,6 +480,16 @@ async def run_tick(
 async def _run_tick_locked(db, max_uploads: int) -> dict:
     max_uploads = max(0, min(max_uploads, MAX_UPLOADS_PER_TICK))
     await run_in_threadpool(_ensure_table, db)
+
+    # Card e2e:kb-file-to-graph-to-answer (2026-10-12): `run` is the ONLY
+    # door the scheduled task ever calls — `scan()` had no caller of its
+    # own on any schedule, so a file dropped on disk between two manual
+    # `scan` invocations (which is to say: always, in production) sat on
+    # disk forever, never even reaching `pending`. `scan()` is cheap and
+    # safe to re-run (its own docstring) — hash-and-upsert, no network
+    # call — so folding it into every tick costs a rescan of the whole
+    # tree, not a rescan of what's already uploaded.
+    await run_in_threadpool(scan, db)
 
     if not await run_in_threadpool(_pending_count, db):
         return {
@@ -524,7 +560,9 @@ async def _run_tick_locked(db, max_uploads: int) -> dict:
     # §13.3's order, now over subtrees. The `relpath LIKE` prefix is what
     # replaces the old `bucket = ?` filter: a subtree is a path prefix,
     # which is the same thing a collection is on the server side.
-    for subtree in SUBTREE_ORDER:
+    # `_discovered_subtrees` — not the bare tuple — so a subtree `scan()`
+    # journalled but nobody declared still gets its pending rows queried.
+    for subtree in _discovered_subtrees(kb_root()):
         if budget <= 0:
             break
 
@@ -650,7 +688,7 @@ def report(db) -> dict:
     priority copy of the same content already was."""
     _ensure_table(db)
     subtrees: dict[str, dict] = {}
-    for subtree in SUBTREE_ORDER:
+    for subtree in _discovered_subtrees(kb_root()):
         rows = db.execute(
             TABLE,
             """

@@ -324,6 +324,53 @@ def test_scan_skips_oversized_files_with_a_reason(_workspace_home, db):
     assert "10MB" in row["error"]
 
 
+def test_scan_discovers_an_unlisted_top_level_subtree(_workspace_home, db):
+    """Card e2e:kb-file-to-graph-to-answer (2026-10-12) — `SUBTREE_ORDER` is
+    an ORDERING hint over the curated subtrees, not an allowlist. A brand
+    new top-level folder under `knowledge_base/` (e.g. `random/`, created
+    by dropping a file in by hand, with nobody editing this tuple) must
+    still be walked and journaled.
+
+    MUTATION: revert `scan()` to iterate `SUBTREE_ORDER` directly instead
+    of `_discovered_subtrees(root)` and this goes red on `scanned == 0` —
+    the unlisted folder is silently never seen.
+    """
+    root = bulk_ingest.kb_root()
+    _write(root, "random/me.md", "I like fresh grapes")
+
+    counts = bulk_ingest.scan(db)
+    assert counts["scanned"] == 1
+
+    status = bulk_ingest.status(db)
+    assert status["by_subtree"]["random"] == {"pending": 1}
+
+
+def test_run_tick_picks_up_an_unlisted_subtree_without_a_manual_scan(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The other half of the same gap: `_run_tick_locked`'s upload loop
+    also iterated `SUBTREE_ORDER` directly, so even a row scan() did
+    journal for an unlisted subtree would never be queried for upload.
+    Zero manual steps end to end: write the file, call `run_tick` (the
+    scheduled task's own entrypoint) with no `scan()` call in between."""
+    root = bulk_ingest.kb_root()
+    _write(root, "random/me.md", "I like fresh grapes")
+
+    uploaded = []
+
+    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+        uploaded.append(source_path)
+        return {"id": "doc-1", "deduplicated": False}, None
+
+    monkeypatch.setattr(client, "get_ingest_status", _ok_status())
+    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+
+    result = _run(bulk_ingest.run_tick(db, lease))
+
+    assert result["uploaded"] == 1
+    assert uploaded == ["random/me.md"]
+
+
 def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, db, lease, monkeypatch):
     root = bulk_ingest.kb_root()
     _write(root, "crispal/a.md", "stable content")
