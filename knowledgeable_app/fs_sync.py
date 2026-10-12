@@ -55,6 +55,36 @@ LEASE_NAME = "fs-sync-tick"
 
 ORIGIN_SCAN = "scan"
 
+#: §17.2 — a journal row this engine minted from the server's own
+#: `sync-paths` enumeration, not from a local file this connector ever
+#: uploaded. `external_id` is NULL until the path converges (the file
+#: turns up on disk and gets PUT by-path for the first time); until then
+#: the row exists purely to extend the ≥2-consecutive-scans delete clock
+#: and the §7 valve to a path the journal would otherwise never see.
+ORIGIN_ADOPTED = "adopted"
+
+#: §17.3 exclusion 2 — pre-`card C` downsync, a human-authored document can
+#: legitimately exist server-side with no file on disk yet; adopting it
+#: would mark that future downsync payload for deletion. Card C removes
+#: this exclusion deliberately when it lands.
+ADOPTION_AUTHORED_PREFIX = "authored/"
+
+#: §17.2 — page size for `GET /api/documents/sync-paths`, matching the
+#: server's own default.
+SYNC_PATHS_PAGE_LIMIT = 500
+
+#: §17.4 — this app's own tiny flags table (`db:own-tables`'s `app__<slug>__`
+#: prefix), one row per one-time migration. Separate from the shared
+#: bulk-ingest journal so a flag row never shows up in `status()`/`report()`'s
+#: per-path counts.
+FLAGS_TABLE = "app__knowledgeable__fs_sync_flags"
+
+#: §17.4 — the live-35 catch-up runs exactly once per upgrade, gated by this
+#: row's presence, not by a per-tick check of `pending_delete` rows (which
+#: would re-run forever since catch-up itself doesn't change `pending_delete`
+#: on an already-marked row).
+CATCHUP_FLAG = "mark_delete_by_path_catchup_v1"
+
 #: §3.3 step 1 — never mark a path missing on the scan that first notices
 #: it gone; only on the SECOND consecutive miss. A half-written
 #: `agent sync` pass or a transiently unmounted tree must not read as
@@ -67,18 +97,20 @@ MISSING_SCANS_THRESHOLD = 2
 #: STABLE files rather than 1,564 half-written reads.
 DEBOUNCE_SECONDS = 30
 
-#: §7 valve guard 2 — the floor of `max(floor, 10% of uploaded rows)`.
+#: §7 valve guard 2 — the floor of `max(floor, 10% of tracked rows)`.
 MASS_DELETE_FLOOR = 25
 MASS_DELETE_FRACTION = 0.10
 
 MAX_UPLOADS_PER_TICK = bulk_ingest.MAX_UPLOADS_PER_TICK
 
 
-def mass_delete_threshold(uploaded_rows: int) -> int:
+def mass_delete_threshold(tracked_rows: int) -> int:
     """§7 guard 2's declared formula — a free function so the valve test
     and an operator reading `report()` can both state the exact number
-    without re-deriving it."""
-    return max(MASS_DELETE_FLOOR, int(uploaded_rows * MASS_DELETE_FRACTION))
+    without re-deriving it. Also §17.5's in-pass document ceiling: the
+    SAME threshold value, reused rather than re-derived, applied to a
+    document count instead of a path count (see `_MarkBudget`)."""
+    return max(MASS_DELETE_FLOOR, int(tracked_rows * MASS_DELETE_FRACTION))
 
 
 def _walk_sync_tree(root: Path) -> dict[str, str] | None:
@@ -120,53 +152,208 @@ def _walk_sync_tree(root: Path) -> dict[str, str] | None:
     return found
 
 
-def _uploaded_row_count(db) -> int:
+#: §17.5 guard 2's widened WHERE — every row PARTICIPATING in
+#: missing-tracking, not just `status = 'uploaded'`: a row this engine has
+#: actually synced (`external_id IS NOT NULL`) OR a row the adoption pass
+#: minted to watch a server-claimed path (`origin = 'adopted'`). Rows still
+#: mid-debounce with neither were never this engine's document to begin
+#: with (unchanged from before the amendment). Shared by `_tracked_row_count`
+#: (the threshold's denominator) and the tracked-paths query below (the
+#: threshold's numerator) so the two can never drift apart.
+_TRACKED_ROWS_WHERE = "WHERE external_id IS NOT NULL OR origin = :adopted"
+
+
+def _tracked_row_count(db) -> int:
     rows = db.execute(
-        TABLE, "SELECT COUNT(*) FROM {table} WHERE status = :status",
-        {"status": bulk_ingest.STATUS_UPLOADED},
+        TABLE, f"SELECT COUNT(*) FROM {{table}} {_TRACKED_ROWS_WHERE}",
+        {"adopted": ORIGIN_ADOPTED},
     )
     return rows[0][0] if rows else 0
 
 
-def _check_mass_delete_valve(db, found: dict[str, str] | None) -> dict | None:
+def _check_mass_delete_valve(db, found: dict[str, str] | None) -> tuple[dict | None, int]:
     """§7 — the two stacked guards, checked BEFORE a single row's
-    `missing_scans` advances or a single `mark-delete` call goes out.
-    Returns ``None`` when clear, or a dict with a declared `reason` (and,
-    for guard 2, the counts that tripped it) when the tick must abort
-    the WHOLE pass and mark nothing.
+    `missing_scans` advances, a single `mark-delete` call goes out, or
+    (§17.5) adoption/catch-up touch anything. Returns
+    ``(violation, document_ceiling)``: `violation` is ``None`` when clear,
+    or a dict with a declared `reason` (and, for guard 2, the counts that
+    tripped it) when the tick must abort the WHOLE pass and mark nothing.
+    `document_ceiling` is §17.5's in-pass ceiling threshold — computed here
+    so the caller never re-derives a second, possibly-drifted number for
+    `_MarkBudget`; it is meaningless (0) when guard 1 already aborted.
 
     Guard 1 (zero-trust scan precondition): `found is None` (root missing
     or unreadable) or `found == {}` (walked it, saw zero files) — an
-    unmounted volume or a half-recreated tree must mark nothing.
+    unmounted volume or a half-recreated tree must mark nothing, and
+    nothing downstream (adoption, catch-up) may touch a row either.
 
-    Guard 2 (mass-delete threshold): more files would have their
-    `missing_scans` advanced this tick than
-    `max(25, 10% of uploaded rows)` — a transient near-total wipe (e.g. an
-    `agent sync` pass caught mid-write) must not cascade into hundreds of
-    delete marks."""
+    Guard 2 (mass-delete threshold): more paths would have their
+    `missing_scans` advanced this tick than `max(25, 10% of tracked rows)`
+    — a transient near-total wipe (e.g. an `agent sync` pass caught
+    mid-write) must not cascade into hundreds of delete marks. §17.5
+    widens both sides of this count to `_TRACKED_ROWS_WHERE` so a mass
+    disappearance of adopted-only paths is not invisible to the valve."""
     if found is None:
-        return {"reason": "kb_root() is missing or unreadable — aborting the tick, marking nothing"}
+        return {"reason": "kb_root() is missing or unreadable — aborting the tick, marking nothing"}, 0
     if not found:
-        return {"reason": "scan saw zero files — aborting the tick, marking nothing"}
+        return {"reason": "scan saw zero files — aborting the tick, marking nothing"}, 0
 
-    uploaded_rows = _uploaded_row_count(db)
-    threshold = mass_delete_threshold(uploaded_rows)
-    rows = db.execute(
-        TABLE, "SELECT relpath FROM {table} WHERE status = :status",
-        {"status": bulk_ingest.STATUS_UPLOADED},
-    )
+    tracked_rows = _tracked_row_count(db)
+    threshold = mass_delete_threshold(tracked_rows)
+    rows = db.execute(TABLE, f"SELECT relpath FROM {{table}} {_TRACKED_ROWS_WHERE}", {"adopted": ORIGIN_ADOPTED})
     tracked_paths = {r[0] for r in rows}
     missing_now = tracked_paths - set(found.keys())
     if len(missing_now) > threshold:
         return {
             "reason": (
                 f"{len(missing_now)} files missing from the tree this tick exceeds the "
-                f"mass-delete threshold max({MASS_DELETE_FLOOR}, 10% of {uploaded_rows}) = {threshold}"
+                f"mass-delete threshold max({MASS_DELETE_FLOOR}, 10% of {tracked_rows}) = {threshold}"
             ),
             "missing_count": len(missing_now),
             "threshold": threshold,
-        }
-    return None
+        }, threshold
+    return None, threshold
+
+
+def _should_adopt(relpath: str) -> bool:
+    """§17.3 — two of the three adoption exclusions, each a correctness
+    rule, not tidiness: `is_skipped()` paths (the code-map skip prefixes,
+    and any dot-component — §16.1) may well have a live file the scan
+    deliberately never looks at, so "missing from source tree" would be a
+    lie; `authored/` is pre-`card C` downsync, where a human-authored
+    document legitimately exists server-side with no file on disk yet.
+    The third exclusion (foreign-`workspace_slug` claims) needs no check
+    here — `GET /sync-paths`' own slug-or-NULL filter already means this
+    engine is never offered one."""
+    if bulk_ingest.is_skipped(relpath):
+        return False
+    if relpath.startswith(ADOPTION_AUTHORED_PREFIX):
+        return False
+    return True
+
+
+class _MarkBudget:
+    """§17.5's third guard — a cross-call ceiling on DOCUMENTS actually
+    marked this tick, not on paths or calls: by-path marking fans out (one
+    path can mark several claimants at once), so the path-counting guard 2
+    above cannot see it. Shared between the one-time catch-up and the
+    live-miss pass below so both draw from the same tick's budget and the
+    SAME `max(25, 10%)` number guard 2 already computed — never a second,
+    independently-derived threshold."""
+
+    def __init__(self, ceiling: int) -> None:
+        self.ceiling = ceiling
+        self.marked_documents = 0
+        self.tripped = False
+
+    def allows_more(self) -> bool:
+        return not self.tripped
+
+    def record(self, count: int) -> None:
+        self.marked_documents += count
+        if self.marked_documents > self.ceiling:
+            self.tripped = True
+
+
+def _ensure_flags_table(db) -> None:
+    db.create(FLAGS_TABLE, "flag TEXT PRIMARY KEY, done_at DOUBLE PRECISION NOT NULL")
+
+
+def _catchup_done(db) -> bool:
+    return bool(db.execute(FLAGS_TABLE, "SELECT 1 FROM {table} WHERE flag = :flag", {"flag": CATCHUP_FLAG}))
+
+
+def _mark_catchup_done(db) -> None:
+    db.execute(
+        FLAGS_TABLE,
+        "INSERT INTO {table} (flag, done_at) VALUES (:flag, :now) ON CONFLICT (flag) DO NOTHING",
+        {"flag": CATCHUP_FLAG, "now": time.time()},
+    )
+
+
+async def _adopt_paths(db, known_relpaths: set[str], workspace_slug: str) -> int:
+    """§17.2 point 2 — insert a journal row (`origin='adopted'`,
+    `external_id` NULL) for every server-claimed path `GET /sync-paths`
+    returns that `known_relpaths` (the journal as of the start of this
+    tick) doesn't already have, except the §17.3 exclusions. Adoption
+    NEVER marks — it only starts observation; the existing ≥2-consecutive-
+    scans clock and the §7 valve then cover the new row exactly like any
+    other. Mutates `known_relpaths` in place so a second page of the same
+    tick, or a path repeated across pages, is never double-inserted."""
+    adopted = 0
+    after: str | None = None
+    while True:
+        data, err = await client.get_sync_paths(workspace_slug, after=after, limit=SYNC_PATHS_PAGE_LIMIT)
+        if err:
+            log.warning("fs_sync: adoption GET /sync-paths failed: %s", err)
+            return adopted
+        paths = (data or {}).get("paths") or []
+        if not paths:
+            return adopted
+        now = time.time()
+        for entry in paths:
+            relpath = (entry or {}).get("source_path")
+            if not relpath or relpath in known_relpaths or not _should_adopt(relpath):
+                continue
+            await run_in_threadpool(
+                db.execute, TABLE,
+                "INSERT INTO {table} "
+                "(relpath, sha256, bucket, status, origin, scanned_at, updated_at, "
+                "missing_scans, pending_delete) "
+                "VALUES (:relpath, '', :bucket, :status, :origin, :now, :now, 0, 0) "
+                "ON CONFLICT (relpath) DO NOTHING",
+                {
+                    "relpath": relpath, "bucket": bulk_ingest.BUCKET,
+                    "status": bulk_ingest.STATUS_PENDING, "origin": ORIGIN_ADOPTED, "now": now,
+                },
+            )
+            known_relpaths.add(relpath)
+            adopted += 1
+        cursor = (data or {}).get("cursor")
+        if not cursor or cursor == after:
+            return adopted
+        after = cursor
+
+
+async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBudget") -> int:
+    """§17.4 — the one-time heal for the live 35 (and any sibling like
+    them): for every journal row already `pending_delete=1`, re-issue the
+    by-path mark once. Idempotent server-side (`SET` on an already-marked
+    document is a no-op — G1's own gate), and idempotent ACROSS RESTARTS
+    here via `CATCHUP_FLAG` in `FLAGS_TABLE` rather than any in-memory
+    state. Runs inside the same valve-cleared tick as everything else and
+    draws from the SAME `budget` the live-miss pass below shares.
+
+    A row skipped this tick — the budget ran out, or a single call
+    errored — leaves `CATCHUP_FLAG` UNSET: marking is idempotent
+    server-side, so retrying the whole pass next tick is free (an
+    already-swept row's re-mark returns `count: 0`), and "done" must mean
+    every `pending_delete=1` row at the start of this run was actually
+    attempted, not "we got through some of them."
+    """
+    await run_in_threadpool(_ensure_flags_table, db)
+    if await run_in_threadpool(_catchup_done, db):
+        return 0
+    swept = 0
+    deferred = False
+    for relpath, row in journal.items():
+        if not row["pending_delete"]:
+            continue
+        if not budget.allows_more():
+            deferred = True
+            break
+        data, err = await client.mark_delete_by_path(
+            relpath, workspace_slug, reason="fs-sync §17.4 one-time catch-up",
+        )
+        if err:
+            log.warning("fs_sync: catch-up mark-delete-by-path failed for %s: %s", relpath, err)
+            deferred = True
+            continue
+        budget.record((data or {}).get("count") or 0)
+        swept += 1
+    if not deferred:
+        await run_in_threadpool(_mark_catchup_done, db)
+    return swept
 
 
 def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
@@ -215,7 +402,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     root = bulk_ingest.kb_root()
     found = await run_in_threadpool(_walk_sync_tree, root)
 
-    valve = await run_in_threadpool(_check_mass_delete_valve, db, found)
+    valve, doc_ceiling = await run_in_threadpool(_check_mass_delete_valve, db, found)
     if valve is not None:
         log.warning("fs_sync: mass-delete valve tripped: %s", valve["reason"])
         return _empty_result(True, valve["reason"], valve_tripped=True, **{
@@ -227,8 +414,8 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     # status call. The ignition guard blocks the whole tick (entity
     # extraction claiming is a reason to touch nothing, not just uploads);
     # the backlog ceiling only caps the upload budget — missing-scan
-    # bookkeeping and delete-marking below are unrelated to upload/
-    # extraction load and still run.
+    # bookkeeping, adoption, catch-up and delete-marking below are
+    # unrelated to upload/extraction load and still run.
     status_payload, status_err = await client.get_ingest_status(bulk_ingest.BUCKET)
     if status_err:
         return _empty_result(True, f"could not reach GET /api/ingest/status: {status_err}")
@@ -242,21 +429,38 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         else max(0, min(max_uploads, MAX_UPLOADS_PER_TICK))
     )
 
+    # §17.2 point 2 — adoption, strictly after the valve above and the
+    # ignition guard (a tick that touches nothing on extraction-claiming
+    # must touch nothing here either). Needs the journal's relpath set
+    # BEFORE the full load below, so it can tell "a path the journal
+    # lacks" from "a path already here" and never double-insert across a
+    # paged GET /sync-paths response.
+    known_rows = await run_in_threadpool(db.execute, TABLE, "SELECT relpath FROM {table}")
+    known_relpaths = {r[0] for r in known_rows}
+    adopted_count = await _adopt_paths(db, known_relpaths, workspace_slug)
+
     rows = await run_in_threadpool(
         db.execute, TABLE,
         "SELECT relpath, sha256, last_synced_hash, scanned_at, missing_scans, "
-        "pending_delete, external_id FROM {table}",
+        "pending_delete, external_id, origin FROM {table}",
     )
     journal = {
         r[0]: {
             "sha256": r[1], "last_synced_hash": r[2], "scanned_at": r[3],
             "missing_scans": r[4] or 0, "pending_delete": r[5] or 0, "external_id": r[6],
+            "origin": r[7],
         }
         for r in rows
     }
 
+    # §17.4/§17.5 — the one-time catch-up and the live-miss marking pass
+    # below share one `_MarkBudget`, drawing on the SAME threshold guard 2
+    # already computed: one document-marking ceiling per tick, not two.
+    mark_budget = _MarkBudget(doc_ceiling)
+    catchup_marked = await _run_catchup(db, journal, workspace_slug, mark_budget)
+
     created = updated = unchanged = failed = 0
-    budget = upload_budget
+    upload_remaining = upload_budget
 
     for relpath in sorted(found):
         digest = found[relpath]
@@ -313,7 +517,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         if now - (row["scanned_at"] or 0) < DEBOUNCE_SECONDS:
             continue  # same hash observed, but not quiet for long enough yet
 
-        if budget <= 0:
+        if upload_remaining <= 0:
             continue
 
         full_path = root / relpath
@@ -357,13 +561,13 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
                 "hash": new_hash, "origin": ORIGIN_SCAN, "now": now, "relpath": relpath,
             },
         )
-        budget -= 1
+        upload_remaining -= 1
         if outcome == "created":
             created += 1
         else:
             updated += 1
 
-    deleted_marked = await _mark_missing_as_deleted(db, journal, found)
+    deleted_marked = await _mark_missing_as_deleted(db, journal, found, workspace_slug, mark_budget)
 
     result = {
         "blocked": False,
@@ -373,36 +577,61 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         "deleted_marked": deleted_marked,
         "failed": failed,
         "bucket": bulk_ingest.BUCKET,
+        "adopted": adopted_count,
+        "catchup_marked": catchup_marked,
     }
     if upload_budget == 0 and backlog >= bulk_ingest.MAX_PENDING_BACKLOG:
         result["skipped_reason"] = f"processing backlog {backlog} >= {bulk_ingest.MAX_PENDING_BACKLOG}"
+    if mark_budget.tripped:
+        # §17.5's third guard, tripped mid-pass (NOT a pre-pass abort like
+        # guard 1/2 above): real work already happened this tick, so this
+        # augments the result rather than replacing it with `_empty_result`.
+        # Marking is idempotent/two-phase (G1's own gate), so every
+        # deferred mark is simply retried next tick at no cost.
+        result["blocked"] = True
+        result["valve_tripped"] = True
+        result["reason"] = (
+            f"in-pass document ceiling exceeded: {mark_budget.marked_documents} documents marked "
+            f"this tick vs threshold {mark_budget.ceiling} — deferring the remainder to the next tick"
+        )
+        result["marked_documents"] = mark_budget.marked_documents
+        result["document_ceiling"] = mark_budget.ceiling
     return result
 
 
-async def _mark_missing_as_deleted(db, journal: dict, found: dict[str, str]) -> int:
-    """§3.3 step 1 / §7 — advance `missing_scans` for every tracked path no
-    longer on disk; at the SECOND consecutive miss, `mark-delete` it.
-    Only rows with a real `external_id` (i.e. already synced via this
-    engine) are tracked here — a row still waiting out its debounce
-    window, or one `bulk_ingest`'s own alias/skip pass owns, was never
-    this engine's document to begin with."""
+async def _mark_missing_as_deleted(
+    db, journal: dict, found: dict[str, str], workspace_slug: str, budget: "_MarkBudget",
+) -> int:
+    """§3.3 step 1 / §7, by-path since §17.2: advance `missing_scans` for
+    every tracked path no longer on disk; at the SECOND consecutive miss,
+    mark the WHOLE path via `mark_delete_by_path` — never `external_id`
+    again, so a journal row that only ever named one of several documents
+    sharing a path (§17.1) can no longer leave the others permanently
+    unreachable. Tracked here: a row this engine has actually synced
+    (`external_id IS NOT NULL`) OR one the adoption pass is watching
+    (`origin == ORIGIN_ADOPTED`) — the same widened set §7's valve now
+    uses. A row still waiting out its debounce window, with neither, was
+    never this engine's document to begin with."""
     marked = 0
     for relpath, row in journal.items():
-        if relpath in found or not row["external_id"]:
+        if relpath in found:
+            continue
+        if not row["external_id"] and row["origin"] != ORIGIN_ADOPTED:
             continue
         new_missing = row["missing_scans"] + 1
-        if new_missing >= MISSING_SCANS_THRESHOLD and not row["pending_delete"]:
-            _, err = await client.mark_delete(
-                row["external_id"], reason="missing from source tree for 2 consecutive scans",
+        if new_missing >= MISSING_SCANS_THRESHOLD and not row["pending_delete"] and budget.allows_more():
+            data, err = await client.mark_delete_by_path(
+                relpath, workspace_slug, reason="missing from source tree for 2 consecutive scans",
             )
             if err:
-                log.warning("fs_sync: mark-delete failed for %s: %s", relpath, err)
+                log.warning("fs_sync: mark-delete-by-path failed for %s: %s", relpath, err)
                 await run_in_threadpool(
                     db.execute, TABLE,
                     "UPDATE {table} SET missing_scans = :missing WHERE relpath = :relpath",
                     {"missing": new_missing, "relpath": relpath},
                 )
                 continue
+            budget.record((data or {}).get("count") or 0)
             await run_in_threadpool(
                 db.execute, TABLE,
                 "UPDATE {table} SET missing_scans = :missing, pending_delete = 1 WHERE relpath = :relpath",

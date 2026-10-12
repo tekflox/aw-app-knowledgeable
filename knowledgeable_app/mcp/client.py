@@ -239,6 +239,40 @@ async def mark_delete(external_id: str, *, reason: str | None = None) -> tuple[d
     return await _post_json(f"/api/documents/{external_id}/mark-delete", body)
 
 
+async def mark_delete_by_path(
+    source_path: str, workspace_slug: str, *, reason: str | None = None
+) -> tuple[dict | None, str | None]:
+    """POST /api/documents/mark-delete-by-path (docs/design/aw-knowledgeable-
+    fs-sync.md §17.2) — marks EVERY document claiming
+    ``{tenant, bucket, source_path}`` with ``workspace_slug = $slug OR
+    workspace_slug IS NULL``, replacing the old by-id ``mark_delete`` above
+    as fs-sync's delete-marking seam: a journal row's `external_id` can only
+    ever name one of several documents sharing a path (§17.1's 35
+    structurally-unreachable `cli_reference/` documents), so this engine
+    stops dereferencing it for deletes entirely. Service-only, two-phase,
+    no `force` variant — same reasoning as `mark_delete`. Response is
+    ``{source_path, marked: [ids], count}``."""
+    body: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
+    if reason:
+        body["reason"] = reason
+    return await _post_json("/api/documents/mark-delete-by-path", body)
+
+
+async def get_sync_paths(
+    workspace_slug: str, *, after: str | None = None, limit: int = 500
+) -> tuple[dict | None, str | None]:
+    """GET /api/documents/sync-paths (§17.2) — paged, distinct
+    `source_path` claims under the same slug-or-NULL filter as
+    ``mark_delete_by_path``, including a path whose only claimant is
+    already `pending_delete` (the §17.4 catch-up and this engine's own
+    per-tick adoption both depend on seeing it). Response is
+    ``{paths: [{source_path, claimant_count}], cursor}``."""
+    params: dict = {"workspace_slug": workspace_slug, "limit": limit}
+    if after:
+        params["after"] = after
+    return await _get("/api/documents/sync-paths", params)
+
+
 async def push_playground_key(value: str) -> tuple[bool, str | None]:
     """POST /api/playground/key — hand production the Playground's ap-mt
     ApiKey, over the same ``X-Internal-Secret`` channel every other call in
