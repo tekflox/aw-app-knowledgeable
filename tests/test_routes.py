@@ -49,11 +49,23 @@ class _FakeKv:
 
 @pytest.fixture()
 def app_client():
+    """Every route except `GET /keys/{slot}` now carries its own
+    `_require_identity` dependency — re-implemented per-route because this
+    app's config must run with `auth_required: false` for the pull route to
+    be reachable at all (see routes.py's module docstring). The REAL
+    `IdentityGuard` middleware that would normally populate
+    `request.scope["aw_identity"]` sits outside this sub-app and is not part
+    of what `build_routes(ctx)` returns, so every test below that exercises
+    ordinary app behaviour overrides the dependency to simulate "the caller
+    already passed that gate" — `test_identity_is_still_required.*` below
+    removes the override to prove the gate is real.
+    """
     ctx = SimpleNamespace(
         secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv())
     )
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
     app = routes_mod.build_routes(ctx)
+    app.dependency_overrides[routes_mod._require_identity] = lambda: None
     return TestClient(app), ctx
 
 
@@ -151,3 +163,137 @@ def test_mcp_json_endpoint(app_client):
     resp = tc.get("/mcp.json")
     assert resp.status_code == 200
     assert "aw-knowledgeable" in resp.json()["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# GET /keys/{slot} — the pull-through route (docs/design/
+# knowledgeable-apmt-key-pull-through.md §3.1). Auth is this route's own
+# X-Internal-Secret check against ctx.secrets, not the workspace's gate.
+# ---------------------------------------------------------------------------
+
+
+def test_pull_key_requires_the_internal_secret(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.get("/keys/playground")
+    assert resp.status_code == 401
+
+
+def test_pull_key_rejects_a_wrong_secret(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.get("/keys/playground", headers={"x-internal-secret": "wrong"})
+    assert resp.status_code == 401
+
+
+def test_pull_key_401s_when_no_service_secret_is_configured_yet(app_client):
+    tc, _ = app_client
+    resp = tc.get("/keys/playground", headers={"x-internal-secret": "anything"})
+    assert resp.status_code == 401
+
+
+def test_pull_key_404s_on_an_unknown_slot(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.get("/keys/bogus", headers={"x-internal-secret": "shh"})
+    assert resp.status_code == 404
+
+
+def test_pull_key_returns_the_vault_value_on_success(app_client, monkeypatch):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+
+    async def fake_read_secret(name, *, reason):
+        assert name == "knowledgeable-playground-apmt-key"
+        return "sk-live-123"
+
+    monkeypatch.setattr(routes_mod.key_vault, "read_secret", fake_read_secret)
+    resp = tc.get("/keys/playground", headers={"x-internal-secret": "shh"})
+    assert resp.status_code == 200
+    assert resp.json() == {"api_key": "sk-live-123"}
+
+
+def test_pull_key_503s_on_a_vault_miss(app_client, monkeypatch):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+
+    async def fake_read_secret(name, *, reason):
+        return None
+
+    monkeypatch.setattr(routes_mod.key_vault, "read_secret", fake_read_secret)
+    resp = tc.get("/keys/ingest", headers={"x-internal-secret": "shh"})
+    assert resp.status_code == 503
+    assert resp.json()["reason"] == "vault_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# `_require_identity` — every OTHER route must still 401 an anonymous
+# caller even with `auth_required: false` on the whole mount (routes.py's
+# module docstring). `app_client` above overrides this dependency for every
+# ordinary-behaviour test; these rebuild the app WITHOUT that override.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ungated_app_client():
+    """Same app as `app_client`, but with NO `_require_identity` override —
+    the shape a real deploy has until the real `IdentityGuard` (outside this
+    sub-app) attaches `scope["aw_identity"]` for an authenticated caller."""
+    ctx = SimpleNamespace(
+        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv())
+    )
+    client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
+    app = routes_mod.build_routes(ctx)
+    return TestClient(app), ctx
+
+
+def test_identity_is_still_required_for_status(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.get("/status").status_code == 401
+
+
+def test_identity_is_still_required_for_settings(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.post("/settings", json={"service_secret": "x"}).status_code == 401
+
+
+def test_identity_is_still_required_for_logout(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.post("/logout").status_code == 401
+
+
+def test_identity_is_still_required_for_test_connection(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.post("/test").status_code == 401
+
+
+def test_identity_is_still_required_for_mcp_json(ungated_app_client):
+    """The route that embeds AW_WORKSPACE_API_KEY in its body when set
+    (mcp/self_register.py) — the one existing route that MUST NOT become
+    reachable by the same caller `GET /keys/{slot}` now is."""
+    tc, _ = ungated_app_client
+    assert tc.get("/mcp.json").status_code == 401
+
+
+def test_identity_is_still_required_for_bulk_ingest_routes(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.post("/bulk-ingest/scan").status_code == 401
+    assert tc.post("/bulk-ingest/run").status_code == 401
+    assert tc.get("/bulk-ingest/status").status_code == 401
+    assert tc.get("/bulk-ingest/report").status_code == 401
+
+
+def test_identity_is_still_required_for_mcp(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.get("/mcp").status_code == 401
+    assert tc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 401
+
+
+def test_pull_key_needs_no_identity_at_all(ungated_app_client):
+    """The one deliberate exception — `GET /keys/{slot}` must answer a
+    caller with NO identity, only the shared `X-Internal-Secret`, which is
+    the entire reason this app's `auth_required` has to go `false`."""
+    tc, ctx = ungated_app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.get("/keys/bogus", headers={"x-internal-secret": "shh"})
+    assert resp.status_code == 404, "reached the handler, past any identity gate"

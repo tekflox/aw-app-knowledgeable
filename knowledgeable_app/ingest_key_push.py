@@ -41,21 +41,12 @@ import asyncio
 import logging
 import os
 
-import httpx
-
+from . import key_vault
 from .mcp import client
-from .workspace_env import workspace_env
 
 log = logging.getLogger("aw_apps.knowledgeable.ingest_key_push")
 
 SECRET_NAME = "knowledgeable-extractor-apmt-key"
-
-#: Sent as the `X-Aw-Caller-Agent` header aw-app-secrets' REST route reads —
-#: same stable caller identity the Playground push uses, since both pushes
-#: originate from this same connector process. See that module's own comment
-#: for the verification this string is grounded on (`caller.py::
-#: agent_identity()`).
-CALLER_AGENT_HEADER_VALUE = "aw-app-knowledgeable"
 
 #: How often to re-push, regardless of whether the last push looked like it
 #: worked — see module docstring: this process cannot know when
@@ -64,72 +55,15 @@ CALLER_AGENT_HEADER_VALUE = "aw-app-knowledgeable"
 #: SLO without a code change.
 PUSH_INTERVAL_S = int(os.environ.get("KNOWLEDGEABLE_INGEST_KEY_PUSH_INTERVAL_S") or 300)
 
-TIMEOUT_S = 20.0
-
-
-def _secrets_api_base() -> tuple[str, str] | None:
-    """This workspace's own loopback API root + the key that opens it, or
-    None when neither is published yet (a workspace that has not finished
-    booting — never raises, matches `resolve_api_key()`'s own contract on
-    the aw-knowledgeable side)."""
-    api_url = workspace_env("AW_WORKSPACE_API_URL")
-    api_key = workspace_env("AW_WORKSPACE_API_KEY")
-    if not api_url or not api_key:
-        return None
-    return api_url.rstrip("/"), api_key
-
-
-async def _read_from_vault() -> str | None:
-    """The ApiKey, read through aw-app-secrets' own REST surface (this
-    workspace's `/api/apps/secrets/secrets/{name}/read`) — not a second,
-    hand-rolled implementation of the approval protocol. `auto_approve_for`
-    on this one secret names this connector's caller identity, so the read
-    returns synchronously with a value; anything else (not yet approved,
-    denied, the vault unreachable) is logged and treated as "nothing to push
-    this tick", never raised."""
-    base = _secrets_api_base()
-    if base is None:
-        log.warning(
-            "ingest key push: AW_WORKSPACE_API_URL/AW_WORKSPACE_API_KEY "
-            "not published yet — skipping this tick"
-        )
-        return None
-    api_url, api_key = base
-    url = f"{api_url}/api/apps/secrets/secrets/{SECRET_NAME}/read"
-    headers = {"X-Api-Key": api_key, "X-Aw-Caller-Agent": CALLER_AGENT_HEADER_VALUE}
-    body = {
-        "reason": "re-assert aw-knowledgeable extractor's ap-mt key in production",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as c:
-            resp = await c.post(url, json=body, headers=headers)
-    except httpx.HTTPError as exc:
-        log.warning("ingest key push: could not reach the workspace secret store: %s", exc)
-        return None
-    if resp.status_code >= 400:
-        log.warning(
-            "ingest key push: secret read failed (%s): %s",
-            resp.status_code, resp.text[:300],
-        )
-        return None
-    data = resp.json()
-    if data.get("status") != "approved" or not data.get("value"):
-        log.warning(
-            "ingest key push: %r was not auto-approved for caller %r "
-            "(status=%s) — that caller must be on the secret's "
-            "auto_approve_for allowlist, or every tick opens a Telegram "
-            "prompt instead of pushing anything",
-            SECRET_NAME, CALLER_AGENT_HEADER_VALUE, data.get("status"),
-        )
-        return None
-    return data["value"]
-
 
 async def push_once() -> bool:
     """Read the key from the vault and push it to production. Never raises —
     every failure is logged and this waits for the next tick, the same
     never-fail-loud shape aw-knowledgeable's own `resolve_api_key()` uses."""
-    value = await _read_from_vault()
+    value = await key_vault.read_secret(
+        SECRET_NAME,
+        reason="re-assert aw-knowledgeable extractor's ap-mt key in production",
+    )
     if not value:
         return False
     ok, err = await client.push_ingest_key(value)

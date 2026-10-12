@@ -1,23 +1,57 @@
 """This app's backend sub-app, mounted by the runtime at
-``/api/apps/knowledgeable`` behind the workspace's IdentityGuard.
+``/api/apps/knowledgeable``.
 
 The service secret goes to ``ctx.secrets`` via ``POST /settings``, never
 through the generic config path — that would land it in plain,
 cloud-syncable app config. The ``x-secret`` flag on ``service_secret`` in
 the manifest exists only so the settings UI renders a password field. Same
 split as ``aw-app-google-maps``'s API key.
+
+**This app's config must carry ``auth_required: false``** — without it, the
+workspace's own ``IdentityGuard`` 401s every request to this mount before any
+handler below runs, and ``GET /keys/{slot}`` (below) exists precisely to be
+called by production aw-knowledgeable, which holds neither a signed-in
+session nor the workspace API key, only the shared ``X-Internal-Secret``.
+``auth_required`` is an ALL-OR-NOTHING flag on the whole mount
+(``aw-autoskill-app-auth-required-routing``), so every OTHER route here now
+carries its own explicit ``_require_identity`` dependency — the protection
+the framework gate used to provide for free. Flipping that config key is a
+deliberate operational step outside this repo (``POST
+/api/apps/knowledgeable/config``); this file only makes it SAFE to flip.
 """
 from __future__ import annotations
 
-from fastapi import Body, FastAPI
+import hmac
+
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import bulk_ingest, git_backend, mcp_config
+from . import bulk_ingest, git_backend, ingest_key_push, key_vault, label_key_push, mcp_config, playground_key_push
 from .mcp import client
 from .workspace_env import workspace_env
 
 SECRET_KEY = "service_secret"
+
+#: `GET /keys/{slot}` — docs/design/knowledgeable-apmt-key-pull-through.md
+#: §3.1. Each slot is one of the three ap-mt keys production already pushes
+#: for, named by the aw-knowledgeable-side endpoint that consumes it, mapped
+#: to the vault secret + push module that already know how to fetch it. One
+#: table rather than three near-identical route functions.
+_PULL_SLOTS = {
+    "playground": (
+        playground_key_push.SECRET_NAME,
+        "pull-through: aw-knowledgeable's Playground ap-mt key on miss/401",
+    ),
+    "ingest": (
+        ingest_key_push.SECRET_NAME,
+        "pull-through: aw-knowledgeable's extractor ap-mt key on miss/401",
+    ),
+    "topics": (
+        label_key_push.SECRET_NAME,
+        "pull-through: aw-knowledgeable's topic labeller ap-mt key on miss/401",
+    ),
+}
 GIT_TOKEN_KEY = git_backend.GIT_TOKEN_SECRET
 #: `ctx.state.kv` name the last tick's git_state/git_detail is cached under,
 #: so `/status` can show it between ticks (§16.3 point 3) without re-running
@@ -27,10 +61,23 @@ GIT_STATE_KV_NAME = "git_last_state"
 GIT_STATE_KV_TTL = 60 * 60 * 24
 
 
+def _require_identity(request: Request) -> None:
+    """401 unless the framework's own ``IdentityGuard`` authenticated this
+    caller (a signed-in workspace session, or the workspace API key) —
+    re-implemented per-route because ``auth_required: false`` (see module
+    docstring) stops the guard from enforcing it for the whole mount. Mirrors
+    ``aw-app-xiaomi``'s own ``_require_credential``; no loopback carve-out
+    here, since this app has no local-agent caller that needs one.
+    """
+    if request.scope.get("aw_identity") is not None:
+        return
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
 def build_routes(ctx) -> FastAPI:
     app = FastAPI(title="knowledgeable")
 
-    @app.get("/status")
+    @app.get("/status", dependencies=[Depends(_require_identity)])
     async def status() -> dict:
         secret = ctx.secrets.read(SECRET_KEY) or ""
         base = client.base_url()
@@ -55,7 +102,7 @@ def build_routes(ctx) -> FastAPI:
             },
         }
 
-    @app.post("/settings")
+    @app.post("/settings", dependencies=[Depends(_require_identity)])
     async def save_settings(data: dict = Body(...)) -> dict:
         secret = (data.get(SECRET_KEY) or "").strip()
         if not secret:
@@ -74,12 +121,12 @@ def build_routes(ctx) -> FastAPI:
         # a per-call callable, so the very next tool call already uses it.
         return {"ok": True, "logged_in": True}
 
-    @app.post("/logout")
+    @app.post("/logout", dependencies=[Depends(_require_identity)])
     async def clear_secret() -> dict:
         ctx.secrets.delete(SECRET_KEY)
         return {"ok": True, "logged_in": False, "configured": False}
 
-    @app.post("/test")
+    @app.post("/test", dependencies=[Depends(_require_identity)])
     async def test_connection() -> dict:
         """Prove reachability + auth for real, from the actual owning
         process — not from a sandbox or an agent container, per D2 risk 6
@@ -88,9 +135,42 @@ def build_routes(ctx) -> FastAPI:
         result, is_error = await client.list_documents({})
         return {"ok": not is_error, "base_url": client.base_url(), "result": result[:2000]}
 
-    @app.get("/mcp.json")
+    @app.get("/mcp.json", dependencies=[Depends(_require_identity)])
     async def mcp_json() -> dict:
+        # build_self_entry() embeds AW_WORKSPACE_API_KEY in this body when
+        # set (mcp/self_register.py) — exactly the credential this whole
+        # file's reasoning says an external, credential-less caller must
+        # never get. This MUST stay gated even with auth_required: false.
         return {"mcpServers": mcp_config.build_mcp_servers()}
+
+    # ------------------------------------------------------------------
+    # §3.1 of the pull-through design — production fetches its ap-mt key
+    # from HERE (at boot, on an empty slot, on a 401) instead of waiting for
+    # the push loops above. Same `X-Internal-Secret` channel those loops'
+    # pushes already travel over, just inbound instead of outbound: this
+    # route must enforce that auth itself rather than trust whatever gate
+    # the workspace server wraps app routes in — a workspace API key must
+    # not be enough to extract an LLM credential (the same "never a human"
+    # reasoning `require_service` already applies on the push side).
+    # ------------------------------------------------------------------
+
+    @app.get("/keys/{slot}")
+    async def pull_key(slot: str, request: Request):
+        provided = request.headers.get("x-internal-secret", "")
+        expected = ctx.secrets.read(SECRET_KEY) or ""
+        if not provided or not expected or not hmac.compare_digest(expected, provided):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        entry = _PULL_SLOTS.get(slot)
+        if entry is None:
+            return JSONResponse({"detail": f"unknown key slot {slot!r}"}, status_code=404)
+        secret_name, reason = entry
+        value = await key_vault.read_secret(secret_name, reason=reason)
+        if not value:
+            return JSONResponse(
+                {"detail": f"vault read for {secret_name!r} unavailable", "reason": "vault_unavailable"},
+                status_code=503,
+            )
+        return {"api_key": value}
 
     # ------------------------------------------------------------------
     # §13 — the KB bulk-ingest driver. Both doors (the `knowledgeable-ingest`
@@ -101,11 +181,11 @@ def build_routes(ctx) -> FastAPI:
     # `mcp/client.py` (base_url + X-Internal-Secret).
     # ------------------------------------------------------------------
 
-    @app.post("/bulk-ingest/scan")
+    @app.post("/bulk-ingest/scan", dependencies=[Depends(_require_identity)])
     async def bulk_ingest_scan() -> dict:
         return await run_in_threadpool(bulk_ingest.scan, ctx.db)
 
-    @app.post("/bulk-ingest/run")
+    @app.post("/bulk-ingest/run", dependencies=[Depends(_require_identity)])
     async def bulk_ingest_run(data: dict = Body(default={})) -> dict:
         max_uploads = data.get("max_uploads")
         git_config = {
@@ -126,11 +206,11 @@ def build_routes(ctx) -> FastAPI:
             )
         return result
 
-    @app.get("/bulk-ingest/status")
+    @app.get("/bulk-ingest/status", dependencies=[Depends(_require_identity)])
     async def bulk_ingest_status() -> dict:
         return await run_in_threadpool(bulk_ingest.status, ctx.db)
 
-    @app.get("/bulk-ingest/report")
+    @app.get("/bulk-ingest/report", dependencies=[Depends(_require_identity)])
     async def bulk_ingest_report() -> dict:
         return await run_in_threadpool(bulk_ingest.report, ctx.db)
 
@@ -138,7 +218,7 @@ def build_routes(ctx) -> FastAPI:
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.
     # ------------------------------------------------------------------
 
-    @app.post("/mcp")
+    @app.post("/mcp", dependencies=[Depends(_require_identity)])
     async def mcp_post(data: dict | list = Body(...)):
         from .mcp.http_handler import handle_request
 
@@ -152,7 +232,7 @@ def build_routes(ctx) -> FastAPI:
             return Response(status_code=202)
         return JSONResponse(responses if isinstance(data, list) else responses[0])
 
-    @app.get("/mcp")
+    @app.get("/mcp", dependencies=[Depends(_require_identity)])
     async def mcp_get():
         return Response(status_code=405)
 
