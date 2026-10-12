@@ -177,6 +177,21 @@ STATUS_ALIAS = "alias"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 
+#: docs/design/aw-knowledgeable-fs-sync.md §3.2 — the journal extension
+#: `fs_sync.py` needs on this SAME table (reusing bulk-ingest's journal,
+#: per that module's own docstring) rather than a second table: the
+#: three-way base (`last_synced_hash`), the downsync cursor
+#: (`remote_rev`, unused until card C), the ≥2-consecutive-scans delete
+#: counter (`missing_scans`), the two-phase-delete mark (`pending_delete`),
+#: and which direction last wrote a row (`origin`).
+_SYNC_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("last_synced_hash", "TEXT"),
+    ("remote_rev", "INTEGER"),
+    ("missing_scans", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_delete", "INTEGER NOT NULL DEFAULT 0"),
+    ("origin", "TEXT"),
+)
+
 #: Mirrors aw-knowledgeable's own cap (`backend/app/api/documents.py`'s
 #: `max_document_size_bytes`) — §13.9 risk 4: skipped with a journal reason,
 #: never a driver crash.
@@ -211,6 +226,35 @@ def kb_root() -> Path:
     return Path(_workspace_home()) / "knowledge_base"
 
 
+def _ensure_sync_columns(db) -> None:
+    """§3.2's journal extension, idempotent the same way a bulk SQL
+    migration file would be, but hand-rolled per house style (no alembic).
+
+    Checked column-by-column with a probe ``SELECT`` rather than ``ALTER
+    TABLE ... ADD COLUMN IF NOT EXISTS``: that clause is valid Postgres
+    (this app's real, production engine) but this repo's own test double
+    runs stdlib sqlite3, whose ``ADD COLUMN`` does not accept it on every
+    build — a probe-then-add is portable to both and still a real,
+    checked ALTER (a bare ``try/except`` swallowing any ALTER failure
+    would also hide a genuine typo in the DDL).
+
+    The bootstrap backfill (`last_synced_hash = sha256` on every already-
+    `uploaded` row) runs in the same pass — it is what gives fs-sync a
+    three-way comparison base for every document this driver already
+    ingested, with no re-embedding and no wipe (card B's whole point)."""
+    for column, ddl_type in _SYNC_COLUMNS:
+        try:
+            db.execute(TABLE, f"SELECT {column} FROM {{table}} LIMIT 1")
+        except Exception:
+            db.execute(TABLE, f"ALTER TABLE {{table}} ADD COLUMN {column} {ddl_type}")
+    db.execute(
+        TABLE,
+        "UPDATE {table} SET last_synced_hash = sha256 "
+        "WHERE status = :status AND last_synced_hash IS NULL",
+        {"status": STATUS_UPLOADED},
+    )
+
+
 def _ensure_table(db) -> None:
     """``CREATE TABLE``/``CREATE INDEX ... IF NOT EXISTS`` — idempotent, and
     guarded so a process only pays the round trip once (every call after the
@@ -233,6 +277,7 @@ def _ensure_table(db) -> None:
         db.execute(TABLE, "CREATE INDEX IF NOT EXISTS ix_bulk_ingest_files_status ON {table} (status)")
         db.execute(TABLE, "CREATE INDEX IF NOT EXISTS ix_bulk_ingest_files_bucket ON {table} (bucket)")
         db.execute(TABLE, "CREATE INDEX IF NOT EXISTS ix_bulk_ingest_files_sha256 ON {table} (sha256)")
+        _ensure_sync_columns(db)
         _table_ensured = True
 
 

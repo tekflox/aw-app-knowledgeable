@@ -195,6 +195,50 @@ async def upload_bytes(
     return resp.json(), None
 
 
+async def put_document_by_path(
+    filename: str,
+    raw: bytes,
+    *,
+    source_path: str,
+    workspace_slug: str,
+    base_hash: str | None = None,
+    title: str | None = None,
+) -> tuple[dict | None, str | None]:
+    """PUT /api/documents/by-path (docs/design/aw-knowledgeable-fs-sync.md
+    §1.2) — the fs-sync engine's path-keyed sibling of ``upload_bytes``
+    above. The response (``{id, rev, content_hash, outcome}``) is the
+    load-bearing contract the caller journals from directly, never from a
+    second read — same real-bytes-not-base64 reasoning as ``upload_bytes``,
+    since `fs_sync.py` also reads files off this process's own KB tree."""
+    data: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
+    if base_hash:
+        data["base_hash"] = base_hash
+    if title:
+        data["title"] = title
+    async with httpx.AsyncClient(timeout=45) as http_client:
+        try:
+            resp = await http_client.put(
+                f"{base_url()}/api/documents/by-path",
+                data=data,
+                files={"file": (filename, raw)},
+                headers=_headers(),
+            )
+        except httpx.HTTPError as exc:
+            return None, f"could not reach aw-knowledgeable at {base_url()}: {exc}"
+    if resp.status_code >= 400:
+        return None, _describe_error(resp)
+    return resp.json(), None
+
+
+async def mark_delete(external_id: str, *, reason: str | None = None) -> tuple[dict | None, str | None]:
+    """POST /api/documents/{id}/mark-delete (§7) — marks pending-delete,
+    never removes. This connector never sends ``force``: that is decision
+    5's agent path, a separate, explicit MCP-tool argument reserved for a
+    human-directed reorganization, not this driver's default behaviour."""
+    body: dict = {"reason": reason} if reason else {}
+    return await _post_json(f"/api/documents/{external_id}/mark-delete", body)
+
+
 async def push_playground_key(value: str) -> tuple[bool, str | None]:
     """POST /api/playground/key — hand production the Playground's ap-mt
     ApiKey, over the same ``X-Internal-Secret`` channel every other call in

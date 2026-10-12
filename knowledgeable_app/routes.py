@@ -27,7 +27,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import bulk_ingest, git_backend, ingest_key_push, key_vault, label_key_push, mcp_config, playground_key_push
+from . import bulk_ingest, fs_sync, git_backend, ingest_key_push, key_vault, label_key_push, mcp_config, playground_key_push
 from .mcp import client
 from .workspace_env import workspace_env
 
@@ -59,6 +59,14 @@ GIT_TOKEN_KEY = git_backend.GIT_TOKEN_SECRET
 #: quiet weekend without going stale forever.
 GIT_STATE_KV_NAME = "git_last_state"
 GIT_STATE_KV_TTL = 60 * 60 * 24
+
+#: docs/design/aw-knowledgeable-fs-sync.md §7 — the mass-delete valve's
+#: own "journal flag", cached the same way `git_last_state` is: a tripped
+#: valve is a rare, deliberately sticky signal an operator must notice and
+#: clear (verify the tree, then either resolve it or approve in the UI),
+#: so it gets a long TTL rather than the git state's 1-day one.
+FS_SYNC_VALVE_KV_NAME = "fs_sync_valve_tripped"
+FS_SYNC_VALVE_KV_TTL = 60 * 60 * 24 * 30
 
 
 def _require_identity(request: Request) -> None:
@@ -213,6 +221,40 @@ def build_routes(ctx) -> FastAPI:
     @app.get("/bulk-ingest/report", dependencies=[Depends(_require_identity)])
     async def bulk_ingest_report() -> dict:
         return await run_in_threadpool(bulk_ingest.report, ctx.db)
+
+    # ------------------------------------------------------------------
+    # docs/design/aw-knowledgeable-fs-sync.md §3/§7 (card B) — the fs-sync
+    # upsync engine. Same one-engine-reused-through-routes shape as the
+    # bulk-ingest doors above: `knowledgeable-sync` CLI is door 1, a future
+    # scheduled task would be door 2 (not wired up by this card — enabling
+    # it live is an operator decision after the restart this Tier-1 code
+    # change needs, same as card A's deploy-then-verify split).
+    # ------------------------------------------------------------------
+
+    @app.post("/fs-sync/run", dependencies=[Depends(_require_identity)])
+    async def fs_sync_run(data: dict = Body(default={})) -> dict:
+        max_uploads = data.get("max_uploads")
+        kwargs = {"workspace_slug": workspace_env("AW_WORKSPACE")}
+        if max_uploads is not None:
+            kwargs["max_uploads"] = int(max_uploads)
+        result = await fs_sync.run_tick(ctx.db, ctx.state.lease, **kwargs)
+        if result.get("valve_tripped"):
+            await ctx.state.kv.put(
+                FS_SYNC_VALVE_KV_NAME,
+                {"reason": result.get("reason")},
+                ttl=FS_SYNC_VALVE_KV_TTL,
+            )
+        return result
+
+    @app.get("/fs-sync/status", dependencies=[Depends(_require_identity)])
+    async def fs_sync_status() -> dict:
+        payload = await run_in_threadpool(fs_sync.status, ctx.db)
+        payload["valve_tripped"] = await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME)
+        return payload
+
+    @app.get("/fs-sync/report", dependencies=[Depends(_require_identity)])
+    async def fs_sync_report() -> dict:
+        return await run_in_threadpool(fs_sync.report, ctx.db)
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

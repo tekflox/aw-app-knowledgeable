@@ -283,6 +283,13 @@ def test_identity_is_still_required_for_bulk_ingest_routes(ungated_app_client):
     assert tc.get("/bulk-ingest/report").status_code == 401
 
 
+def test_identity_is_still_required_for_fs_sync_routes(ungated_app_client):
+    tc, _ = ungated_app_client
+    assert tc.post("/fs-sync/run").status_code == 401
+    assert tc.get("/fs-sync/status").status_code == 401
+    assert tc.get("/fs-sync/report").status_code == 401
+
+
 def test_identity_is_still_required_for_mcp(ungated_app_client):
     tc, _ = ungated_app_client
     assert tc.get("/mcp").status_code == 401
