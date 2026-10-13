@@ -1085,6 +1085,317 @@ def test_pull_conflict_filesystem_wins_leaves_the_file_and_defers_the_loss_to_th
     assert row["remote_rev"] == 3  # this remote revision won't be re-flagged next tick
 
 
+def test_pull_conflict_tie_within_skew_epsilon_goes_to_filesystem(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§3.3 step 3's tie rule, made to actually bite: the remote change is
+    nominally newer than the file, but by less than the ±5s skew epsilon,
+    so the design says the tie still goes to the filesystem. The two
+    tests above only exercise "remote far newer" and "local far newer" —
+    both would stay green even if the tie direction were silently
+    inverted, since neither puts the two mtimes anywhere near each
+    other. This is the case that actually proves the direction."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"local content, nominally a bit older but inside the window"
+    _write(root, "authored/note.md", local_content.decode())
+    local_time = time.time() - 500
+    os.utime(root / "authored/note.md", (local_time, local_time))
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42",
+    )
+
+    remote_time = local_time + 3.0  # nominally newer, but inside ±CONFLICT_SKEW_SECONDS
+    assert remote_time - local_time < fs_sync.CONFLICT_SKEW_SECONDS
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": "the-losing-remote-hash", "sync_status": None,
+                "updated_at": _iso(remote_time),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    content_calls = []
+
+    async def fake_content(external_id):
+        content_calls.append(external_id)
+        return b"should never be written to disk", None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["conflicts_local_won"] == 1
+    assert content_calls == []  # inside the window — filesystem wins, remote content never fetched
+    assert (root / "authored/note.md").read_bytes() == local_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == "base-hash"
+    assert row["remote_rev"] == 3
+
+
+def test_pull_conflict_at_exact_skew_boundary_goes_to_filesystem(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The boundary itself: remote exactly `CONFLICT_SKEW_SECONDS` newer
+    than the file. The design's comparison is inclusive (`>=`, see
+    `fs_sync._run_pull_pass`), so this exact point is still a tie and
+    still goes to the filesystem — a `>` instead of `>=` would flip only
+    this one point without affecting the "clearly inside"/"clearly
+    outside" cases above and below."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"local content exactly at the skew boundary"
+    _write(root, "authored/note.md", local_content.decode())
+    # Whole seconds, deliberately: the mtime/iso round trip loses sub-second
+    # precision in ways that make the exact fractional boundary flaky to
+    # pin down — a whole-second boundary is exact on both sides and still
+    # genuinely exercises the `>=` in `fs_sync._run_pull_pass`.
+    local_time = float(int(time.time())) - 500
+    os.utime(root / "authored/note.md", (local_time, local_time))
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42",
+    )
+
+    remote_time = local_time + fs_sync.CONFLICT_SKEW_SECONDS  # exactly on the boundary
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": "the-losing-remote-hash", "sync_status": None,
+                "updated_at": _iso(remote_time),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    content_calls = []
+
+    async def fake_content(external_id):
+        content_calls.append(external_id)
+        return b"should never be written to disk", None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["conflicts_local_won"] == 1
+    assert content_calls == []  # boundary included — filesystem still wins
+    assert (root / "authored/note.md").read_bytes() == local_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == "base-hash"
+
+
+def test_pull_conflict_just_outside_skew_epsilon_remote_wins(
+    _workspace_home, db, lease, monkeypatch
+):
+    """One step past the boundary: remote more than `CONFLICT_SKEW_SECONDS`
+    newer than the file. Pairs with the exact-boundary test above to
+    prove the ±5s window has a real edge in both directions, not just a
+    direction with no limit."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"a stale local edit, just past the skew window"
+    _write(root, "authored/note.md", local_content.decode())
+    local_time = time.time() - 500
+    os.utime(root / "authored/note.md", (local_time, local_time))
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42",
+    )
+
+    remote_content = b"the remote edit that wins just past the window"
+    remote_hash = hashlib.sha256(remote_content).hexdigest()
+    remote_time = local_time + fs_sync.CONFLICT_SKEW_SECONDS + 0.5
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": _iso(remote_time),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    async def fake_content(external_id):
+        return remote_content, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["conflicts_local_won"] == 0
+    assert (root / "authored/note.md").read_bytes() == remote_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == remote_hash
+    assert row["remote_rev"] == 3
+
+
+def _server_conflict_overwrote(*, old_hash: str, base_hash: str | None, new_hash: str) -> str | None:
+    """Mirrors `upsert_document_by_path`'s Cypher in
+    repos/aw-knowledgeable/backend/app/core/graph.py (§1.2) exactly:
+
+        changed = NOT created AND old_hash <> $content_hash
+        conflict_overwrote = CASE
+            WHEN changed AND $base_hash IS NOT NULL AND $base_hash <> old_hash
+            THEN old_hash ELSE d.conflict_overwrote END
+
+    Defined here, not imported, because this card is scoped to
+    repos/aw-app-knowledgeable only — but the connector's entire
+    contribution to that server-side audit trail is the `base_hash` value
+    it sends, so mirroring the formula is the only way to assert the
+    actual recorded value from this repo rather than merely trusting that
+    some non-empty `base_hash` was passed."""
+    changed = old_hash != new_hash
+    if changed and base_hash is not None and base_hash != old_hash:
+        return old_hash
+    return None
+
+
+def test_filesystem_wins_conflict_then_upload_sends_the_stale_base_hash_that_records_the_losing_remote_hash(
+    _workspace_home, db, lease, monkeypatch
+):
+    """Gap 2 from the mutation-testing card: no test asserted that the
+    losing side's hash is actually recorded in `conflict_overwrote`.
+    That field is written server-side (out of scope for this card — see
+    `_server_conflict_overwrote` above), but the connector's own half of
+    the promise is sending the STALE pre-conflict `base_hash` on the
+    upload that follows a filesystem-won conflict (this module's own
+    docstring on `_run_pull_pass`). Debounce is pre-satisfied
+    (`scanned_at` far in the past) so the conflict and the deferred
+    upload both land in this one tick, same as production: the pull pass
+    leaves `last_synced_hash` stale, and the scan/upload loop later in
+    the SAME tick finds `digest != last_synced_hash` and uploads
+    immediately with that stale hash as `base_hash`."""
+    root = bulk_ingest.kb_root()
+    local_content = b"the newer local edit, uploaded this same tick"
+    _write(root, "authored/note.md", local_content.decode())
+    local_digest = hashlib.sha256(local_content).hexdigest()
+    _seed_uploaded(
+        db, "authored/note.md", sha256=local_digest, last_synced_hash="base-hash",
+        external_id="doc-42", scanned_at=time.time() - 100,  # debounce already satisfied
+    )
+
+    remote_hash = "the-losing-remote-hash"
+    old_remote_iso = _iso(time.time() - 1000)  # far older — filesystem wins the pull conflict
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": old_remote_iso,
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    content_calls = []
+
+    async def fake_content(external_id):
+        content_calls.append(external_id)
+        return b"should never be fetched", None
+
+    put_calls = []
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        put_calls.append({"base_hash": base_hash, "raw": raw})
+        return {"id": "doc-42", "rev": 4, "content_hash": local_digest, "outcome": "updated"}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["conflicts_local_won"] == 1
+    assert content_calls == []  # filesystem won the pull-side conflict
+    assert len(put_calls) == 1
+    assert put_calls[0]["base_hash"] == "base-hash"  # the stale pre-conflict hash — not the winner's
+
+    recorded = _server_conflict_overwrote(
+        old_hash=remote_hash, base_hash=put_calls[0]["base_hash"], new_hash=local_digest,
+    )
+    assert recorded == remote_hash  # the LOSING remote hash — not the local winner's, not None
+
+
+def test_remote_wins_conflict_never_uploads_the_discarded_local_edit(
+    _workspace_home, db, lease, monkeypatch
+):
+    """Mirror image of the test above: when the remote side wins, the
+    discarded local edit must never be pushed back up at all — there is
+    no `base_hash` to send and no server-side loser to record, because
+    the local bytes are simply overwritten on disk. A copy-paste of the
+    filesystem-wins branch's deferred-upload behaviour into this branch
+    would silently re-upload the very content that just lost, so this
+    asserts zero `put_document_by_path` calls, not just that the file
+    ends up with the remote content (already covered by
+    `test_pull_conflict_remote_wins_on_newer_mtime_overwrites_the_local_edit`,
+    which never previously confirmed upload was skipped — it just never
+    mocked `put_document_by_path`, so a real network call would have
+    raised or errored silently and still been invisible to that test)."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"a stale local edit about to be discarded"
+    _write(root, "authored/note.md", local_content.decode())
+    old_time = time.time() - 1000
+    os.utime(root / "authored/note.md", (old_time, old_time))
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42", scanned_at=old_time,
+    )
+
+    remote_content = b"the newer remote edit that wins"
+    remote_hash = hashlib.sha256(remote_content).hexdigest()
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": _iso(time.time()),  # now — far newer than old_time
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    async def fake_content(external_id):
+        return remote_content, None
+
+    put_calls = []
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        put_calls.append({"base_hash": base_hash})
+        return {"id": "doc-42", "rev": 99, "content_hash": "should-never-be-used", "outcome": "updated"}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["conflicts_local_won"] == 0
+    assert put_calls == []  # the discarded local edit is never uploaded
+    assert (root / "authored/note.md").read_bytes() == remote_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == remote_hash
+
+
 def test_decline_restore_arriving_on_the_feed_clears_the_stale_journal_mark(
     _workspace_home, db, lease, monkeypatch
 ):
