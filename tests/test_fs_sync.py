@@ -16,6 +16,7 @@ import hashlib
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,20 @@ def _no_adoptable_paths(monkeypatch):
         return {"paths": [], "cursor": None}, None
 
     monkeypatch.setattr(client, "get_sync_paths", fake_get_sync_paths)
+
+
+@pytest.fixture(autouse=True)
+def _no_pending_changes(monkeypatch):
+    """§3.3 step 2 — every tick now also runs the pull pass unconditionally,
+    so without this default every pre-card-C test would fire a real
+    (failing) HTTP call to `GET /changes`. Default: nothing new on the
+    feed. The tests that exercise the pull pass itself override this
+    explicitly."""
+
+    async def fake_get_document_changes(since=None, limit=200):
+        return {"changes": [], "cursor": since}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_get_document_changes)
 
 
 @pytest.fixture()
@@ -624,10 +639,15 @@ def test_adoption_excludes_skipped_paths(_workspace_home, db, lease, monkeypatch
     assert "notion/real.md" in relpaths
 
 
-def test_adoption_excludes_authored_paths(_workspace_home, db, lease, monkeypatch):
-    """§17.3 exclusion 2 — pre-card-C, a human-authored document can
-    legitimately exist server-side with no file on disk; adopting it
-    would mark that future downsync payload for deletion."""
+def test_adoption_no_longer_excludes_authored_paths_now_that_the_pull_pass_exists(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§17.6 point 4 — card C removes the pre-downsync tripwire
+    deliberately: an `authored/` document whose file was genuinely deleted
+    on disk must be adopted (and, eventually, delete-detected) exactly
+    like any other path now that the pull pass exists to keep a
+    legitimately file-less `authored/` document's journal row written
+    before anything downstream could see it as missing."""
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
 
     async def fake_sync_paths(workspace_slug, after=None, limit=500):
@@ -644,9 +664,9 @@ def test_adoption_excludes_authored_paths(_workspace_home, db, lease, monkeypatc
     result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
 
     assert result["blocked"] is False
-    assert result["adopted"] == 1
+    assert result["adopted"] == 2
     relpaths = {r["relpath"] for r in _journal_rows(db)}
-    assert "authored/note.md" not in relpaths
+    assert "authored/note.md" in relpaths
     assert "notion/real.md" in relpaths
 
 
@@ -848,3 +868,301 @@ def test_valve_guard1_aborts_before_adoption_or_catchup_touch_anything(
     # proof it was never reached, not just that it had nothing to do.
     with pytest.raises(Exception):
         fs_sync._catchup_done(db)
+
+
+# ---------------------------------------------------------------------------
+# §3.3 steps 2-3 (card C) — the pull pass: journal-before-file, conflict
+# resolution, remote_rev-only drift tracking, and the decline/restore gap.
+# ---------------------------------------------------------------------------
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def test_pull_writes_the_journal_row_before_the_file_the_echo_loop_breaker(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The card's own single most important invariant, made explicit: if
+    this were reversed, a scan could observe the new bytes on disk before
+    `last_synced_hash` reflects them, PUT them straight back up, and the
+    two directions would loop forever."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")  # a real file so guard 1 doesn't trip
+
+    remote_content = b"pulled from the server"
+    remote_hash = hashlib.sha256(remote_content).hexdigest()
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-99", "source_path": "authored/note.md",
+                "rev": 1, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": _iso(time.time()),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    async def fake_content(external_id):
+        assert external_id == "doc-99"
+        return remote_content, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    events: list[str] = []
+    real_execute = db.execute
+
+    def spy_execute(name, sql, params=None):
+        if name == fs_sync.TABLE and (params or {}).get("relpath") == "authored/note.md" \
+                and "last_synced_hash" in sql:
+            events.append("journal")
+        return real_execute(name, sql, params)
+
+    monkeypatch.setattr(db, "execute", spy_execute)
+
+    real_write_bytes = Path.write_bytes
+
+    def spy_write_bytes(self, data):
+        if self.name == "note.md":
+            events.append("file")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", spy_write_bytes)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["authored_written"] == 1
+    assert events == ["journal", "file"]  # journal committed strictly before the file
+    assert (root / "authored/note.md").read_bytes() == remote_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == remote_hash
+    assert row["remote_rev"] == 1
+    assert row["external_id"] == "doc-99"
+
+
+def test_pull_updates_remote_rev_only_outside_authored_never_touches_disk(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§3.3 step 2's mirror-image rule: a change outside `authored/`
+    advances `remote_rev` so drift is visible in `report()`, but the file
+    on disk is never touched and the content is never even fetched."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(
+        db, "notion/keep.md", external_id="doc-1",
+        last_synced_hash=hashlib.sha256(b"keep me").hexdigest(),
+    )
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-1", "source_path": "notion/keep.md",
+                "rev": 5, "content_hash": "server-side-only-hash", "sync_status": None,
+                "updated_at": _iso(time.time()),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    content_calls = []
+
+    async def fake_content(external_id):
+        content_calls.append(external_id)
+        return b"must never be fetched for a non-authored path", None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["remote_rev_only"] == 1
+    assert result["authored_written"] == 0
+    assert content_calls == []
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/keep.md")
+    assert row["remote_rev"] == 5
+    assert (root / "notion/keep.md").read_text(encoding="utf-8") == "keep me"  # untouched
+
+
+def test_pull_conflict_remote_wins_on_newer_mtime_overwrites_the_local_edit(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§3.3 step 3 — both sides changed; the remote side is clearly newer
+    (well past the ±5s epsilon), so it wins and the local edit is
+    overwritten."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"a stale local edit"
+    _write(root, "authored/note.md", local_content.decode())
+    old_time = time.time() - 1000
+    os.utime(root / "authored/note.md", (old_time, old_time))
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42",
+    )
+
+    remote_content = b"the newer remote edit"
+    remote_hash = hashlib.sha256(remote_content).hexdigest()
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": _iso(time.time()),  # now — far newer than old_time
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    async def fake_content(external_id):
+        return remote_content, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["authored_written"] == 1
+    assert result["conflicts_local_won"] == 0
+    assert (root / "authored/note.md").read_bytes() == remote_content
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == remote_hash
+    assert row["remote_rev"] == 3
+
+
+def test_pull_conflict_filesystem_wins_leaves_the_file_and_defers_the_loss_to_the_next_upload(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§3.3 step 3 — both sides changed, the filesystem is newer (or ties
+    within the ±5s epsilon): the file is left alone and the loser's
+    content is never even fetched. `last_synced_hash` is deliberately NOT
+    advanced to the losing remote hash — a test must assert the loser is
+    recorded, not just that the winner won: leaving the stale base means
+    the NEXT scan's own upload PUTs with a `base_hash` that no longer
+    matches the server's current (remote) content, and the server records
+    that remote content as `conflict_overwrote` on its own upsert path —
+    nothing here silently merges or drops it."""
+    root = bulk_ingest.kb_root()
+    local_content = b"the newer local edit"
+    _write(root, "authored/note.md", local_content.decode())
+    _seed_uploaded(
+        db, "authored/note.md", sha256=hashlib.sha256(local_content).hexdigest(),
+        last_synced_hash="base-hash", external_id="doc-42",
+        scanned_at=time.time(),
+    )
+
+    old_remote_iso = _iso(time.time() - 1000)  # remote change is far OLDER
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": "the-losing-remote-hash", "sync_status": None,
+                "updated_at": old_remote_iso,
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    content_calls = []
+
+    async def fake_content(external_id):
+        content_calls.append(external_id)
+        return b"should never be written to disk", None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert content_calls == []  # filesystem won — the loser's bytes were never even fetched
+    assert (root / "authored/note.md").read_bytes() == local_content  # untouched
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == "base-hash"  # deliberately NOT advanced
+    assert row["remote_rev"] == 3  # this remote revision won't be re-flagged next tick
+
+
+def test_decline_restore_arriving_on_the_feed_clears_the_stale_journal_mark(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§17.6 point 5's full round trip: mark, decline (restored
+    server-side, so the feed's `sync_status` is no longer `pending_delete`),
+    tick — the journal's stale `pending_delete=1` must be cleared rather
+    than left to swallow every future miss at this path forever, but the
+    declined path also must NOT be instantly re-marked just because it is
+    still, separately, missing from disk."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/declined.md", external_id="doc-7", missing_scans=2, pending_delete=1)
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-7", "source_path": "notion/declined.md",
+                "rev": 1, "content_hash": "h", "sync_status": None,  # restored
+                "updated_at": _iso(time.time()),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    mark_calls = []
+
+    async def fake_mark(source_path, workspace_slug, reason=None):
+        mark_calls.append(source_path)
+        return {"source_path": source_path, "marked": [], "count": 0}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["restored"] == 1
+    assert mark_calls == []  # not re-marked this tick
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["pending_delete"] == 0
+
+
+def test_pull_pass_persists_its_cursor_across_ticks(_workspace_home, db, lease, monkeypatch):
+    """The cursor must survive the tick boundary — a second poll starts
+    from where the first left off, not from scratch. Matches the real
+    server's contract (`document_changes`'s own `cursor = ... if rows
+    else since`): the cursor only ever advances alongside an actual row,
+    so the fake only advances it on the page that carries one."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(
+        db, "notion/keep.md", external_id="doc-1",
+        last_synced_hash=hashlib.sha256(b"keep me").hexdigest(),
+    )
+
+    since_values = []
+    calls = {"n": 0}
+
+    async def fake_changes(since=None, limit=200):
+        since_values.append(since)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "changes": [{
+                    "external_id": "doc-1", "source_path": "notion/keep.md",
+                    "rev": 1, "content_hash": "h", "sync_status": None,
+                    "updated_at": _iso(time.time()),
+                }],
+                "cursor": "cursor-after-tick-1",
+            }, None
+        return {"changes": [], "cursor": since}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+
+    _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    # The pull pass pages until the cursor stops advancing, so tick 1 makes
+    # a second, same-tick call with the new cursor before it is satisfied
+    # there is nothing left — every call after the first real page echoes
+    # that same persisted cursor back, including tick 2's very first call.
+    assert since_values[0] is None
+    assert len(since_values) >= 2
+    assert all(v == "cursor-after-tick-1" for v in since_values[1:])

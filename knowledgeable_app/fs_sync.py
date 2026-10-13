@@ -17,10 +17,10 @@ content-hash-identity, create-only flow on the same table; this engine is
 a second, independent regime on the same journal rows (§1's "added NEXT
 TO the existing MERGE, not replacing it").
 
-**Card B scope only: upsync.** The pull/downsync half (§3.3 step 2,
-``GET /api/documents/changes``, the echo-loop breaker, last-write-wins) is
-card C and is not built here — there is no cursor state, no
-``authored/``-only write-back in this module.
+**Card C adds the pull/downsync half** (§3.3 steps 2-3): a persisted
+cursor over `GET /api/documents/changes`, the journal-before-file
+echo-loop breaker, and §3.3 step 3's last-change-wins conflict rule for
+`authored/` — the one subtree §4 lets this engine write back to disk.
 
 **The §7 mass-delete valve is the load-bearing piece of this file.**
 `aw-workspace-cli agent sync` does exact-mirror deletions (AGENTS.md), so
@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from fastapi.concurrency import run_in_threadpool
@@ -55,6 +57,12 @@ LEASE_NAME = "fs-sync-tick"
 
 ORIGIN_SCAN = "scan"
 
+#: §3.3 step 2 — the origin stamp for a journal row the PULL pass just
+#: wrote (as opposed to `ORIGIN_SCAN`, written by the upload pass). Both
+#: are real, reconciled rows; `origin` records which direction wrote them
+#: last, same column §3.2 already reserves for this.
+ORIGIN_DOWNSYNC = "downsync"
+
 #: §17.2 — a journal row this engine minted from the server's own
 #: `sync-paths` enumeration, not from a local file this connector ever
 #: uploaded. `external_id` is NULL until the path converges (the file
@@ -63,11 +71,21 @@ ORIGIN_SCAN = "scan"
 #: and the §7 valve to a path the journal would otherwise never see.
 ORIGIN_ADOPTED = "adopted"
 
-#: §17.3 exclusion 2 — pre-`card C` downsync, a human-authored document can
-#: legitimately exist server-side with no file on disk yet; adopting it
-#: would mark that future downsync payload for deletion. Card C removes
-#: this exclusion deliberately when it lands.
-ADOPTION_AUTHORED_PREFIX = "authored/"
+#: §4 — the one subtree the pull pass ever writes back to disk, and (until
+#: card C landed) the one adoption exclusion §17.3 carried as a deliberate
+#: tripwire. §17.6 point 4: removed from adoption's exclusions now that the
+#: pull pass exists to make the exclusion's reason moot — still used here by
+#: the pull pass itself to decide which changes may touch the filesystem.
+AUTHORED_PREFIX = "authored/"
+
+#: §3.3 step 3 — the last-change-wins tie rule: within this many seconds of
+#: each other, the filesystem (the corpus's primary home) wins rather than
+#: whichever side happens to compare greater by a few milliseconds.
+CONFLICT_SKEW_SECONDS = 5.0
+
+#: §3.3 step 2 — page size for `GET /api/documents/changes`, matching the
+#: server's own default.
+CHANGES_PAGE_LIMIT = 200
 
 #: §17.2 — page size for `GET /api/documents/sync-paths`, matching the
 #: server's own default.
@@ -84,6 +102,17 @@ FLAGS_TABLE = "app__knowledgeable__fs_sync_flags"
 #: would re-run forever since catch-up itself doesn't change `pending_delete`
 #: on an already-marked row).
 CATCHUP_FLAG = "mark_delete_by_path_catchup_v1"
+
+#: §3.3 step 2 — this connector's own small key/value table, holding the
+#: pull pass's persisted cursor over `GET /api/documents/changes` (and
+#: nothing else; the §17.4 catch-up gate above has its own single-purpose
+#: table, kept separate rather than overloaded with a differently-shaped
+#: value). Surviving a process restart is the whole point: losing the
+#: cursor would mean re-polling every change ever made, which is wasteful
+#: but not unsafe (every change is idempotent to re-apply — rev <=
+#: remote_rev is always a no-op).
+STATE_TABLE = "app__knowledgeable__fs_sync_state"
+DOWNSYNC_CURSOR_KEY = "downsync_cursor"
 
 #: §3.3 step 1 — never mark a path missing on the scan that first notices
 #: it gone; only on the SECOND consecutive miss. A half-written
@@ -216,20 +245,25 @@ def _check_mass_delete_valve(db, found: dict[str, str] | None) -> tuple[dict | N
 
 
 def _should_adopt(relpath: str) -> bool:
-    """§17.3 — two of the three adoption exclusions, each a correctness
-    rule, not tidiness: `is_skipped()` paths (the code-map skip prefixes,
-    and any dot-component — §16.1) may well have a live file the scan
-    deliberately never looks at, so "missing from source tree" would be a
-    lie; `authored/` is pre-`card C` downsync, where a human-authored
-    document legitimately exists server-side with no file on disk yet.
-    The third exclusion (foreign-`workspace_slug` claims) needs no check
-    here — `GET /sync-paths`' own slug-or-NULL filter already means this
-    engine is never offered one."""
-    if bulk_ingest.is_skipped(relpath):
-        return False
-    if relpath.startswith(ADOPTION_AUTHORED_PREFIX):
-        return False
-    return True
+    """§17.3 — one of the three adoption exclusions, a correctness rule,
+    not tidiness: `is_skipped()` paths (the code-map skip prefixes, and any
+    dot-component — §16.1) may well have a live file the scan deliberately
+    never looks at, so "missing from source tree" would be a lie.
+
+    §17.6 point 4 — `authored/` is deliberately NOT excluded here any
+    more. Pre-card-C that exclusion existed because adopting a
+    human-authored, file-less document would have marked the pull pass's
+    own future payload for deletion; now that the pull pass exists and
+    writes the file before anything downstream can see the row as
+    missing, the reason is moot, and leaving the exclusion in would make
+    an `authored/` document whose file was genuinely deleted on disk
+    invisible to delete detection again — a smaller re-instance of the
+    exact bug §17 exists to close.
+
+    The remaining exclusion (foreign-`workspace_slug` claims) needs no
+    check here — `GET /sync-paths`' own slug-or-NULL filter already means
+    this engine is never offered one."""
+    return not bulk_ingest.is_skipped(relpath)
 
 
 class _MarkBudget:
@@ -269,6 +303,253 @@ def _mark_catchup_done(db) -> None:
         "INSERT INTO {table} (flag, done_at) VALUES (:flag, :now) ON CONFLICT (flag) DO NOTHING",
         {"flag": CATCHUP_FLAG, "now": time.time()},
     )
+
+
+def _ensure_state_table(db) -> None:
+    db.create(STATE_TABLE, "key TEXT PRIMARY KEY, value TEXT NOT NULL")
+
+
+def _get_state(db, key: str) -> str | None:
+    rows = db.execute(STATE_TABLE, "SELECT value FROM {table} WHERE key = :key", {"key": key})
+    return rows[0][0] if rows else None
+
+
+def _set_state(db, key: str, value: str) -> None:
+    db.execute(
+        STATE_TABLE,
+        "INSERT INTO {table} (key, value) VALUES (:key, :value) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        {"key": key, "value": value},
+    )
+
+
+#: Neo4j's `toString(datetime())` can carry up to nanosecond-precision
+#: fractional seconds — more digits than `datetime.fromisoformat` accepts
+#: (max 6, microseconds). Matches only when there ARE excess digits, so a
+#: normal 0-6-digit fraction (e.g. Python's own `isoformat()` output, used
+#: by this module's tests) passes through unchanged.
+_EXCESS_FRACTION_RE = re.compile(r"\.(\d{6})\d+")
+
+
+def _parse_iso_timestamp(value: str) -> float:
+    """§3.3 step 3's conflict rule compares this against a local file's
+    mtime, so both sides need to land on the same epoch-seconds scale.
+    Handles the trailing ``Z`` `toString(datetime())` emits (Python's
+    `fromisoformat` only accepts an explicit offset) and truncates any
+    fractional-second digits past microsecond precision — §3.3's ±5s skew
+    epsilon dwarfs any rounding error that truncation could introduce."""
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    text = _EXCESS_FRACTION_RE.sub(r".\1", text)
+    return datetime.fromisoformat(text).timestamp()
+
+
+async def _run_pull_pass(
+    db, journal: dict, found: dict[str, str], workspace_slug: str, root: Path,
+) -> dict:
+    """§3.3 steps 2-3 — the downsync. Pages `GET /api/documents/changes`
+    from this connector's own persisted cursor (`STATE_TABLE`); for every
+    change with a `source_path`:
+
+    - §17.6 point 5 — a stale journal mark is cleared the moment the feed
+      shows the document is no longer `pending_delete` (a human declined
+      it), regardless of subtree, so a later genuine miss can mark it
+      again instead of being silently swallowed by a mark from a previous
+      lifetime.
+    - outside `authored/`: only `remote_rev` advances — never written to
+      disk (§4's mirror-image rule; drift stays visible in `report()`
+      without making the server a writer to the tree).
+    - under `authored/` with `rev` past the journal's `remote_rev`: §3.3
+      step 3's conflict rule runs (local hash vs. the journal's
+      `last_synced_hash` base) — no local edit, or the remote side wins a
+      real conflict, writes the JOURNAL ROW FIRST and only then the file
+      (the echo-loop breaker: the next scan sees hash == `last_synced_hash`
+      and no-ops); the filesystem winning a conflict touches neither,
+      leaving `last_synced_hash` stale on purpose so the next scan's own
+      upload PUTs with that stale `base_hash` and the server records the
+      remote's content as `conflict_overwrote` — the existing upload path
+      is what records the loser, not new code here.
+
+    `found` is mutated in place for a path the pull pass just wrote, so
+    the scan/upload loop and `_mark_missing_as_deleted` later in this same
+    tick see it as present with a matching hash rather than reacting to a
+    `found` snapshot taken before the pull pass ran.
+    """
+    await run_in_threadpool(_ensure_state_table, db)
+    cursor = await run_in_threadpool(_get_state, db, DOWNSYNC_CURSOR_KEY)
+    pulled = authored_written = remote_rev_only = restored = conflicts_local_won = 0
+
+    while True:
+        data, err = await client.get_document_changes(since=cursor, limit=CHANGES_PAGE_LIMIT)
+        if err:
+            log.warning("fs_sync: pull pass GET /changes failed: %s", err)
+            break
+        changes = (data or {}).get("changes") or []
+        new_cursor = (data or {}).get("cursor")
+        if not changes:
+            break
+
+        for change in changes:
+            relpath = change.get("source_path")
+            if not relpath:
+                continue  # pathless ad-hoc document — outside sync's contract (§4)
+            pulled += 1
+            row = journal.get(relpath)
+
+            if row and row["pending_delete"] and change.get("sync_status") != "pending_delete":
+                await run_in_threadpool(
+                    db.execute, TABLE,
+                    "UPDATE {table} SET pending_delete = 0, missing_scans = 0 WHERE relpath = :relpath",
+                    {"relpath": relpath},
+                )
+                row["pending_delete"] = 0
+                row["missing_scans"] = 0
+                restored += 1
+
+            rev = change.get("rev")
+            if rev is None:
+                continue
+            remote_rev_known = (row or {}).get("remote_rev") or 0
+            if rev <= remote_rev_known:
+                continue
+
+            if not relpath.startswith(AUTHORED_PREFIX):
+                now = time.time()
+                await run_in_threadpool(
+                    db.execute, TABLE,
+                    "INSERT INTO {table} (relpath, sha256, bucket, status, scanned_at, updated_at, "
+                    "missing_scans, pending_delete, remote_rev) "
+                    "VALUES (:relpath, '', :bucket, :status, :now, :now, 0, 0, :rev) "
+                    "ON CONFLICT (relpath) DO UPDATE SET remote_rev = excluded.remote_rev",
+                    {
+                        "relpath": relpath, "bucket": bulk_ingest.BUCKET,
+                        "status": bulk_ingest.STATUS_PENDING, "now": now, "rev": rev,
+                    },
+                )
+                if row is not None:
+                    row["remote_rev"] = rev
+                else:
+                    journal[relpath] = {
+                        "sha256": "", "last_synced_hash": None, "scanned_at": now,
+                        "missing_scans": 0, "pending_delete": 0, "external_id": None,
+                        "origin": None, "remote_rev": rev,
+                    }
+                remote_rev_only += 1
+                continue
+
+            # authored/ — §3.3 step 3's conflict rule.
+            base_hash = (row or {}).get("last_synced_hash")
+            full_path = root / relpath
+            local_hash = None
+            if full_path.is_file():
+                try:
+                    local_hash = hashlib.sha256(full_path.read_bytes()).hexdigest()
+                except OSError:
+                    local_hash = None
+            local_changed = local_hash is not None and local_hash != base_hash
+
+            filesystem_wins = False
+            if local_changed:
+                try:
+                    local_mtime = full_path.stat().st_mtime
+                except OSError:
+                    local_mtime = 0.0
+                remote_mtime = _parse_iso_timestamp(change["updated_at"])
+                # Decision 4 + §3.3 step 3's tie rule: a tie within the
+                # skew epsilon goes to the filesystem, the corpus's
+                # primary home — hence >= rather than a strict >.
+                filesystem_wins = local_mtime >= remote_mtime - CONFLICT_SKEW_SECONDS
+
+            if filesystem_wins:
+                await run_in_threadpool(
+                    db.execute, TABLE,
+                    "UPDATE {table} SET remote_rev = :rev WHERE relpath = :relpath",
+                    {"rev": rev, "relpath": relpath},
+                )
+                if row is not None:
+                    row["remote_rev"] = rev
+                conflicts_local_won += 1
+                continue
+
+            content, content_err = await client.get_document_content(change["external_id"])
+            if content_err or content is None:
+                log.warning(
+                    "fs_sync: pull pass could not fetch content for %s: %s", relpath, content_err,
+                )
+                continue
+            new_hash = hashlib.sha256(content).hexdigest()
+            now = time.time()
+            if row is None:
+                await run_in_threadpool(
+                    db.execute, TABLE,
+                    "INSERT INTO {table} (relpath, sha256, bucket, status, origin, external_id, "
+                    "last_synced_hash, remote_rev, scanned_at, updated_at, missing_scans, pending_delete) "
+                    "VALUES (:relpath, :sha256, :bucket, :status, :origin, :external_id, :hash, :rev, "
+                    ":now, :now, 0, 0) "
+                    "ON CONFLICT (relpath) DO UPDATE SET sha256 = excluded.sha256, "
+                    "origin = excluded.origin, external_id = excluded.external_id, "
+                    "last_synced_hash = excluded.last_synced_hash, remote_rev = excluded.remote_rev, "
+                    "scanned_at = excluded.scanned_at, updated_at = excluded.updated_at",
+                    {
+                        "relpath": relpath, "sha256": new_hash, "bucket": bulk_ingest.BUCKET,
+                        "status": bulk_ingest.STATUS_UPLOADED, "origin": ORIGIN_DOWNSYNC,
+                        "external_id": change.get("external_id"), "hash": new_hash, "rev": rev, "now": now,
+                    },
+                )
+            else:
+                await run_in_threadpool(
+                    db.execute, TABLE,
+                    "UPDATE {table} SET sha256 = :sha256, last_synced_hash = :hash, remote_rev = :rev, "
+                    "origin = :origin, status = :status, external_id = :external_id, "
+                    "scanned_at = :now, updated_at = :now WHERE relpath = :relpath",
+                    {
+                        "sha256": new_hash, "hash": new_hash, "rev": rev, "origin": ORIGIN_DOWNSYNC,
+                        "status": bulk_ingest.STATUS_UPLOADED, "external_id": change.get("external_id"),
+                        "now": now, "relpath": relpath,
+                    },
+                )
+            # Journal row committed above, THEN the file — the echo-loop
+            # breaker: a scan that saw the bytes before `last_synced_hash`
+            # reflected them would PUT them straight back up and loop
+            # forever.
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            await run_in_threadpool(full_path.write_bytes, content)
+
+            if row is not None:
+                row["sha256"] = new_hash
+                row["last_synced_hash"] = new_hash
+                row["remote_rev"] = rev
+                row["origin"] = ORIGIN_DOWNSYNC
+                row["external_id"] = change.get("external_id") or row["external_id"]
+            else:
+                journal[relpath] = {
+                    "sha256": new_hash, "last_synced_hash": new_hash, "scanned_at": now,
+                    "missing_scans": 0, "pending_delete": 0,
+                    "external_id": change.get("external_id"), "origin": ORIGIN_DOWNSYNC,
+                    "remote_rev": rev,
+                }
+            # The scan/upload loop and `_mark_missing_as_deleted` below
+            # read `found`, computed before this pass ran — without this,
+            # a freshly pulled file would look "new" (and the loop would
+            # restart its debounce window pointlessly) or "missing" (and
+            # advance `missing_scans` for a file that is, right now, on
+            # disk) for the rest of this tick.
+            found[relpath] = new_hash
+            authored_written += 1
+
+        if not new_cursor or new_cursor == cursor:
+            break
+        cursor = new_cursor
+        await run_in_threadpool(_set_state, db, DOWNSYNC_CURSOR_KEY, cursor)
+
+    return {
+        "pulled": pulled,
+        "authored_written": authored_written,
+        "remote_rev_only": remote_rev_only,
+        "restored": restored,
+        "conflicts_local_won": conflicts_local_won,
+    }
 
 
 async def _adopt_paths(db, known_relpaths: set[str], workspace_slug: str) -> int:
@@ -442,16 +723,23 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     rows = await run_in_threadpool(
         db.execute, TABLE,
         "SELECT relpath, sha256, last_synced_hash, scanned_at, missing_scans, "
-        "pending_delete, external_id, origin FROM {table}",
+        "pending_delete, external_id, origin, remote_rev FROM {table}",
     )
     journal = {
         r[0]: {
             "sha256": r[1], "last_synced_hash": r[2], "scanned_at": r[3],
             "missing_scans": r[4] or 0, "pending_delete": r[5] or 0, "external_id": r[6],
-            "origin": r[7],
+            "origin": r[7], "remote_rev": r[8] or 0,
         }
         for r in rows
     }
+
+    # §3.3 steps 2-3 — the pull pass, after the journal load above (it
+    # needs each row's `last_synced_hash`/`remote_rev` to decide per
+    # change) and before the catch-up/upload/missing passes below (it
+    # mutates `found` in place for anything it just wrote, so the rest of
+    # this tick sees accurate state rather than a pre-pull snapshot).
+    pull_result = await _run_pull_pass(db, journal, found, workspace_slug, root)
 
     # §17.4/§17.5 — the one-time catch-up and the live-miss marking pass
     # below share one `_MarkBudget`, drawing on the SAME threshold guard 2
@@ -579,6 +867,11 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         "bucket": bulk_ingest.BUCKET,
         "adopted": adopted_count,
         "catchup_marked": catchup_marked,
+        "pulled": pull_result["pulled"],
+        "authored_written": pull_result["authored_written"],
+        "remote_rev_only": pull_result["remote_rev_only"],
+        "restored": pull_result["restored"],
+        "conflicts_local_won": pull_result["conflicts_local_won"],
     }
     if upload_budget == 0 and backlog >= bulk_ingest.MAX_PENDING_BACKLOG:
         result["skipped_reason"] = f"processing backlog {backlog} >= {bulk_ingest.MAX_PENDING_BACKLOG}"

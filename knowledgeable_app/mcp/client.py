@@ -230,28 +230,20 @@ async def put_document_by_path(
     return resp.json(), None
 
 
-async def mark_delete(external_id: str, *, reason: str | None = None) -> tuple[dict | None, str | None]:
-    """POST /api/documents/{id}/mark-delete (§7) — marks pending-delete,
-    never removes. This connector never sends ``force``: that is decision
-    5's agent path, a separate, explicit MCP-tool argument reserved for a
-    human-directed reorganization, not this driver's default behaviour."""
-    body: dict = {"reason": reason} if reason else {}
-    return await _post_json(f"/api/documents/{external_id}/mark-delete", body)
-
-
 async def mark_delete_by_path(
     source_path: str, workspace_slug: str, *, reason: str | None = None
 ) -> tuple[dict | None, str | None]:
     """POST /api/documents/mark-delete-by-path (docs/design/aw-knowledgeable-
     fs-sync.md §17.2) — marks EVERY document claiming
     ``{tenant, bucket, source_path}`` with ``workspace_slug = $slug OR
-    workspace_slug IS NULL``, replacing the old by-id ``mark_delete`` above
-    as fs-sync's delete-marking seam: a journal row's `external_id` can only
-    ever name one of several documents sharing a path (§17.1's 35
-    structurally-unreachable `cli_reference/` documents), so this engine
-    stops dereferencing it for deletes entirely. Service-only, two-phase,
-    no `force` variant — same reasoning as `mark_delete`. Response is
-    ``{source_path, marked: [ids], count}``."""
+    workspace_slug IS NULL``. Replaces the old by-id ``mark_delete`` (card
+    C removed it — dead since G2 switched fs-sync's delete-marking seam to
+    this one, no other caller ever existed) as fs-sync's delete-marking
+    seam: a journal row's `external_id` can only ever name one of several
+    documents sharing a path (§17.1's 35 structurally-unreachable
+    `cli_reference/` documents), so this engine stops dereferencing it for
+    deletes entirely. Service-only, two-phase, no `force` variant.
+    Response is ``{source_path, marked: [ids], count}``."""
     body: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
     if reason:
         body["reason"] = reason
@@ -271,6 +263,38 @@ async def get_sync_paths(
     if after:
         params["after"] = after
     return await _get("/api/documents/sync-paths", params)
+
+
+async def get_document_changes(
+    *, since: str | None = None, limit: int = 200
+) -> tuple[dict | None, str | None]:
+    """GET /api/documents/changes (docs/design/aw-knowledgeable-fs-sync.md
+    §3.3 step 2) — the downsync's poll feed. `since` is the opaque cursor a
+    prior call's `cursor` field returned; omitted on the very first poll.
+    Response is ``{changes: [{id, source_path, rev, content_hash,
+    sync_status, updated_at}], cursor}``."""
+    params: dict = {"limit": limit}
+    if since:
+        params["since"] = since
+    return await _get("/api/documents/changes", params)
+
+
+async def get_document_content(external_id: str) -> tuple[bytes | None, str | None]:
+    """GET /api/documents/{id}/content — the downsync's byte-fetch. The
+    `changes` feed above carries only metadata (no file bytes), so writing
+    a pulled `authored/` file needs this second call. Returns raw bytes,
+    not JSON, hence its own small request rather than going through
+    ``_get``."""
+    async with httpx.AsyncClient(timeout=45) as http_client:
+        try:
+            resp = await http_client.get(
+                f"{base_url()}/api/documents/{external_id}/content", headers=_headers()
+            )
+        except httpx.HTTPError as exc:
+            return None, f"could not reach aw-knowledgeable at {base_url()}: {exc}"
+    if resp.status_code >= 400:
+        return None, _describe_error(resp)
+    return resp.content, None
 
 
 async def push_playground_key(value: str) -> tuple[bool, str | None]:
