@@ -279,6 +279,18 @@ async def get_document_changes(
     return await _get("/api/documents/changes", params)
 
 
+async def get_documents_pending_delete() -> tuple[dict | None, str | None]:
+    """GET /api/documents?pending_delete=1 (docs/design/aw-knowledgeable-
+    fs-sync.md §18.4) — the server's currently-marked set, fetched once by
+    the one-time `restore_reconcile_catchup_v1` pass to tell "restored
+    through a channel the feed poll never saw" apart from "genuinely still
+    awaiting approval". No bucket/workspace scoping — the server's own
+    `resolve_search_scope` spans every bucket this service token can read,
+    matching the documents.py route's own contract. Response is
+    ``{documents: [{source_path, ...}]}``."""
+    return await _get("/api/documents", {"pending_delete": True})
+
+
 async def get_document_content(external_id: str) -> tuple[bytes | None, str | None]:
     """GET /api/documents/{id}/content — the downsync's byte-fetch. The
     `changes` feed above carries only metadata (no file bytes), so writing

@@ -190,6 +190,13 @@ _SYNC_COLUMNS: tuple[tuple[str, str], ...] = (
     ("missing_scans", "INTEGER NOT NULL DEFAULT 0"),
     ("pending_delete", "INTEGER NOT NULL DEFAULT 0"),
     ("origin", "TEXT"),
+    # docs/design/aw-knowledgeable-fs-sync.md §18.2 — a restore (feed or
+    # catch-up) sets this alongside clearing `pending_delete`/`missing_scans`,
+    # and holds it until the scan sees the file present again. Without it a
+    # bare reset re-enters a still-missing file into delete detection and
+    # re-marks it two ticks later — the decline/re-mark nag loop §18.2 exists
+    # to close.
+    ("restore_suppressed", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 #: Mirrors aw-knowledgeable's own cap (`backend/app/api/documents.py`'s

@@ -142,7 +142,8 @@ def _journal_rows(db: _FakeDb) -> list[dict]:
 
 def _seed_uploaded(db: _FakeDb, relpath: str, *, sha256: str = "abc", external_id: str = "doc-1",
                    last_synced_hash: str | None = None, missing_scans: int = 0,
-                   pending_delete: int = 0, scanned_at: float | None = None) -> None:
+                   pending_delete: int = 0, restore_suppressed: int = 0,
+                   scanned_at: float | None = None) -> None:
     """Seed one already-synced journal row directly — the no-wipe
     bootstrap's shape (§8's 2,046 rows): `status=uploaded`, a real
     `external_id`, and (after the §3.2 backfill) `last_synced_hash`."""
@@ -151,12 +152,14 @@ def _seed_uploaded(db: _FakeDb, relpath: str, *, sha256: str = "abc", external_i
     db.execute(
         fs_sync.TABLE,
         "INSERT INTO {table} (relpath, sha256, bucket, status, external_id, scanned_at, updated_at, "
-        "missing_scans, pending_delete, last_synced_hash) "
-        "VALUES (:relpath, :sha256, :bucket, :status, :external_id, :now, :now, :missing, :pending, :last_synced)",
+        "missing_scans, pending_delete, last_synced_hash, restore_suppressed) "
+        "VALUES (:relpath, :sha256, :bucket, :status, :external_id, :now, :now, :missing, :pending, "
+        ":last_synced, :suppressed)",
         {
             "relpath": relpath, "sha256": sha256, "bucket": "main", "status": bulk_ingest.STATUS_UPLOADED,
             "external_id": external_id, "now": now, "missing": missing_scans, "pending": pending_delete,
             "last_synced": last_synced_hash if last_synced_hash is not None else sha256,
+            "suppressed": restore_suppressed,
         },
     )
 
@@ -297,7 +300,7 @@ def test_run_tick_refuses_with_empty_workspace_slug(_workspace_home, db, lease):
 # ---------------------------------------------------------------------------
 
 
-def test_journal_gains_the_five_sync_columns_and_backfills_last_synced_hash(_workspace_home, db):
+def test_journal_gains_the_six_sync_columns_and_backfills_last_synced_hash(_workspace_home, db):
     bulk_ingest._ensure_table(db)
     db.execute(
         bulk_ingest.TABLE,
@@ -318,6 +321,7 @@ def test_journal_gains_the_five_sync_columns_and_backfills_last_synced_hash(_wor
     assert row["last_synced_hash"] == "hash-a"
     assert row["missing_scans"] == 0
     assert row["pending_delete"] == 0
+    assert row["restore_suppressed"] == 0
 
 
 def test_backfill_never_overwrites_an_already_synced_hash(_workspace_home, db):
@@ -1434,6 +1438,7 @@ def test_decline_restore_arriving_on_the_feed_clears_the_stale_journal_mark(
     assert mark_calls == []  # not re-marked this tick
     row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
     assert row["pending_delete"] == 0
+    assert row["restore_suppressed"] == 1  # §18.2 — held until the file reappears
 
 
 def test_pull_pass_persists_its_cursor_across_ticks(_workspace_home, db, lease, monkeypatch):
@@ -1477,3 +1482,383 @@ def test_pull_pass_persists_its_cursor_across_ticks(_workspace_home, db, lease, 
     assert since_values[0] is None
     assert len(since_values) >= 2
     assert all(v == "cursor-after-tick-1" for v in since_values[1:])
+
+
+# ---------------------------------------------------------------------------
+# §18 (card H2) — restore suppression, GC of journal-rows-whose-claimant-
+# is-gone, the §7 valve numerator narrowing, and the one-time
+# restore_reconcile_catchup_v1. docs/design/aw-knowledgeable-fs-sync.md
+# §18.7's acceptance gates, one test (or group) per bullet.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_suppression_holds_across_further_ticks_while_the_file_stays_missing(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§18.2's whole point: a restore must not be a one-tick reprieve. The
+    file is STILL missing — two more ticks pass, each would reach the
+    old ≥2-scans threshold under reset-only behaviour, and neither
+    re-marks."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/declined.md", external_id="doc-7", missing_scans=2, pending_delete=1)
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-7", "source_path": "notion/declined.md",
+                "rev": 1, "content_hash": "h", "sync_status": None,  # restored
+                "updated_at": _iso(time.time()),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    mark_calls = []
+
+    async def fake_mark(source_path, workspace_slug, reason=None):
+        mark_calls.append(source_path)
+        return {"source_path": source_path, "marked": [], "count": 0}, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+
+    result1 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result1["restored"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["restore_suppressed"] == 1
+    assert row["pending_delete"] == 0
+    assert row["missing_scans"] == 1  # this tick's own miss, post-restore
+
+    # Two further ticks — the feed has nothing new now; the file is STILL
+    # missing from disk both times.
+    monkeypatch.setattr(
+        client, "get_document_changes",
+        lambda since=None, limit=200: _async({"changes": [], "cursor": since}, None),
+    )
+
+    _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert mark_calls == []  # never re-marked despite missing_scans climbing past 2
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["pending_delete"] == 0
+    assert row["restore_suppressed"] == 1
+    assert row["missing_scans"] >= 2  # would have tripped the old threshold
+
+
+def test_restore_suppression_clears_on_reappearance_then_re_marks_after_normal_two_scans(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§17.6-5 closed, loop-free: once the file genuinely comes back, the
+    flag clears unconditionally and a LATER disappearance is marked again
+    through the normal ≥2-scans clock — suppression is not a permanent
+    exemption."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/declined.md", external_id="doc-7", missing_scans=3,
+                   pending_delete=0, restore_suppressed=1)
+
+    mark_calls = []
+
+    async def fake_mark(source_path, workspace_slug, reason=None):
+        mark_calls.append(source_path)
+        return {"source_path": source_path, "marked": ["doc-7"], "count": 1}, None
+
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+
+    # Tick 1 — the file reappears.
+    _write(root, "notion/declined.md", "back again")
+    result1 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result1["blocked"] is False
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["restore_suppressed"] == 0
+    assert row["missing_scans"] == 0
+    assert mark_calls == []
+
+    # Tick 2 — the file disappears again; first miss, not yet marked.
+    (root / "notion/declined.md").unlink()
+    result2 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result2["blocked"] is False
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["missing_scans"] == 1
+    assert mark_calls == []
+
+    # Tick 3 — second consecutive miss: marked, exactly like any other path.
+    result3 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result3["blocked"] is False
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["missing_scans"] == 2
+    assert row["pending_delete"] == 1
+    assert mark_calls == ["notion/declined.md"]
+
+
+def test_gc_removes_a_dead_pending_delete_row_absent_from_a_full_sync_paths_enumeration(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§18.3 — an approval is structurally invisible to the feed even after
+    H1 (the node is gone, no tombstone). Absence from a full, successful
+    sync-paths enumeration is the server-truth signal that the last
+    claimant at that path is gone; the dead journal row gets GC'd."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/gone.md", external_id="doc-1", pending_delete=1)
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return {"paths": [{"source_path": "notion/keep.md", "claimant_count": 1}], "cursor": None}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["gc_removed"] == 1
+    relpaths = {r["relpath"] for r in _journal_rows(db)}
+    assert "notion/gone.md" not in relpaths
+    assert "notion/keep.md" in relpaths
+
+
+def test_gc_leaves_a_dead_row_untouched_when_the_enumeration_errors(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The zero-trust guard, exercised: an errored enumeration must not be
+    read as "nobody claims this path any more" — GC must touch nothing
+    rather than risk treating a transient failure as mass approval."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/gone.md", external_id="doc-1", pending_delete=1)
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return None, "HTTP 500"
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["gc_removed"] == 0
+    relpaths = {r["relpath"] for r in _journal_rows(db)}
+    assert "notion/gone.md" in relpaths
+
+
+def test_gc_leaves_a_dead_row_untouched_when_the_enumeration_is_empty(
+    _workspace_home, db, lease
+):
+    """Distinct from the errored case: a SUCCESSFUL but empty enumeration
+    is still unusable for GC — on a real corpus, "nobody claims anything"
+    is itself a suspect signal, not evidence every pending-delete row was
+    just approved. The autouse `_no_adoptable_paths` fixture already
+    returns an empty, error-free page."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/gone.md", external_id="doc-1", pending_delete=1)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["gc_removed"] == 0
+    relpaths = {r["relpath"] for r in _journal_rows(db)}
+    assert "notion/gone.md" in relpaths
+
+
+def test_gc_never_touches_a_live_row_with_an_absent_claimant(
+    _workspace_home, db, lease, monkeypatch
+):
+    """A live (`pending_delete=0`) row whose claimant vanished from
+    sync-paths is the §17 journal-blind family, not deletion evidence —
+    GC must never touch it; it stays for the ordinary missing-scans clock
+    to pick up."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/orphan.md", external_id="doc-2")  # pending_delete=0, not on disk
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return {"paths": [{"source_path": "notion/keep.md", "claimant_count": 1}], "cursor": None}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["gc_removed"] == 0
+    relpaths = {r["relpath"] for r in _journal_rows(db)}
+    assert "notion/orphan.md" in relpaths
+
+
+def test_valve_denominator_must_not_narrow_with_the_numerator(_workspace_home, db, lease):
+    """§18.5 point 5's rejected alternative, proven the other direction:
+    narrowing the DENOMINATOR alongside the numerator would make the valve
+    MORE trigger-happy as dead/suppressed rows accumulate — punishing
+    exactly the corpus state the operator just blessed. 300 tracked rows
+    (125 dead `pending_delete=1`, 7 `restore_suppressed=1`, 168 mark-
+    eligible of which 28 are missing this tick): the correct, UNCHANGED
+    denominator gives threshold max(25, 30%)=30 and 28 < 30 stays clear; a
+    denominator narrowed to the 168 eligible rows gives max(25, 16.8%)=25
+    and 28 > 25 would wrongly trip. Fails under a narrowed denominator,
+    passes only when the denominator stays the full tracked set."""
+    root = bulk_ingest.kb_root()
+    for i in range(125):
+        _seed_uploaded(db, f"notion/dead-{i}.md", sha256=f"d{i}", external_id=f"doc-dead-{i}", pending_delete=1)
+    for i in range(7):
+        _seed_uploaded(db, f"notion/suppressed-{i}.md", sha256=f"s{i}", external_id=f"doc-sup-{i}",
+                       restore_suppressed=1)
+    for i in range(140):
+        _seed_uploaded(db, f"notion/present-{i}.md", sha256=f"p{i}", external_id=f"doc-present-{i}",
+                       scanned_at=time.time() - 100)
+        _write(root, f"notion/present-{i}.md", f"body {i}")
+    for i in range(28):
+        _seed_uploaded(db, f"notion/missing-{i}.md", sha256=f"m{i}", external_id=f"doc-missing-{i}")
+
+    assert fs_sync._tracked_row_count(db) == 300  # the denominator must see ALL 300
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert not result.get("valve_tripped")
+
+
+def test_valve_headroom_restored_on_a_simulated_stuck_corpus(_workspace_home, db, lease):
+    """QA's own measured regression (pre-H2): 132 of 206 tracked rows
+    permanently consumed guard 2's numerator — 107 dead (§18.3 GC's job),
+    18 declined-but-suppressed, 7 legitimately `pending_delete`. Simulates
+    that exact split plus 74 live rows and confirms the valve clears on a
+    perfectly quiet tree: the near-zero headroom §18.3 promises, not the
+    132-of-206 permanently consumed before it."""
+    root = bulk_ingest.kb_root()
+    for i in range(107):
+        _seed_uploaded(db, f"notion/dead-{i}.md", sha256=f"d{i}", external_id=f"doc-dead-{i}", pending_delete=1)
+    for i in range(18):
+        _seed_uploaded(db, f"notion/declined-{i}.md", sha256=f"c{i}", external_id=f"doc-decl-{i}",
+                       restore_suppressed=1)
+    for i in range(7):
+        _seed_uploaded(db, f"notion/pending-{i}.md", sha256=f"e{i}", external_id=f"doc-pend-{i}", pending_delete=1)
+    for i in range(74):
+        _seed_uploaded(db, f"notion/live-{i}.md", sha256=f"l{i}", external_id=f"doc-live-{i}",
+                       scanned_at=time.time() - 100)
+        _write(root, f"notion/live-{i}.md", f"body {i}")
+
+    assert fs_sync._tracked_row_count(db) == 206
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert not result.get("valve_tripped")
+
+
+def test_restore_reconcile_catchup_three_way_split(_workspace_home, db, lease, monkeypatch):
+    """§18.4's three populations in one tick: a dead row (no claimant at
+    all) is §18.3's GC job and never reaches this pass; a live claimant NOT
+    in the server's currently-marked set was restored through a channel
+    the feed's cursor can never replay — reconciled via §18.2's
+    clear+suppress; a live claimant IN the marked set is genuinely still
+    awaiting approval and is left alone."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/restored.md", external_id="doc-r", pending_delete=1)
+    _seed_uploaded(db, "notion/still-pending.md", external_id="doc-p", pending_delete=1)
+    _seed_uploaded(db, "notion/dead.md", external_id="doc-d", pending_delete=1)
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return {
+            "paths": [
+                {"source_path": "notion/keep.md", "claimant_count": 1},
+                {"source_path": "notion/restored.md", "claimant_count": 1},
+                {"source_path": "notion/still-pending.md", "claimant_count": 1},
+            ],
+            "cursor": None,
+        }, None
+
+    async def fake_pending_delete():
+        return {"documents": [{"source_path": "notion/still-pending.md"}]}, None
+
+    async def fake_mark(source_path, workspace_slug, reason=None):
+        return {"source_path": source_path, "marked": [], "count": 0}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending_delete)
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["gc_removed"] == 1
+    assert result["restore_reconciled"] == 1
+    rows = {r["relpath"]: r for r in _journal_rows(db)}
+    assert "notion/dead.md" not in rows
+    assert rows["notion/restored.md"]["pending_delete"] == 0
+    assert rows["notion/restored.md"]["restore_suppressed"] == 1
+    assert rows["notion/still-pending.md"]["pending_delete"] == 1
+
+
+def test_restore_reconcile_catchup_runs_once_then_stays_off(
+    _workspace_home, db, lease, monkeypatch
+):
+    """Flag-gated, same shape as §17.4's `CATCHUP_FLAG`: a second tick must
+    not re-fetch the server's marked set at all once the one-time pass has
+    completed, idempotent across restarts (the gate is a `FLAGS_TABLE` row,
+    not in-memory state)."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/restored.md", external_id="doc-r", pending_delete=1)
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return {
+            "paths": [
+                {"source_path": "notion/keep.md", "claimant_count": 1},
+                {"source_path": "notion/restored.md", "claimant_count": 1},
+            ],
+            "cursor": None,
+        }, None
+
+    pending_delete_calls = []
+
+    async def fake_pending_delete():
+        pending_delete_calls.append(1)
+        return {"documents": []}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending_delete)
+
+    result1 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result1["restore_reconciled"] == 1
+    assert fs_sync._restore_reconcile_done(db) is True
+    assert len(pending_delete_calls) == 1
+
+    result2 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result2["restore_reconciled"] == 0
+    assert len(pending_delete_calls) == 1  # not called again — flag already set
+
+
+def test_restore_reconcile_catchup_retries_after_a_failed_documents_fetch(
+    _workspace_home, db, lease, monkeypatch
+):
+    """Crash-idempotent: the flag must be set ONLY when the pass completed
+    without errors. A failed `GET /documents?pending_delete=1` leaves the
+    row untouched and the flag unset, so the next tick retries clean."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/restored.md", external_id="doc-r", pending_delete=1)
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+        return {
+            "paths": [
+                {"source_path": "notion/keep.md", "claimant_count": 1},
+                {"source_path": "notion/restored.md", "claimant_count": 1},
+            ],
+            "cursor": None,
+        }, None
+
+    calls = {"n": 0}
+
+    async def flaky_pending_delete():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, "HTTP 500"
+        return {"documents": []}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+    monkeypatch.setattr(client, "get_documents_pending_delete", flaky_pending_delete)
+
+    result1 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result1["restore_reconciled"] == 0
+    assert fs_sync._restore_reconcile_done(db) is False
+    row1 = next(r for r in _journal_rows(db) if r["relpath"] == "notion/restored.md")
+    assert row1["pending_delete"] == 1  # untouched — the fetch failed
+
+    result2 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert result2["restore_reconciled"] == 1
+    assert fs_sync._restore_reconcile_done(db) is True

@@ -200,6 +200,26 @@ def _tracked_row_count(db) -> int:
     return rows[0][0] if rows else 0
 
 
+#: §18.3 — guard 2's NUMERATOR narrows to rows that could actually produce a
+#: NEW mark this tick: tracked (per `_TRACKED_ROWS_WHERE`) AND not already
+#: `pending_delete` AND not `restore_suppressed`. The denominator
+#: (`_tracked_row_count`, above) stays on `_TRACKED_ROWS_WHERE` alone —
+#: narrowing it too was rejected (§18.5 point 5): it would shrink the
+#: threshold exactly as the corpus accumulates the dead/suppressed rows the
+#: operator just blessed, making the valve MORE trigger-happy, not less.
+#:
+#: Parenthesized rather than a bare `f"{_TRACKED_ROWS_WHERE} AND ..."`: SQL
+#: binds AND tighter than OR, so an unparenthesized splice would silently
+#: become `external_id IS NOT NULL OR (origin = :adopted AND pending_delete
+#: = 0 AND restore_suppressed = 0)` — true for every synced row regardless
+#: of `pending_delete`/`restore_suppressed`, which is the exact bug a
+#: denominator-vs-numerator test below exists to catch.
+_MARK_ELIGIBLE_ROWS_WHERE = (
+    "WHERE (external_id IS NOT NULL OR origin = :adopted) "
+    "AND pending_delete = 0 AND restore_suppressed = 0"
+)
+
+
 def _check_mass_delete_valve(db, found: dict[str, str] | None) -> tuple[dict | None, int]:
     """§7 — the two stacked guards, checked BEFORE a single row's
     `missing_scans` advances, a single `mark-delete` call goes out, or
@@ -221,7 +241,10 @@ def _check_mass_delete_valve(db, found: dict[str, str] | None) -> tuple[dict | N
     — a transient near-total wipe (e.g. an `agent sync` pass caught
     mid-write) must not cascade into hundreds of delete marks. §17.5
     widens both sides of this count to `_TRACKED_ROWS_WHERE` so a mass
-    disappearance of adopted-only paths is not invisible to the valve."""
+    disappearance of adopted-only paths is not invisible to the valve.
+    §18.3 then narrows the NUMERATOR ONLY to `_MARK_ELIGIBLE_ROWS_WHERE` —
+    the denominator (`_tracked_row_count`, i.e. `_TRACKED_ROWS_WHERE`) is
+    untouched, see that query's own docstring for why."""
     if found is None:
         return {"reason": "kb_root() is missing or unreadable — aborting the tick, marking nothing"}, 0
     if not found:
@@ -229,7 +252,7 @@ def _check_mass_delete_valve(db, found: dict[str, str] | None) -> tuple[dict | N
 
     tracked_rows = _tracked_row_count(db)
     threshold = mass_delete_threshold(tracked_rows)
-    rows = db.execute(TABLE, f"SELECT relpath FROM {{table}} {_TRACKED_ROWS_WHERE}", {"adopted": ORIGIN_ADOPTED})
+    rows = db.execute(TABLE, f"SELECT relpath FROM {{table}} {_MARK_ELIGIBLE_ROWS_WHERE}", {"adopted": ORIGIN_ADOPTED})
     tracked_paths = {r[0] for r in rows}
     missing_now = tracked_paths - set(found.keys())
     if len(missing_now) > threshold:
@@ -345,6 +368,29 @@ def _parse_iso_timestamp(value: str) -> float:
     return datetime.fromisoformat(text).timestamp()
 
 
+async def _apply_restore(db, row: dict, relpath: str) -> None:
+    """§18.2 — the restore semantics: clear AND suppress. A bare reset
+    (`pending_delete = 0, missing_scans = 0` alone, card C's original
+    behaviour) re-enters a still-missing file into delete detection and
+    `_mark_missing_as_deleted` re-marks it two ticks later — the declined
+    file's absence from disk never changed, only the human's decision did.
+    `restore_suppressed = 1` holds that decision until the scan loop sees
+    the file present again (`_run_tick_locked`'s found-loop, below).
+
+    Shared by the live feed's restore detection (`_run_pull_pass`) and the
+    one-time `restore_reconcile_catchup_v1` (§18.4) — same journal
+    mutation, two different triggers for noticing it."""
+    await run_in_threadpool(
+        db.execute, TABLE,
+        "UPDATE {table} SET pending_delete = 0, missing_scans = 0, restore_suppressed = 1 "
+        "WHERE relpath = :relpath",
+        {"relpath": relpath},
+    )
+    row["pending_delete"] = 0
+    row["missing_scans"] = 0
+    row["restore_suppressed"] = 1
+
+
 async def _run_pull_pass(
     db, journal: dict, found: dict[str, str], workspace_slug: str, root: Path,
 ) -> dict:
@@ -352,11 +398,12 @@ async def _run_pull_pass(
     from this connector's own persisted cursor (`STATE_TABLE`); for every
     change with a `source_path`:
 
-    - §17.6 point 5 — a stale journal mark is cleared the moment the feed
-      shows the document is no longer `pending_delete` (a human declined
-      it), regardless of subtree, so a later genuine miss can mark it
-      again instead of being silently swallowed by a mark from a previous
-      lifetime.
+    - §17.6 point 5 / §18.2 — a stale journal mark is cleared the moment the
+      feed shows the document is no longer `pending_delete` (a human
+      declined it), regardless of subtree, via `_apply_restore` — which also
+      SUPPRESSES re-marking until the scan sees the file present again,
+      so a later genuine miss (the file is, separately, still gone) is not
+      instantly re-marked and does not manufacture a decline/re-mark loop.
     - outside `authored/`: only `remote_rev` advances — never written to
       disk (§4's mirror-image rule; drift stays visible in `report()`
       without making the server a writer to the tree).
@@ -398,13 +445,7 @@ async def _run_pull_pass(
             row = journal.get(relpath)
 
             if row and row["pending_delete"] and change.get("sync_status") != "pending_delete":
-                await run_in_threadpool(
-                    db.execute, TABLE,
-                    "UPDATE {table} SET pending_delete = 0, missing_scans = 0 WHERE relpath = :relpath",
-                    {"relpath": relpath},
-                )
-                row["pending_delete"] = 0
-                row["missing_scans"] = 0
+                await _apply_restore(db, row, relpath)
                 restored += 1
 
             rev = change.get("rev")
@@ -433,7 +474,7 @@ async def _run_pull_pass(
                     journal[relpath] = {
                         "sha256": "", "last_synced_hash": None, "scanned_at": now,
                         "missing_scans": 0, "pending_delete": 0, "external_id": None,
-                        "origin": None, "remote_rev": rev,
+                        "origin": None, "remote_rev": rev, "restore_suppressed": 0,
                     }
                 remote_rev_only += 1
                 continue
@@ -527,7 +568,7 @@ async def _run_pull_pass(
                     "sha256": new_hash, "last_synced_hash": new_hash, "scanned_at": now,
                     "missing_scans": 0, "pending_delete": 0,
                     "external_id": change.get("external_id"), "origin": ORIGIN_DOWNSYNC,
-                    "remote_rev": rev,
+                    "remote_rev": rev, "restore_suppressed": 0,
                 }
             # The scan/upload loop and `_mark_missing_as_deleted` below
             # read `found`, computed before this pass ran — without this,
@@ -552,7 +593,9 @@ async def _run_pull_pass(
     }
 
 
-async def _adopt_paths(db, known_relpaths: set[str], workspace_slug: str) -> int:
+async def _adopt_paths(
+    db, known_relpaths: set[str], workspace_slug: str,
+) -> tuple[int, set[str] | None]:
     """§17.2 point 2 — insert a journal row (`origin='adopted'`,
     `external_id` NULL) for every server-claimed path `GET /sync-paths`
     returns that `known_relpaths` (the journal as of the start of this
@@ -560,21 +603,36 @@ async def _adopt_paths(db, known_relpaths: set[str], workspace_slug: str) -> int
     NEVER marks — it only starts observation; the existing ≥2-consecutive-
     scans clock and the §7 valve then cover the new row exactly like any
     other. Mutates `known_relpaths` in place so a second page of the same
-    tick, or a path repeated across pages, is never double-inserted."""
+    tick, or a path repeated across pages, is never double-inserted.
+
+    Returns ``(adopted_count, paths_seen)``. ``paths_seen`` is EVERY
+    `source_path` the enumeration returned across all pages — including
+    the §17.3-excluded ones, since §18.3's GC and §18.4's catch-up both
+    need the server's full claim set, not just what this pass chose to
+    adopt. It is ``None`` when any page errored: the zero-trust guard §18.3
+    needs to tell a complete, successful listing from a partial one, and a
+    partial `seen` set would make GC wrongly treat an unreached page's rows
+    as having no claimant at all. A full pass that genuinely saw zero paths
+    returns an empty (not ``None``) set — still unusable for GC's own
+    nonzero-set guard, but for a different, non-error reason."""
     adopted = 0
+    seen: set[str] = set()
     after: str | None = None
     while True:
         data, err = await client.get_sync_paths(workspace_slug, after=after, limit=SYNC_PATHS_PAGE_LIMIT)
         if err:
             log.warning("fs_sync: adoption GET /sync-paths failed: %s", err)
-            return adopted
+            return adopted, None
         paths = (data or {}).get("paths") or []
         if not paths:
-            return adopted
+            return adopted, seen
         now = time.time()
         for entry in paths:
             relpath = (entry or {}).get("source_path")
-            if not relpath or relpath in known_relpaths or not _should_adopt(relpath):
+            if not relpath:
+                continue
+            seen.add(relpath)
+            if relpath in known_relpaths or not _should_adopt(relpath):
                 continue
             await run_in_threadpool(
                 db.execute, TABLE,
@@ -592,8 +650,111 @@ async def _adopt_paths(db, known_relpaths: set[str], workspace_slug: str) -> int
             adopted += 1
         cursor = (data or {}).get("cursor")
         if not cursor or cursor == after:
-            return adopted
+            return adopted, seen
         after = cursor
+
+
+async def _gc_dead_pending_delete_rows(db, journal: dict, sync_paths_seen: set[str] | None) -> int:
+    """§18.3 — an approval is structurally invisible to the feed even after
+    H1 (the node is deleted, no tombstone — §11-8's rejection): the
+    `pending_delete=1` journal row left behind needs a different signal.
+    `sync_paths_seen` (from this tick's `_adopt_paths`, which already pages
+    the full enumeration for free) deliberately includes already-marked
+    claimants (G1's own gate), so a `pending_delete=1` row absent from it
+    means the last claimant at that path is genuinely gone — approved and
+    deleted, not merely declined (a decline keeps the node, so its path
+    stays claimed).
+
+    Zero-trust, same basis as §7 guard 1: ``sync_paths_seen`` is ``None``
+    (an enumeration page errored) or empty (nothing claimed anything, which
+    on a real corpus means the listing itself is suspect, not that
+    everything was approved) — GC touches NOTHING. Only `pending_delete=1`
+    rows are even considered; a live row whose claimant vanished is the
+    §17 journal-blind family, not deletion evidence, and must survive to
+    be adopted/marked normally instead."""
+    if not sync_paths_seen:
+        return 0
+    removed = 0
+    for relpath, row in list(journal.items()):
+        if not row["pending_delete"]:
+            continue
+        if relpath in sync_paths_seen:
+            continue
+        await run_in_threadpool(db.execute, TABLE, "DELETE FROM {table} WHERE relpath = :relpath", {"relpath": relpath})
+        del journal[relpath]
+        removed += 1
+    return removed
+
+
+#: §18.4 — the one-time catch-up for the already-stuck rows the feed can
+#: never retroactively surface (the cursor is already past their stale
+#: `updated_at`). Same shape/table as `CATCHUP_FLAG` above, a distinct flag
+#: because it is a distinct one-time migration.
+RESTORE_RECONCILE_FLAG = "restore_reconcile_catchup_v1"
+
+
+def _restore_reconcile_done(db) -> bool:
+    return bool(db.execute(FLAGS_TABLE, "SELECT 1 FROM {table} WHERE flag = :flag", {"flag": RESTORE_RECONCILE_FLAG}))
+
+
+def _mark_restore_reconcile_done(db) -> None:
+    db.execute(
+        FLAGS_TABLE,
+        "INSERT INTO {table} (flag, done_at) VALUES (:flag, :now) ON CONFLICT (flag) DO NOTHING",
+        {"flag": RESTORE_RECONCILE_FLAG, "now": time.time()},
+    )
+
+
+async def _run_restore_reconcile_catchup(
+    db, journal: dict, sync_paths_seen: set[str] | None,
+) -> int:
+    """§18.4 — the 18 already-stuck rows §18.1/§18.2 cannot retroactively
+    fix: a human restored (declined) them before H1 shipped, so their
+    stale `updated_at` sits behind the pull pass's cursor and the feed will
+    never replay them. One-time, flag-gated: fetch the server's currently-
+    marked set (`GET /api/documents?pending_delete=1`), then for every
+    journal row still `pending_delete=1` (post-GC, so a dead claimant is
+    already gone from `journal` by the time this runs):
+
+    - a live claimant (`relpath in sync_paths_seen`) NOT in the marked set
+      → restored through a channel this tick's feed poll could never see
+      → apply §18.2's clear+suppress via `_apply_restore`.
+    - a live claimant IN the marked set → genuinely still awaiting
+      approval → untouched.
+    - no live claimant at all → §18.3's GC already collected it before
+      this ran; nothing left to do here (the branch is unreachable in
+      practice, not specifically handled).
+
+    Same zero-trust basis as GC: `sync_paths_seen` must be the full,
+    successful enumeration this tick already paged, or this pass does
+    nothing and leaves the flag unset for a clean retry next tick. The
+    flag is set ONLY when both the paths enumeration and the documents
+    fetch succeeded — "done" means every `pending_delete=1` row this run
+    saw was actually resolved, not "we got through some of them."
+    """
+    await run_in_threadpool(_ensure_flags_table, db)
+    if await run_in_threadpool(_restore_reconcile_done, db):
+        return 0
+    if not sync_paths_seen:
+        return 0
+    data, err = await client.get_documents_pending_delete()
+    if err:
+        log.warning("fs_sync: restore-reconcile catch-up GET /documents?pending_delete=1 failed: %s", err)
+        return 0
+    marked_paths = {
+        path for doc in (data or {}).get("documents") or []
+        if (path := (doc or {}).get("source_path"))
+    }
+    reconciled = 0
+    for relpath, row in journal.items():
+        if not row["pending_delete"]:
+            continue
+        if relpath not in sync_paths_seen or relpath in marked_paths:
+            continue
+        await _apply_restore(db, row, relpath)
+        reconciled += 1
+    await run_in_threadpool(_mark_restore_reconcile_done, db)
+    return reconciled
 
 
 async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBudget") -> int:
@@ -718,21 +879,27 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     # paged GET /sync-paths response.
     known_rows = await run_in_threadpool(db.execute, TABLE, "SELECT relpath FROM {table}")
     known_relpaths = {r[0] for r in known_rows}
-    adopted_count = await _adopt_paths(db, known_relpaths, workspace_slug)
+    adopted_count, sync_paths_seen = await _adopt_paths(db, known_relpaths, workspace_slug)
 
     rows = await run_in_threadpool(
         db.execute, TABLE,
         "SELECT relpath, sha256, last_synced_hash, scanned_at, missing_scans, "
-        "pending_delete, external_id, origin, remote_rev FROM {table}",
+        "pending_delete, external_id, origin, remote_rev, restore_suppressed FROM {table}",
     )
     journal = {
         r[0]: {
             "sha256": r[1], "last_synced_hash": r[2], "scanned_at": r[3],
             "missing_scans": r[4] or 0, "pending_delete": r[5] or 0, "external_id": r[6],
-            "origin": r[7], "remote_rev": r[8] or 0,
+            "origin": r[7], "remote_rev": r[8] or 0, "restore_suppressed": r[9] or 0,
         }
         for r in rows
     }
+
+    # §18.3 — GC, right after the journal load (it deletes rows OUT of
+    # `journal`) and before anything else touches `pending_delete=1` rows
+    # this tick, so §18.4's catch-up below never has to re-derive "no
+    # claimant at all" — by the time it runs, such a row is simply gone.
+    gc_removed = await _gc_dead_pending_delete_rows(db, journal, sync_paths_seen)
 
     # §3.3 steps 2-3 — the pull pass, after the journal load above (it
     # needs each row's `last_synced_hash`/`remote_rev` to decide per
@@ -740,6 +907,12 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     # mutates `found` in place for anything it just wrote, so the rest of
     # this tick sees accurate state rather than a pre-pull snapshot).
     pull_result = await _run_pull_pass(db, journal, found, workspace_slug, root)
+
+    # §18.4 — the one-time restore-reconcile catch-up for the rows the live
+    # feed can never retroactively surface. Independent of the §17.4
+    # catch-up/marking budget below: this one never marks, only clears and
+    # suppresses, so it carries no mass-delete risk of its own.
+    restore_reconciled = await _run_restore_reconcile_catchup(db, journal, sync_paths_seen)
 
     # §17.4/§17.5 — the one-time catch-up and the live-miss marking pass
     # below share one `_MarkBudget`, drawing on the SAME threshold guard 2
@@ -771,6 +944,19 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
                 },
             )
             continue
+
+        if row["restore_suppressed"]:
+            # §18.2 — the file is present at this path again: re-arm
+            # detection unconditionally (not just when `missing_scans` was
+            # already nonzero), the first time the scan sees it. From here
+            # on a later disappearance is marked normally after the usual
+            # ≥2 scans — the suppression's job was one cycle, not forever.
+            await run_in_threadpool(
+                db.execute, TABLE,
+                "UPDATE {table} SET restore_suppressed = 0 WHERE relpath = :relpath",
+                {"relpath": relpath},
+            )
+            row["restore_suppressed"] = 0
 
         if row["missing_scans"]:
             # The path reappeared — the ≥2-consecutive-scans counter must
@@ -866,7 +1052,9 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         "failed": failed,
         "bucket": bulk_ingest.BUCKET,
         "adopted": adopted_count,
+        "gc_removed": gc_removed,
         "catchup_marked": catchup_marked,
+        "restore_reconciled": restore_reconciled,
         "pulled": pull_result["pulled"],
         "authored_written": pull_result["authored_written"],
         "remote_rev_only": pull_result["remote_rev_only"],
@@ -904,7 +1092,13 @@ async def _mark_missing_as_deleted(
     (`external_id IS NOT NULL`) OR one the adoption pass is watching
     (`origin == ORIGIN_ADOPTED`) — the same widened set §7's valve now
     uses. A row still waiting out its debounce window, with neither, was
-    never this engine's document to begin with."""
+    never this engine's document to begin with.
+
+    §18.2 — `restore_suppressed` rows are excluded from marking alongside
+    the existing `pending_delete` exclusion (both still advance
+    `missing_scans`, harmlessly, via the `else` branch below; only the
+    MARK itself is withheld). Clearing the flag is the found-loop's job
+    (`_run_tick_locked`, the moment the file reappears), not this one's."""
     marked = 0
     for relpath, row in journal.items():
         if relpath in found:
@@ -912,7 +1106,10 @@ async def _mark_missing_as_deleted(
         if not row["external_id"] and row["origin"] != ORIGIN_ADOPTED:
             continue
         new_missing = row["missing_scans"] + 1
-        if new_missing >= MISSING_SCANS_THRESHOLD and not row["pending_delete"] and budget.allows_more():
+        if (
+            new_missing >= MISSING_SCANS_THRESHOLD and not row["pending_delete"]
+            and not row["restore_suppressed"] and budget.allows_more()
+        ):
             data, err = await client.mark_delete_by_path(
                 relpath, workspace_slug, reason="missing from source tree for 2 consecutive scans",
             )
