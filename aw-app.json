@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "knowledgeable",
   "name": "Knowledgeable Connector",
-  "version": "0.33.0",
+  "version": "0.34.0",
   "description": "Ingestion + retrieval MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 7 tools mapped onto its API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes (lexical name matching, for the link picker), search_graph (lexical/semantic/tree retrieval with the \u00a712 knobs \u2014 beam_width, min_score, related_vias, bucket). This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
   "icon": "share-2",
   "tier": "inprocess",
@@ -87,14 +87,14 @@
         "enabled": false
       },
       {
-        "name": "KB fs-sync — tick",
+        "name": "KB fs-sync \u2014 tick",
         "type": "agentic_output",
         "command": "aw-workspace-cli knowledgeable-sync run",
         "notify_exit_codes": [
           1
         ],
         "agent_slug": "coder-sonnet",
-        "prompt": "The `KB fs-sync — tick` task (docs/design/aw-knowledgeable-fs-sync.md §3/§7/§20) just exited non-zero. Run `aw-workspace-cli knowledgeable-sync status` and read the command's own stderr above to tell which case this is: (1) the §6 workspace_slug refusal — AW_WORKSPACE is unset, a real config gap, open a blocker; (2) another fs-sync tick already in progress — expected under overlap, just note it; (3) the §7 mass-delete valve tripped — check `status` for `valve_tripped` and the tree before approving anything in the UI, this is the one that protects the corpus, do not clear it yourself. A §20 per-prefix quiet period holding uploads (`holding` in `status`) is NOT a failure and never produces a non-zero exit on its own. Report which case, and only open a blocker for (1) or an unexplained (3).",
+        "prompt": "The `KB fs-sync \u2014 tick` task (docs/design/aw-knowledgeable-fs-sync.md \u00a73/\u00a77/\u00a720) just exited non-zero. Run `aw-workspace-cli knowledgeable-sync status` and read the command's own stderr above to tell which case this is: (1) the \u00a76 workspace_slug refusal \u2014 AW_WORKSPACE is unset, a real config gap, open a blocker; (2) another fs-sync tick already in progress \u2014 expected under overlap, just note it; (3) the \u00a77 mass-delete valve tripped \u2014 check `status` for `valve_tripped` and the tree before approving anything in the UI, this is the one that protects the corpus, do not clear it yourself. A \u00a720 per-prefix quiet period holding uploads (`holding` in `status`) is NOT a failure and never produces a non-zero exit on its own. Report which case, and only open a blocker for (1) or an unexplained (3).",
         "reuse_session": false,
         "schedules": [
           {
