@@ -69,6 +69,20 @@ class _FakeAsyncClient:
         )
         return _FakeAsyncClient._QUEUE.pop(0)
 
+    async def put(self, url, json=None, headers=None, files=None, params=None, data=None):
+        _FakeAsyncClient._CALLS.append(
+            {
+                "method": "PUT",
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "files": files,
+                "params": params,
+                "data": data,
+            }
+        )
+        return _FakeAsyncClient._QUEUE.pop(0)
+
 
 @pytest.fixture(autouse=True)
 def _fresh_fake_client(monkeypatch):
@@ -388,6 +402,34 @@ def test_upload_bytes_surfaces_a_backend_error():
     data, err = _run(client.upload_bytes("huge.md", b"x", bucket="kb-crispal"))
     assert data is None
     assert "10MB" in err
+
+
+def test_put_document_by_path_sends_bucket_as_a_query_param():
+    """fs-sync-upload-bucket-missing — PUT /api/documents/by-path must carry
+    an explicit `bucket`, the same way `upload_bytes` already does above.
+    `require_bucket_write` reads `bucket` off the query string (never the
+    multipart body), so an omitted bucket resolves server-side to "the
+    tenant's sole writable bucket" — which breaks the moment a second
+    writable bucket exists. This assertion is the guard against that
+    silently coming back."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(200, {"id": "doc-1", "rev": 2, "content_hash": "h", "outcome": "updated"})
+    )
+    data, err = _run(
+        client.put_document_by_path(
+            "notes.md", b"kb body", bucket="main",
+            source_path="authored/notes.md", workspace_slug="aw", base_hash="old-hash",
+        )
+    )
+    assert err is None
+    assert data == {"id": "doc-1", "rev": 2, "content_hash": "h", "outcome": "updated"}
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/documents/by-path"
+    assert call["params"] == {"bucket": "main"}
+    assert call["data"] == {
+        "source_path": "authored/notes.md", "workspace_slug": "aw", "base_hash": "old-hash",
+    }
+    assert call["files"] == {"file": ("notes.md", b"kb body")}
 
 
 def test_push_playground_key_sends_the_value_and_secret_header():

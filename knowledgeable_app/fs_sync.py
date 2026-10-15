@@ -1125,7 +1125,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
             continue
 
         data, err = await client.put_document_by_path(
-            Path(relpath).name, raw,
+            Path(relpath).name, raw, bucket=bulk_ingest.BUCKET,
             source_path=relpath, workspace_slug=workspace_slug, base_hash=last_synced,
         )
         now = time.time()

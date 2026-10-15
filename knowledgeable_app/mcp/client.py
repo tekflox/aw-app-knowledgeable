@@ -199,6 +199,7 @@ async def put_document_by_path(
     filename: str,
     raw: bytes,
     *,
+    bucket: str,
     source_path: str,
     workspace_slug: str,
     base_hash: str | None = None,
@@ -209,7 +210,14 @@ async def put_document_by_path(
     above. The response (``{id, rev, content_hash, outcome}``) is the
     load-bearing contract the caller journals from directly, never from a
     second read — same real-bytes-not-base64 reasoning as ``upload_bytes``,
-    since `fs_sync.py` also reads files off this process's own KB tree."""
+    since `fs_sync.py` also reads files off this process's own KB tree.
+
+    `bucket` travels as a query param, same as ``upload_bytes`` above —
+    the server's ``require_bucket_write`` reads it off the query string, not
+    the multipart body. Without it the route falls back to "the tenant's
+    sole writable bucket", which silently breaks the moment a second
+    writable bucket exists."""
+    params: dict = {"bucket": bucket}
     data: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
     if base_hash:
         data["base_hash"] = base_hash
@@ -219,6 +227,7 @@ async def put_document_by_path(
         try:
             resp = await http_client.put(
                 f"{base_url()}/api/documents/by-path",
+                params=params,
                 data=data,
                 files={"file": (filename, raw)},
                 headers=_headers(),

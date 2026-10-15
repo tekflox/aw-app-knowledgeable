@@ -375,8 +375,11 @@ def test_edit_after_debounce_puts_by_path_with_base_hash_and_keeps_external_id(
 
     calls = []
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
-        calls.append({"source_path": source_path, "workspace_slug": workspace_slug, "base_hash": base_hash})
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
+        calls.append({
+            "bucket": bucket, "source_path": source_path,
+            "workspace_slug": workspace_slug, "base_hash": base_hash,
+        })
         return {"id": "doc-42", "rev": 2, "content_hash": "new-hash-value", "outcome": "updated"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
@@ -388,6 +391,11 @@ def test_edit_after_debounce_puts_by_path_with_base_hash_and_keeps_external_id(
     assert result["created"] == 0
     assert len(calls) == 1
     assert calls[0]["base_hash"] == "old-hash"
+    # fs-sync-upload-bucket-missing — the upload must name its bucket
+    # explicitly. An omitted bucket resolves server-side to "the tenant's
+    # sole writable bucket", which silently breaks the moment a second
+    # writable bucket exists (a stray fixture bucket did exactly that).
+    assert calls[0]["bucket"] == bulk_ingest.BUCKET
     row = _journal_rows(db)[0]
     assert row["external_id"] == "doc-42"  # unchanged — no duplicate minted
     assert row["last_synced_hash"] == "new-hash-value"
@@ -733,7 +741,7 @@ def test_adopted_path_whose_file_exists_converges_to_a_normal_synced_row(
         {"t": time.time() - 100, "r": "notion/adopted.md"},
     )
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         return {"id": "doc-new", "rev": 1, "content_hash": "hash-after-put", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
@@ -1329,7 +1337,7 @@ def test_filesystem_wins_conflict_then_upload_sends_the_stale_base_hash_that_rec
 
     put_calls = []
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         put_calls.append({"base_hash": base_hash, "raw": raw})
         return {"id": "doc-42", "rev": 4, "content_hash": local_digest, "outcome": "updated"}, None
 
@@ -1396,7 +1404,7 @@ def test_remote_wins_conflict_never_uploads_the_discarded_local_edit(
 
     put_calls = []
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         put_calls.append({"base_hash": base_hash})
         return {"id": "doc-42", "rev": 99, "content_hash": "should-never-be-used", "outcome": "updated"}, None
 
@@ -2013,7 +2021,7 @@ def test_upload_fires_once_the_configured_quiet_period_elapses(
         pending_hash=digest, pending_since=time.time() - 150, dirty_since=time.time() - 150,
     )
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         return {"id": "doc-9", "rev": 2, "content_hash": "new-hash", "outcome": "updated"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
@@ -2046,7 +2054,7 @@ def test_starvation_cap_fires_despite_a_quiet_window_that_has_not_elapsed(
         dirty_since=time.time() - 200,  # continuously dirty well past the 100s cap
     )
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         return {"id": "doc-5", "rev": 7, "content_hash": "new-hash", "outcome": "updated"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
@@ -2142,7 +2150,7 @@ def test_unmatched_prefix_keeps_the_built_in_30s_debounce(_workspace_home, db, l
         pending_hash=digest, pending_since=time.time() - 40, dirty_since=time.time() - 40,
     )
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         return {"id": "doc-1", "rev": 2, "content_hash": "new-hash", "outcome": "updated"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
@@ -2231,7 +2239,7 @@ def test_bulk_ingest_scan_stomping_scanned_at_does_not_reset_the_quiet_window(
     assert row_after_scan["scanned_at"] > pending_since + 1000  # genuinely stomped
     assert row_after_scan["pending_since"] == pending_since  # untouched by scan()
 
-    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+    async def fake_put(filename, raw, *, bucket=None, source_path, workspace_slug, base_hash=None, title=None):
         return {"id": "doc-new", "rev": 1, "content_hash": digest, "outcome": "created"}, None
 
     monkeypatch.setattr(client, "put_document_by_path", fake_put)
