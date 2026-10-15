@@ -94,7 +94,7 @@
           1
         ],
         "agent_slug": "coder-sonnet",
-        "prompt": "The `KB fs-sync \u2014 tick` task (docs/design/aw-knowledgeable-fs-sync.md \u00a73/\u00a77/\u00a720) just exited non-zero. Run `aw-workspace-cli knowledgeable-sync status` and read the command's own stderr above to tell which case this is: (1) the \u00a76 workspace_slug refusal \u2014 AW_WORKSPACE is unset, a real config gap, open a blocker; (2) another fs-sync tick already in progress \u2014 expected under overlap, just note it; (3) the \u00a77 mass-delete valve tripped \u2014 check `status` for `valve_tripped` and the tree before approving anything in the UI, this is the one that protects the corpus, do not clear it yourself. A \u00a720 per-prefix quiet period holding uploads (`holding` in `status`) is NOT a failure and never produces a non-zero exit on its own. Report which case, and only open a blocker for (1) or an unexplained (3).",
+        "prompt": "The `KB fs-sync \u2014 tick` task (docs/design/aw-knowledgeable-fs-sync.md \u00a73/\u00a77/\u00a720/\u00a721) just exited non-zero. Run `aw-workspace-cli knowledgeable-sync status` and read the command's own stderr above to tell which case this is: (1) the \u00a76 workspace_slug refusal \u2014 AW_WORKSPACE is unset, a real config gap, open a blocker; (2) another fs-sync tick already in progress \u2014 expected under overlap, just note it; (3) the \u00a77 mass-delete valve tripped \u2014 check `status` for `valve_tripped` and the tree before approving anything in the UI, this is the one that protects the corpus, do not clear it yourself. A \u00a720 per-prefix quiet period holding uploads (`holding` in `status`) is NOT a failure and never produces a non-zero exit on its own. A latched valve (3) also suspends \u00a721's unattended deletion approval \u2014 surfaced as `auto_approve_suspended` in the tick result \u2014 until an audited `POST /fs-sync/valve/clear`; do not clear it yourself. Report which case, and only open a blocker for (1) or an unexplained (3).",
         "reuse_session": false,
         "schedules": [
           {
@@ -155,6 +155,12 @@
         "default": "notion/=10800",
         "title": "Sync quiet periods",
         "description": "docs/design/aw-knowledgeable-fs-sync.md \u00a720. Comma- or newline-separated rules `prefix=quiet_seconds[:max_hold_seconds]`. A changed file under `prefix` uploads only once its content has been unchanged for quiet_seconds; max_hold (default 4\u00d7 quiet, 0 = unlimited) syncs it anyway if it has been continuously changing that long. Longest matching prefix wins. Paths matching no rule keep the built-in 30s debounce. A malformed entry is skipped and surfaced as quiet_rules_invalid in GET /fs-sync/status rather than silently disabling the feature."
+      },
+      "delete_policy": {
+        "type": "string",
+        "default": "",
+        "title": "Unattended deletion approval",
+        "description": "docs/design/aw-knowledgeable-fs-sync.md \u00a721. Comma- or newline-separated rules `prefix=auto[:min_missing_scans]` or `prefix=manual`. Longest matching prefix wins; paths matching no rule stay `manual` (today's behaviour \u2014 a human approves in the Library UI). `min_missing_scans` defaults to 2, the same tick a delete mark lands. An empty prefix is rejected (no blanket auto-approve, ever) and so is an `auto` rule anchored at `authored/` (\u00a74's downsync is not yet exercised) \u2014 both are skipped and surfaced as delete_policy_invalid in GET /fs-sync/status rather than silently disabling or silently enabling anything. Default empty ships inert, byte-identical to today. Auto-approval also stays off whenever the \u00a77 mass-delete valve is latched, until an audited POST /fs-sync/valve/clear."
       }
     },
     "required": []

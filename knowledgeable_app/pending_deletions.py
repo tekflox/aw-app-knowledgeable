@@ -215,6 +215,22 @@ def _reconcile_journal_for_succeeded(db, matched: list[dict], succeeded: list[st
     return cleared
 
 
+async def record_valve_clear(db, actor: str, *, bucket: str) -> None:
+    """§21.2 — the only non-MCP writer into this module's audit table: the
+    audited `POST /fs-sync/valve/clear` route in `routes.py`. A thin entry
+    point rather than that route reaching into `_record_audit` directly
+    (this module's own convention of a leading underscore on it), so the
+    §7 valve latch's own clear lands in the SAME audit trail as every
+    approve/decline — one log for every action on the deletion gate, not a
+    second one grown in `routes.py`. No scope or counts apply to clearing
+    a latch, so every count/scope field here is the fixed "no-op" shape."""
+    await run_in_threadpool(
+        _record_audit, db, action="valve_clear", actor=actor, bucket=bucket,
+        path_prefix=None, node_ids=None, expected_count=None,
+        matched_count=0, succeeded_count=0, failed_count=0, outcome="ok",
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP tool bodies — dispatched from `mcp/http_handler.py`.
 # ---------------------------------------------------------------------------

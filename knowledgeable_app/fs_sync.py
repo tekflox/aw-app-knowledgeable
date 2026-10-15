@@ -31,6 +31,7 @@ called before a single row's `missing_scans` is touched on any tick.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -40,7 +41,7 @@ from typing import NamedTuple
 
 from fastapi.concurrency import run_in_threadpool
 
-from . import bulk_ingest
+from . import bulk_ingest, pending_deletions
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.fs_sync")
@@ -202,6 +203,115 @@ def _resolve_quiet_rule(relpath: str, rules: list[_QuietRule]) -> tuple[float, f
         if relpath.startswith(rule.prefix):
             return rule.quiet_seconds, rule.cap_seconds
     return _DEFAULT_QUIET_RULE
+
+
+#: §21.1 — the same tick a mark lands is the default approval latency: the
+#: one measured false-positive class (cli_reference, restored by a *daily*
+#: task) has a restore horizon of hours, far past any `min_missing_scans`
+#: an operator would sanely dial in. Reuses `MISSING_SCANS_THRESHOLD`
+#: itself rather than a second constant — approving before the mark exists
+#: is meaningless, so this IS the floor, not a coincidence.
+DEFAULT_MIN_MISSING_SCANS = MISSING_SCANS_THRESHOLD
+
+#: §21.1 — no rule may ever resolve to a blanket auto-approve: an empty
+#: prefix is parser-rejected (surfaced in `delete_policy_invalid`, same as
+#: a malformed entry), never silently treated as "match everything".
+_EMPTY_PREFIX_INVALID_SUFFIX = " (empty prefix — no blanket auto-approve, ever)"
+
+#: §21.1 — `authored/` cannot carry an `auto` rule until §4's downsync is
+#: exercised: "the file vanished" is weak evidence about a document a
+#: human authored in the graph. Lift consciously, in an amendment.
+_AUTHORED_AUTO_INVALID_SUFFIX = " (authored/ cannot carry an auto rule — §4 downsync is not yet exercised)"
+
+#: §21.1 — the default policy for any path no configured rule matches, and
+#: for every path when `delete_policy` itself is absent: today's behaviour,
+#: unattended approval never happens.
+_DEFAULT_DELETE_RULE_MODE = "manual"
+
+
+class _DeleteRule(NamedTuple):
+    prefix: str
+    mode: str  # "auto" or "manual"
+    min_missing_scans: int  # meaningless for "manual"
+
+
+_DEFAULT_DELETE_RULE = _DeleteRule(prefix="", mode=_DEFAULT_DELETE_RULE_MODE, min_missing_scans=0)
+
+
+def parse_delete_policy(raw: str | None) -> tuple[list[_DeleteRule], list[str]]:
+    """§21.1 — parse the `delete_policy` config string: comma- or
+    newline-separated ``prefix=auto[:min_missing_scans]`` or
+    ``prefix=manual`` entries, same splitting/longest-prefix-sort/
+    skip-and-surface shape as `parse_quiet_rules` above (a typo must not
+    silently disable — or silently ENABLE — unattended deletion).
+
+    Two rejections beyond a plain parse failure, both because this knob
+    deletes documents rather than merely holding an upload: an empty
+    prefix (no blanket auto-approve, ever — see the 2026-10-15
+    cli_reference near-miss) and an `auto` rule anchored at `authored/`
+    (§4's downsync is unexercised). Both are skipped and reported back in
+    `invalid`, never ignored silently and never raised.
+
+    ``raw`` falsy (unset/empty) returns ``([], [])`` — `_resolve_delete_
+    policy` then falls back to `_DEFAULT_DELETE_RULE` (`manual`) for every
+    path: ships inert, byte-identical to today."""
+    rules: list[_DeleteRule] = []
+    invalid: list[str] = []
+    if not raw:
+        return rules, invalid
+    for entry in re.split(r"[,\n]", raw):
+        entry = entry.strip()
+        if not entry:
+            continue
+        prefix, sep, value = entry.partition("=")
+        if not sep:
+            invalid.append(entry)
+            continue
+        prefix = prefix.strip()
+        value = value.strip()
+        if not prefix:
+            invalid.append(entry + _EMPTY_PREFIX_INVALID_SUFFIX)
+            continue
+        mode_part, _, min_part = value.partition(":")
+        mode_part = mode_part.strip().lower()
+        if mode_part == "manual":
+            if min_part:
+                invalid.append(entry)
+                continue
+            rules.append(_DeleteRule(prefix=prefix, mode="manual", min_missing_scans=0))
+        elif mode_part == "auto":
+            if prefix.startswith(AUTHORED_PREFIX):
+                invalid.append(entry + _AUTHORED_AUTO_INVALID_SUFFIX)
+                continue
+            if min_part:
+                try:
+                    min_scans = int(min_part)
+                except ValueError:
+                    invalid.append(entry)
+                    continue
+                if min_scans < 0:
+                    invalid.append(entry)
+                    continue
+            else:
+                min_scans = DEFAULT_MIN_MISSING_SCANS
+            rules.append(_DeleteRule(prefix=prefix, mode="auto", min_missing_scans=min_scans))
+        else:
+            invalid.append(entry)
+            continue
+    for entry in invalid:
+        log.warning("fs_sync: invalid delete_policy entry %r — skipped", entry)
+    rules.sort(key=lambda r: len(r.prefix), reverse=True)
+    return rules, invalid
+
+
+def _resolve_delete_policy(relpath: str, rules: list[_DeleteRule]) -> _DeleteRule:
+    """§21.1 — longest matching prefix wins (`rules` pre-sorted by
+    `parse_delete_policy`). No match → `_DEFAULT_DELETE_RULE` (`manual`) —
+    unmatched paths always wait for a human, exactly like today."""
+    for rule in rules:
+        if relpath.startswith(rule.prefix):
+            return rule
+    return _DEFAULT_DELETE_RULE
 
 
 #: §7 valve guard 2 — the floor of `max(floor, 10% of tracked rows)`.
@@ -904,7 +1014,8 @@ def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
 
 async def run_tick(
     db, lease, *, max_uploads: int = MAX_UPLOADS_PER_TICK, workspace_slug: str = "",
-    quiet_rules: str | None = None,
+    quiet_rules: str | None = None, delete_policy: str | None = None,
+    valve_latched: bool | None = None,
 ) -> dict:
     """One bounded tick. §6: refuses to run at all when `workspace_slug`
     is empty — a quarter of the path-keyed document identity, so a
@@ -920,7 +1031,13 @@ async def run_tick(
     string — threaded straight through from `routes.py`'s `ctx.config`,
     parsed once per tick here rather than per row. ``None`` (the config
     key absent) behaves exactly as before this amendment: every path uses
-    the built-in 30s debounce, uncapped."""
+    the built-in 30s debounce, uncapped.
+
+    `delete_policy` (§21.1) is the same shape of raw config string for the
+    `_auto_approve_pending` pass, below. `valve_latched` (§21.2) defaults
+    to ``None`` = unknown = auto-approve DISABLED — a caller that doesn't
+    prove the §7 valve latch is clear gets marking-only behaviour. Fail
+    closed: an unknown latch state must never permit an automatic delete."""
     if not workspace_slug:
         return _empty_result(
             True, "AW_WORKSPACE is unset — refusing to run with a defaulted workspace_slug (§6)",
@@ -930,13 +1047,20 @@ async def run_tick(
             True, "another fs-sync tick is already in progress — wait for it to finish",
         )
     try:
-        return await _run_tick_locked(db, max_uploads, workspace_slug, quiet_rules)
+        return await _run_tick_locked(
+            db, max_uploads, workspace_slug, quiet_rules,
+            delete_policy=delete_policy, valve_latched=valve_latched,
+        )
     finally:
         lease.release(LEASE_NAME)
 
 
-async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rules: str | None = None) -> dict:
+async def _run_tick_locked(
+    db, max_uploads: int, workspace_slug: str, quiet_rules: str | None = None, *,
+    delete_policy: str | None = None, valve_latched: bool | None = None,
+) -> dict:
     rules, _invalid = parse_quiet_rules(quiet_rules)
+    delete_rules, delete_policy_invalid = parse_delete_policy(delete_policy)
     await run_in_threadpool(bulk_ingest._ensure_table, db)
     root = bulk_ingest.kb_root()
     found = await run_in_threadpool(_walk_sync_tree, root)
@@ -1172,6 +1296,36 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
         db, journal, found, workspace_slug, mark_budget
     )
 
+    # §21.2 — the in-tick auto-approve pass, immediately after the marking
+    # pass above so a mark and its approval land in the SAME tick (§21.3's
+    # "mark-at-2 + same-tick approval" acceptance contract). Entirely
+    # inert when `delete_policy` has no `auto` rule at all. Otherwise
+    # no-ops (and says why) on any of the three stop signals: §17.5's
+    # mid-pass `_MarkBudget` trip, a latched §7 valve, or an UNKNOWN latch
+    # state (fail closed — see `run_tick`'s own docstring). Guard 2's
+    # pre-pass trip is handled for free: it already returned `_empty_
+    # result` above, long before this line ever runs. Never clears the
+    # latch itself — a trip always waits for an explicit, audited,
+    # out-of-tick decision via `POST /fs-sync/valve/clear`.
+    auto_approved = 0
+    auto_approve_failed = 0
+    auto_approve_suspended = None
+    if any(r.mode == "auto" for r in delete_rules):
+        if mark_budget.tripped:
+            auto_approve_suspended = (
+                "in-pass document ceiling tripped this tick — deferring to the next tick"
+            )
+        elif valve_latched is None:
+            auto_approve_suspended = (
+                "valve latch state unknown — auto-approve defaults to OFF (fail closed)"
+            )
+        elif valve_latched:
+            auto_approve_suspended = (
+                "mass-delete valve latch is set — clear it via POST /fs-sync/valve/clear"
+            )
+        else:
+            auto_approved, auto_approve_failed = await _auto_approve_pending(db, delete_rules)
+
     result = {
         "blocked": False,
         "created": created,
@@ -1190,7 +1344,11 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
         "remote_rev_only": pull_result["remote_rev_only"],
         "restored": pull_result["restored"],
         "conflicts_local_won": pull_result["conflicts_local_won"],
+        "auto_approved": auto_approved,
+        "auto_approve_failed": auto_approve_failed,
     }
+    if auto_approve_suspended:
+        result["auto_approve_suspended"] = auto_approve_suspended
     if upload_budget == 0 and backlog >= bulk_ingest.MAX_PENDING_BACKLOG:
         result["skipped_reason"] = f"processing backlog {backlog} >= {bulk_ingest.MAX_PENDING_BACKLOG}"
     if mark_budget.tripped:
@@ -1279,7 +1437,73 @@ async def _mark_missing_as_deleted(
     return marked, failed
 
 
-def status(db, quiet_rules: str | None = None) -> dict:
+async def _auto_approve_pending(db, rules: list[_DeleteRule]) -> tuple[int, int]:
+    """§21.2 steps 2-3 — the auto-approve pass's own body, called only
+    when the caller (`_run_tick_locked`) has already confirmed an `auto`
+    rule exists and none of the three stop signals apply.
+
+    Queries the journal FRESH via `db` rather than reusing the in-memory
+    `journal` dict `_mark_missing_as_deleted` was given above — that dict's
+    rows are never mutated in place (see that function's own body), so a
+    path this very tick just marked would otherwise be invisible here,
+    breaking the "mark-at-2 + same-tick approval" acceptance contract.
+
+    Groups eligible relpaths by the SPECIFIC rule that matched them (not
+    one call for the whole tick) so each approve call's audit actor names
+    the rule that actually authorized it. Fetches the server's pending
+    list once, also fresh (after this tick's marks), and reuses the
+    EXISTING `pending_deletions.approve_pending_deletions` — one approve
+    path, one audit shape, one journal-reconcile, for human, agent and
+    policy alike. A TOCTOU count mismatch (§21.7) is handled entirely
+    inside that call (rejected, audited, counted as neither approved nor
+    failed here) and is never retried in-pass — the next tick re-derives
+    eligibility from scratch and tries again."""
+    eligible = await run_in_threadpool(
+        db.execute, TABLE, "SELECT relpath, missing_scans FROM {table} WHERE pending_delete = 1",
+    )
+    by_prefix: dict[str, set[str]] = {}
+    for relpath, missing_scans in eligible:
+        rule = _resolve_delete_policy(relpath, rules)
+        if rule.mode != "auto":
+            continue
+        if (missing_scans or 0) < rule.min_missing_scans:
+            continue
+        by_prefix.setdefault(rule.prefix, set()).add(relpath)
+    if not by_prefix:
+        return 0, 0
+
+    data, err = await client.get_documents_pending_delete(bucket=bulk_ingest.BUCKET)
+    if err:
+        log.warning("fs_sync: delete_policy auto-approve could not list pending deletions: %s", err)
+        return 0, 0
+    docs = (data or {}).get("documents") or []
+
+    approved = 0
+    failed = 0
+    for prefix, relpaths in by_prefix.items():
+        node_ids = [d["id"] for d in docs if d.get("source_path") in relpaths]
+        if not node_ids:
+            continue
+        text, is_error = await pending_deletions.approve_pending_deletions(
+            {"bucket": bulk_ingest.BUCKET, "node_ids": node_ids, "expected_count": len(node_ids)},
+            db, f"fs-sync:delete_policy rule={prefix}",
+        )
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            payload = {}
+        succeeded = payload.get("approved") or []
+        failed_docs = payload.get("failed") or []
+        approved += len(succeeded)
+        failed += len(failed_docs)
+        if is_error and not succeeded:
+            log.warning(
+                "fs_sync: delete_policy auto-approve rule=%s did not complete: %s", prefix, text,
+            )
+    return approved, failed
+
+
+def status(db, quiet_rules: str | None = None, delete_policy: str | None = None) -> dict:
     """A cheap journal-only snapshot for the CLI `status` subcommand —
     same no-network-call contract as `bulk_ingest.status`.
 
@@ -1289,7 +1513,11 @@ def status(db, quiet_rules: str | None = None) -> dict:
     parsed, effective `quiet_rules`, and `quiet_rules_invalid` (any entry
     that failed to parse — a typo must be visible here, not silently
     disable the feature). Without these, "held for 3h" and "silently
-    broken" are indistinguishable from the operator's seat."""
+    broken" are indistinguishable from the operator's seat.
+
+    §21.2 adds the same shape for `delete_policy`: the parsed, effective
+    `delete_policy` rules and `delete_policy_invalid` (any entry rejected
+    — malformed, an empty prefix, or an `auto` rule on `authored/`)."""
     bulk_ingest._ensure_table(db)
     rows = db.execute(
         TABLE, "SELECT relpath, last_synced_hash, missing_scans, pending_delete, pending_hash FROM {table}",
@@ -1299,6 +1527,7 @@ def status(db, quiet_rules: str | None = None) -> dict:
     pending_delete = sum(1 for r in rows if r[3])
     holding = sum(1 for r in rows if r[4] is not None)
     rules, invalid = parse_quiet_rules(quiet_rules)
+    delete_rules, delete_invalid = parse_delete_policy(delete_policy)
     return {
         "bucket": bulk_ingest.BUCKET,
         "journal_rows": len(rows),
@@ -1311,15 +1540,21 @@ def status(db, quiet_rules: str | None = None) -> dict:
             for r in rules
         ],
         "quiet_rules_invalid": invalid,
+        "delete_policy": [
+            {"prefix": r.prefix, "mode": r.mode, "min_missing_scans": r.min_missing_scans}
+            for r in delete_rules
+        ],
+        "delete_policy_invalid": delete_invalid,
         "table": TABLE,
     }
 
 
-def report(db, quiet_rules: str | None = None) -> dict:
+def report(db, quiet_rules: str | None = None, delete_policy: str | None = None) -> dict:
     """The §3/§7 deliverable report — per-subtree synced/missing/pending-
     delete counts plus totals, mirroring `bulk_ingest.report`'s shape.
     §20.7 adds per-subtree `holding` (same `pending_hash IS NOT NULL`
-    definition as `status()`)."""
+    definition as `status()`). §21.2 adds the same top-level
+    `delete_policy`/`delete_policy_invalid` pair `status()` carries."""
     bulk_ingest._ensure_table(db)
     subtrees: dict[str, dict] = {}
     for subtree in bulk_ingest._discovered_subtrees(bulk_ingest.kb_root()):
@@ -1346,4 +1581,15 @@ def report(db, quiet_rules: str | None = None) -> dict:
     for b in subtrees.values():
         for key, value in b.items():
             totals[key] = totals.get(key, 0) + value
-    return {"bucket": bulk_ingest.BUCKET, "subtrees": subtrees, "totals": totals, "table": TABLE}
+    delete_rules, delete_invalid = parse_delete_policy(delete_policy)
+    return {
+        "bucket": bulk_ingest.BUCKET,
+        "subtrees": subtrees,
+        "totals": totals,
+        "delete_policy": [
+            {"prefix": r.prefix, "mode": r.mode, "min_missing_scans": r.min_missing_scans}
+            for r in delete_rules
+        ],
+        "delete_policy_invalid": delete_invalid,
+        "table": TABLE,
+    }

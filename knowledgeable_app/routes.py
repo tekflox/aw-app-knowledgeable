@@ -36,6 +36,7 @@ from . import (
     label_key_push,
     mcp_config,
     orphan_reconcile,
+    pending_deletions,
     playground_key_push,
 )
 from .mcp import client
@@ -73,10 +74,17 @@ GIT_STATE_KV_TTL = 60 * 60 * 24
 #: docs/design/aw-knowledgeable-fs-sync.md §7 — the mass-delete valve's
 #: own "journal flag", cached the same way `git_last_state` is: a tripped
 #: valve is a rare, deliberately sticky signal an operator must notice and
-#: clear (verify the tree, then either resolve it or approve in the UI),
-#: so it gets a long TTL rather than the git state's 1-day one.
+#: clear (verify the tree, then either resolve it or approve in the UI).
+#:
+#: §21.2 promotes this latch from reporting-only to a HARD GATE on
+#: unattended deletion approval, which makes a silent expiry a silent
+#: re-arm of that gate — this workspace's named failure mode. The 30-day
+#: TTL is gone for that reason; `ctx.state.kv` has no immortal-key concept
+#: (`put` requires `ttl > 0`), so this is the largest practical stand-in
+#: for "never" rather than a literal absence of one. The only way this key
+#: now goes away is the audited `POST /fs-sync/valve/clear` below.
 FS_SYNC_VALVE_KV_NAME = "fs_sync_valve_tripped"
-FS_SYNC_VALVE_KV_TTL = 60 * 60 * 24 * 30
+FS_SYNC_VALVE_KV_TTL = 60 * 60 * 24 * 365 * 100  # ~100 years — see note above
 
 
 def _caller_actor(request: Request) -> str:
@@ -274,6 +282,13 @@ def build_routes(ctx) -> FastAPI:
             # §20.5 — the single config seam: absent (None) behaves exactly
             # as before this amendment (30s debounce everywhere).
             "quiet_rules": ctx.config.get("sync_quiet_rules"),
+            # §21.2 — same seam for the auto-approve pass, plus the ONE
+            # place `valve_latched` is ever proven rather than defaulted:
+            # this call always resolves to a real bool, never `None`, so
+            # `run_tick`'s own fail-closed default only protects a caller
+            # that skips this kwarg entirely (see that function's docstring).
+            "delete_policy": ctx.config.get("delete_policy"),
+            "valve_latched": bool(await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME)),
         }
         if max_uploads is not None:
             kwargs["max_uploads"] = int(max_uploads)
@@ -286,15 +301,33 @@ def build_routes(ctx) -> FastAPI:
             )
         return result
 
+    @app.post("/fs-sync/valve/clear", dependencies=[Depends(_require_identity)])
+    async def fs_sync_valve_clear(request: Request) -> dict:
+        """§21.2 — the only way the §7 valve latch ever clears now that its
+        TTL is gone (see `FS_SYNC_VALVE_KV_NAME`'s own comment above): an
+        explicit, audited, out-of-tick decision. Writes a `valve_clear` row
+        to the same card-D audit table `pending_deletions.py` already owns
+        — one audit trail for every action on the deletion gate, not a
+        second one for this route."""
+        actor = _caller_actor(request)
+        was_latched = bool(await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME))
+        await ctx.state.kv.delete(FS_SYNC_VALVE_KV_NAME)
+        await pending_deletions.record_valve_clear(ctx.db, actor, bucket=bulk_ingest.BUCKET)
+        return {"cleared": True, "was_latched": was_latched, "actor": actor}
+
     @app.get("/fs-sync/status", dependencies=[Depends(_require_identity)])
     async def fs_sync_status() -> dict:
-        payload = await run_in_threadpool(fs_sync.status, ctx.db, ctx.config.get("sync_quiet_rules"))
+        payload = await run_in_threadpool(
+            fs_sync.status, ctx.db, ctx.config.get("sync_quiet_rules"), ctx.config.get("delete_policy"),
+        )
         payload["valve_tripped"] = await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME)
         return payload
 
     @app.get("/fs-sync/report", dependencies=[Depends(_require_identity)])
     async def fs_sync_report() -> dict:
-        return await run_in_threadpool(fs_sync.report, ctx.db, ctx.config.get("sync_quiet_rules"))
+        return await run_in_threadpool(
+            fs_sync.report, ctx.db, ctx.config.get("sync_quiet_rules"), ctx.config.get("delete_policy"),
+        )
 
     @app.post("/fs-sync/reconcile-orphans", dependencies=[Depends(_require_identity)])
     async def fs_sync_reconcile_orphans(request: Request, data: dict = Body(default={})) -> dict:
