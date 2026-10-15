@@ -36,6 +36,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from fastapi.concurrency import run_in_threadpool
 
@@ -120,11 +121,88 @@ DOWNSYNC_CURSOR_KEY = "downsync_cursor"
 #: intent on a single scan.
 MISSING_SCANS_THRESHOLD = 2
 
-#: §3.3 step 4 — the debounce window before the upload pass acts on a
+#: §3.3 step 4 / §20 — the quiet window before the upload pass acts on a
 #: freshly observed hash change (new path or edit). notion-sync writes
 #: 1,564 files in one burst; this collapses that into one tick's worth of
-#: STABLE files rather than 1,564 half-written reads.
+#: STABLE files rather than 1,564 half-written reads. Also §20.5's default
+#: for any prefix a configured rule doesn't match (and the value used when
+#: `quiet_rules` itself is absent) — byte-identical to pre-§20 behaviour.
 DEBOUNCE_SECONDS = 30
+
+#: §20.5 — a rule's cap defaults to this multiple of its own quiet seconds
+#: when the config string doesn't specify one explicitly (`prefix=quiet`,
+#: no `:cap`). 4× keeps a hot `notion/` card syncing at most twice a day.
+QUIET_CAP_MULTIPLIER = 4
+
+#: §20.5 — the built-in rule applied to a path no configured prefix
+#: matches, and to every path when `quiet_rules` itself is absent: the
+#: pre-§20 debounce, uncapped (no starvation concept existed before this
+#: amendment).
+_DEFAULT_QUIET_RULE: tuple[float, float] = (float(DEBOUNCE_SECONDS), 0.0)
+
+
+class _QuietRule(NamedTuple):
+    prefix: str
+    quiet_seconds: float
+    cap_seconds: float  # 0 disables the starvation cap for this rule
+
+
+def parse_quiet_rules(raw: str | None) -> tuple[list[_QuietRule], list[str]]:
+    """§20.5 — parse the `sync_quiet_rules` config string: comma- or
+    newline-separated ``prefix=quiet_seconds[:max_hold_seconds]`` entries.
+    A pure function (no `db`/network) with its own unit tests, including
+    malformed input — the optional-config-gated-paths lesson: a typo must
+    not silently disable the feature, so a malformed entry is skipped and
+    reported back to the caller rather than raising or being swallowed.
+
+    Returns ``(rules, invalid)`` — `rules` sorted longest-prefix-first so
+    `_resolve_quiet_rule`'s first match is always the most specific one
+    (`notion/kanban/` before `notion/`, either declaration order); `invalid`
+    is every raw entry that failed to parse, verbatim, for `status()`'s
+    `quiet_rules_invalid`. ``raw`` falsy (unset/empty) returns ``([], [])``
+    — `_resolve_quiet_rule` then falls back to `_DEFAULT_QUIET_RULE` for
+    every path, which is exactly today's behaviour."""
+    rules: list[_QuietRule] = []
+    invalid: list[str] = []
+    if not raw:
+        return rules, invalid
+    for entry in re.split(r"[,\n]", raw):
+        entry = entry.strip()
+        if not entry:
+            continue
+        prefix, sep, value = entry.partition("=")
+        if not sep:
+            invalid.append(entry)
+            continue
+        prefix = prefix.strip()
+        quiet_part, _, cap_part = value.strip().partition(":")
+        try:
+            quiet_seconds = float(quiet_part)
+            cap_seconds = (
+                float(cap_part) if cap_part else quiet_seconds * QUIET_CAP_MULTIPLIER
+            )
+        except ValueError:
+            invalid.append(entry)
+            continue
+        if quiet_seconds < 0 or cap_seconds < 0:
+            invalid.append(entry)
+            continue
+        rules.append(_QuietRule(prefix=prefix, quiet_seconds=quiet_seconds, cap_seconds=cap_seconds))
+    for entry in invalid:
+        log.warning("fs_sync: invalid sync_quiet_rules entry %r — skipped", entry)
+    rules.sort(key=lambda r: len(r.prefix), reverse=True)
+    return rules, invalid
+
+
+def _resolve_quiet_rule(relpath: str, rules: list[_QuietRule]) -> tuple[float, float]:
+    """§20.5 — longest matching prefix wins (`rules` is pre-sorted by
+    `parse_quiet_rules`, longest first). No match → `_DEFAULT_QUIET_RULE`,
+    the pre-§20 debounce, uncapped."""
+    for rule in rules:
+        if relpath.startswith(rule.prefix):
+            return rule.quiet_seconds, rule.cap_seconds
+    return _DEFAULT_QUIET_RULE
+
 
 #: §7 valve guard 2 — the floor of `max(floor, 10% of tracked rows)`.
 MASS_DELETE_FLOOR = 25
@@ -475,6 +553,7 @@ async def _run_pull_pass(
                         "sha256": "", "last_synced_hash": None, "scanned_at": now,
                         "missing_scans": 0, "pending_delete": 0, "external_id": None,
                         "origin": None, "remote_rev": rev, "restore_suppressed": 0,
+                        "pending_hash": None, "pending_since": None, "dirty_since": None,
                     }
                 remote_rev_only += 1
                 continue
@@ -569,6 +648,7 @@ async def _run_pull_pass(
                     "missing_scans": 0, "pending_delete": 0,
                     "external_id": change.get("external_id"), "origin": ORIGIN_DOWNSYNC,
                     "remote_rev": rev, "restore_suppressed": 0,
+                    "pending_hash": None, "pending_since": None, "dirty_since": None,
                 }
             # The scan/upload loop and `_mark_missing_as_deleted` below
             # read `found`, computed before this pass ran — without this,
@@ -815,6 +895,7 @@ def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
 
 async def run_tick(
     db, lease, *, max_uploads: int = MAX_UPLOADS_PER_TICK, workspace_slug: str = "",
+    quiet_rules: str | None = None,
 ) -> dict:
     """One bounded tick. §6: refuses to run at all when `workspace_slug`
     is empty — a quarter of the path-keyed document identity, so a
@@ -824,7 +905,13 @@ async def run_tick(
 
     Refuses to overlap with another in-flight fs-sync tick via
     `ctx.state.lease` (`lease`, non-blocking, flock-backed — see
-    `bulk_ingest.run_tick`'s own docstring for the same mechanism)."""
+    `bulk_ingest.run_tick`'s own docstring for the same mechanism).
+
+    `quiet_rules` (§20.5) is the raw, unparsed `sync_quiet_rules` config
+    string — threaded straight through from `routes.py`'s `ctx.config`,
+    parsed once per tick here rather than per row. ``None`` (the config
+    key absent) behaves exactly as before this amendment: every path uses
+    the built-in 30s debounce, uncapped."""
     if not workspace_slug:
         return _empty_result(
             True, "AW_WORKSPACE is unset — refusing to run with a defaulted workspace_slug (§6)",
@@ -834,12 +921,13 @@ async def run_tick(
             True, "another fs-sync tick is already in progress — wait for it to finish",
         )
     try:
-        return await _run_tick_locked(db, max_uploads, workspace_slug)
+        return await _run_tick_locked(db, max_uploads, workspace_slug, quiet_rules)
     finally:
         lease.release(LEASE_NAME)
 
 
-async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
+async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rules: str | None = None) -> dict:
+    rules, _invalid = parse_quiet_rules(quiet_rules)
     await run_in_threadpool(bulk_ingest._ensure_table, db)
     root = bulk_ingest.kb_root()
     found = await run_in_threadpool(_walk_sync_tree, root)
@@ -884,13 +972,15 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     rows = await run_in_threadpool(
         db.execute, TABLE,
         "SELECT relpath, sha256, last_synced_hash, scanned_at, missing_scans, "
-        "pending_delete, external_id, origin, remote_rev, restore_suppressed FROM {table}",
+        "pending_delete, external_id, origin, remote_rev, restore_suppressed, "
+        "pending_hash, pending_since, dirty_since FROM {table}",
     )
     journal = {
         r[0]: {
             "sha256": r[1], "last_synced_hash": r[2], "scanned_at": r[3],
             "missing_scans": r[4] or 0, "pending_delete": r[5] or 0, "external_id": r[6],
             "origin": r[7], "remote_rev": r[8] or 0, "restore_suppressed": r[9] or 0,
+            "pending_hash": r[10], "pending_since": r[11], "dirty_since": r[12],
         }
         for r in rows
     }
@@ -929,13 +1019,15 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         now = time.time()
 
         if row is None:
-            # Brand-new path: register it and start the debounce window —
-            # §3.3 step 4 applies to creates too, not only edits.
+            # Brand-new path: register it and start the quiet window right
+            # now, same moment §3.3 step 4 always started it (not one tick
+            # later) — §20.1: creates are held exactly like edits.
             await run_in_threadpool(
                 db.execute, TABLE,
                 "INSERT INTO {table} "
-                "(relpath, sha256, bucket, status, scanned_at, updated_at, missing_scans, pending_delete) "
-                "VALUES (:relpath, :sha256, :bucket, :status, :now, :now, 0, 0) "
+                "(relpath, sha256, bucket, status, scanned_at, updated_at, missing_scans, pending_delete, "
+                "pending_hash, pending_since, dirty_since) "
+                "VALUES (:relpath, :sha256, :bucket, :status, :now, :now, 0, 0, :sha256, :now, :now) "
                 "ON CONFLICT (relpath) DO UPDATE SET sha256 = excluded.sha256, "
                 "scanned_at = excluded.scanned_at, missing_scans = 0",
                 {
@@ -969,27 +1061,52 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
 
         last_synced = row["last_synced_hash"]
         if digest == last_synced:
+            # §20.2 rule 1 — unchanged, or an edit that reverted: either way
+            # cancels its own hold. `sha256`/`scanned_at` are updated purely
+            # for reporting (never again trusted for timing — see this
+            # module's docstring); `pending_hash`/`pending_since`/
+            # `dirty_since` are the clock those two used to be.
             unchanged += 1
-            if row["sha256"] != digest:
+            if row["sha256"] != digest or row["pending_hash"] is not None:
                 await run_in_threadpool(
                     db.execute, TABLE,
-                    "UPDATE {table} SET sha256 = :sha256, scanned_at = :now WHERE relpath = :relpath",
+                    "UPDATE {table} SET sha256 = :sha256, scanned_at = :now, "
+                    "pending_hash = NULL, pending_since = NULL, dirty_since = NULL "
+                    "WHERE relpath = :relpath",
                     {"sha256": digest, "now": now, "relpath": relpath},
                 )
+                row["pending_hash"] = None
+                row["pending_since"] = None
+                row["dirty_since"] = None
             continue
 
-        if row["sha256"] != digest:
-            # A change just appeared this tick — restart the quiet window
-            # rather than upload immediately.
+        if digest != row["pending_hash"]:
+            # §20.2 rule 2 — a new hash just appeared (or changed again)
+            # this tick: restart the quiet window. `dirty_since` is the one
+            # exception — it is set ONLY the first time a row diverges from
+            # `last_synced_hash` and never restarts; it is the starvation
+            # cap's anchor (§20.2's "dirty_since does NOT restart").
+            dirty_since = row["dirty_since"] if row["dirty_since"] is not None else now
             await run_in_threadpool(
                 db.execute, TABLE,
-                "UPDATE {table} SET sha256 = :sha256, scanned_at = :now WHERE relpath = :relpath",
-                {"sha256": digest, "now": now, "relpath": relpath},
+                "UPDATE {table} SET sha256 = :sha256, scanned_at = :now, pending_hash = :digest, "
+                "pending_since = :now, dirty_since = :dirty_since WHERE relpath = :relpath",
+                {"sha256": digest, "digest": digest, "now": now, "dirty_since": dirty_since, "relpath": relpath},
             )
             continue
 
-        if now - (row["scanned_at"] or 0) < DEBOUNCE_SECONDS:
-            continue  # same hash observed, but not quiet for long enough yet
+        # §20.2 rule 3 — stable pending hash: upload iff the quiet period
+        # has elapsed, or (§20.2's starvation cap) the row has been
+        # continuously dirty past its cap. §20.5: the rule a configured
+        # prefix doesn't match, or no `quiet_rules` at all, resolves to the
+        # pre-§20 debounce, uncapped — byte-identical to today.
+        quiet_seconds, cap_seconds = _resolve_quiet_rule(relpath, rules)
+        pending_since = row["pending_since"] if row["pending_since"] is not None else now
+        dirty_since = row["dirty_since"] if row["dirty_since"] is not None else pending_since
+        quiet_elapsed = now - pending_since >= quiet_seconds
+        cap_fired = cap_seconds > 0 and now - dirty_since >= cap_seconds
+        if not (quiet_elapsed or cap_fired):
+            continue  # stable pending hash, but not quiet (or capped) long enough yet
 
         if upload_remaining <= 0:
             continue
@@ -1027,7 +1144,8 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
         await run_in_threadpool(
             db.execute, TABLE,
             "UPDATE {table} SET status = :status, external_id = :external_id, "
-            "last_synced_hash = :hash, origin = :origin, error = NULL, updated_at = :now "
+            "last_synced_hash = :hash, origin = :origin, error = NULL, updated_at = :now, "
+            "pending_hash = NULL, pending_since = NULL, dirty_since = NULL "
             "WHERE relpath = :relpath",
             {
                 "status": bulk_ingest.STATUS_UPLOADED,
@@ -1137,29 +1255,47 @@ async def _mark_missing_as_deleted(
     return marked
 
 
-def status(db) -> dict:
+def status(db, quiet_rules: str | None = None) -> dict:
     """A cheap journal-only snapshot for the CLI `status` subcommand —
-    same no-network-call contract as `bulk_ingest.status`."""
+    same no-network-call contract as `bulk_ingest.status`.
+
+    §20.7 — `quiet_rules` (the raw `sync_quiet_rules` config string,
+    threaded through from `routes.py`) adds `holding` (rows currently
+    mid-hold — `pending_hash` set, not yet eligible to upload), the
+    parsed, effective `quiet_rules`, and `quiet_rules_invalid` (any entry
+    that failed to parse — a typo must be visible here, not silently
+    disable the feature). Without these, "held for 3h" and "silently
+    broken" are indistinguishable from the operator's seat."""
     bulk_ingest._ensure_table(db)
     rows = db.execute(
-        TABLE, "SELECT relpath, last_synced_hash, missing_scans, pending_delete FROM {table}",
+        TABLE, "SELECT relpath, last_synced_hash, missing_scans, pending_delete, pending_hash FROM {table}",
     )
     synced = sum(1 for r in rows if r[1] is not None)
     missing_tracked = sum(1 for r in rows if (r[2] or 0) > 0)
     pending_delete = sum(1 for r in rows if r[3])
+    holding = sum(1 for r in rows if r[4] is not None)
+    rules, invalid = parse_quiet_rules(quiet_rules)
     return {
         "bucket": bulk_ingest.BUCKET,
         "journal_rows": len(rows),
         "synced": synced,
         "missing_tracked": missing_tracked,
         "pending_delete": pending_delete,
+        "holding": holding,
+        "quiet_rules": [
+            {"prefix": r.prefix, "quiet_seconds": r.quiet_seconds, "cap_seconds": r.cap_seconds}
+            for r in rules
+        ],
+        "quiet_rules_invalid": invalid,
         "table": TABLE,
     }
 
 
-def report(db) -> dict:
+def report(db, quiet_rules: str | None = None) -> dict:
     """The §3/§7 deliverable report — per-subtree synced/missing/pending-
-    delete counts plus totals, mirroring `bulk_ingest.report`'s shape."""
+    delete counts plus totals, mirroring `bulk_ingest.report`'s shape.
+    §20.7 adds per-subtree `holding` (same `pending_hash IS NOT NULL`
+    definition as `status()`)."""
     bulk_ingest._ensure_table(db)
     subtrees: dict[str, dict] = {}
     for subtree in bulk_ingest._discovered_subtrees(bulk_ingest.kb_root()):
@@ -1169,7 +1305,8 @@ def report(db) -> dict:
             "COUNT(*) AS total, "
             "SUM(CASE WHEN last_synced_hash IS NOT NULL THEN 1 ELSE 0 END) AS synced, "
             "SUM(CASE WHEN missing_scans > 0 THEN 1 ELSE 0 END) AS missing_tracked, "
-            "SUM(CASE WHEN pending_delete = 1 THEN 1 ELSE 0 END) AS pending_delete "
+            "SUM(CASE WHEN pending_delete = 1 THEN 1 ELSE 0 END) AS pending_delete, "
+            "SUM(CASE WHEN pending_hash IS NOT NULL THEN 1 ELSE 0 END) AS holding "
             "FROM {table} WHERE relpath LIKE :prefix",
             {"prefix": f"{subtree}/%"},
         )
@@ -1179,6 +1316,7 @@ def report(db) -> dict:
             "synced": row[1] or 0,
             "missing_tracked": row[2] or 0,
             "pending_delete": row[3] or 0,
+            "holding": row[4] or 0,
         }
     totals: dict[str, int] = {}
     for b in subtrees.values():

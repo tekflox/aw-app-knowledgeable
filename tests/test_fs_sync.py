@@ -143,23 +143,31 @@ def _journal_rows(db: _FakeDb) -> list[dict]:
 def _seed_uploaded(db: _FakeDb, relpath: str, *, sha256: str = "abc", external_id: str = "doc-1",
                    last_synced_hash: str | None = None, missing_scans: int = 0,
                    pending_delete: int = 0, restore_suppressed: int = 0,
-                   scanned_at: float | None = None) -> None:
+                   scanned_at: float | None = None,
+                   pending_hash: str | None = None, pending_since: float | None = None,
+                   dirty_since: float | None = None) -> None:
     """Seed one already-synced journal row directly — the no-wipe
     bootstrap's shape (§8's 2,046 rows): `status=uploaded`, a real
-    `external_id`, and (after the §3.2 backfill) `last_synced_hash`."""
+    `external_id`, and (after the §3.2 backfill) `last_synced_hash`.
+
+    §20's three columns default to NULL (not currently held) exactly like
+    a column the ALTER just added — pass them explicitly only when a test
+    needs to model a row already mid-hold."""
     bulk_ingest._ensure_table(db)
     now = scanned_at if scanned_at is not None else time.time()
     db.execute(
         fs_sync.TABLE,
         "INSERT INTO {table} (relpath, sha256, bucket, status, external_id, scanned_at, updated_at, "
-        "missing_scans, pending_delete, last_synced_hash, restore_suppressed) "
+        "missing_scans, pending_delete, last_synced_hash, restore_suppressed, "
+        "pending_hash, pending_since, dirty_since) "
         "VALUES (:relpath, :sha256, :bucket, :status, :external_id, :now, :now, :missing, :pending, "
-        ":last_synced, :suppressed)",
+        ":last_synced, :suppressed, :pending_hash, :pending_since, :dirty_since)",
         {
             "relpath": relpath, "sha256": sha256, "bucket": "main", "status": bulk_ingest.STATUS_UPLOADED,
             "external_id": external_id, "now": now, "missing": missing_scans, "pending": pending_delete,
             "last_synced": last_synced_hash if last_synced_hash is not None else sha256,
             "suppressed": restore_suppressed,
+            "pending_hash": pending_hash, "pending_since": pending_since, "dirty_since": dirty_since,
         },
     )
 
@@ -354,13 +362,15 @@ def test_edit_after_debounce_puts_by_path_with_base_hash_and_keeps_external_id(
     root = bulk_ingest.kb_root()
     _write(root, "authored/note.md", "new body")
     # The PREVIOUS tick already observed this exact (new) content and
-    # recorded it in `sha256` — `last_synced_hash` is still the stale,
-    # server-confirmed value, and `scanned_at` is far enough in the past
-    # that THIS tick's debounce check passes.
+    # started its quiet window (`pending_hash`/`pending_since`) —
+    # `last_synced_hash` is still the stale, server-confirmed value, and
+    # `pending_since` is far enough in the past that THIS tick's quiet
+    # check passes (no `quiet_rules` kwarg below → the built-in 30s).
     current_digest = hashlib.sha256(b"new body").hexdigest()
     _seed_uploaded(
         db, "authored/note.md", sha256=current_digest, external_id="doc-42",
         last_synced_hash="old-hash", scanned_at=time.time() - 100,
+        pending_hash=current_digest, pending_since=time.time() - 100, dirty_since=time.time() - 100,
     )
 
     calls = []
@@ -715,10 +725,11 @@ def test_adopted_path_whose_file_exists_converges_to_a_normal_synced_row(
     assert row1["sha256"] == hashlib.sha256(b"adopted body").hexdigest()
     assert row1["external_id"] is None
 
-    # Elapse the debounce window, then tick 2 uploads — `external_id`/
+    # Elapse the quiet window, then tick 2 uploads — `external_id`/
     # `last_synced_hash` land from the PUT response, never a second read.
+    # `pending_since`/`dirty_since` are §20's clock now, not `scanned_at`.
     db.execute(
-        fs_sync.TABLE, "UPDATE {table} SET scanned_at = :t WHERE relpath = :r",
+        fs_sync.TABLE, "UPDATE {table} SET pending_since = :t, dirty_since = :t WHERE relpath = :r",
         {"t": time.time() - 100, "r": "notion/adopted.md"},
     )
 
@@ -1291,7 +1302,10 @@ def test_filesystem_wins_conflict_then_upload_sends_the_stale_base_hash_that_rec
     local_digest = hashlib.sha256(local_content).hexdigest()
     _seed_uploaded(
         db, "authored/note.md", sha256=local_digest, last_synced_hash="base-hash",
-        external_id="doc-42", scanned_at=time.time() - 100,  # debounce already satisfied
+        external_id="doc-42", scanned_at=time.time() - 100,
+        # quiet window already satisfied — §20's pending_hash/pending_since,
+        # not scanned_at, is what the found-loop checks now.
+        pending_hash=local_digest, pending_since=time.time() - 100, dirty_since=time.time() - 100,
     )
 
     remote_hash = "the-losing-remote-hash"
@@ -1862,3 +1876,367 @@ def test_restore_reconcile_catchup_retries_after_a_failed_documents_fetch(
     result2 = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
     assert result2["restore_reconciled"] == 1
     assert fs_sync._restore_reconcile_done(db) is True
+
+
+# ---------------------------------------------------------------------------
+# §20 — per-prefix quiet period before upsync. docs/design/
+# aw-knowledgeable-fs-sync.md §20.9's acceptance gates, one test (or group)
+# per bullet. The parser tests need no fixtures (pure function); the
+# found-loop tests reuse this module's existing `_seed_uploaded`/`_run`
+# harness, now extended with `pending_hash`/`pending_since`/`dirty_since`.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_quiet_rules_defaults_cap_to_four_times_quiet():
+    rules, invalid = fs_sync.parse_quiet_rules("notion/=10800")
+    assert invalid == []
+    assert len(rules) == 1
+    assert rules[0].prefix == "notion/"
+    assert rules[0].quiet_seconds == 10800
+    assert rules[0].cap_seconds == 43200  # QUIET_CAP_MULTIPLIER = 4
+
+
+def test_parse_quiet_rules_explicit_cap_and_zero_disables_it():
+    rules, invalid = fs_sync.parse_quiet_rules("notion/=100:50,authored/=10:0")
+    assert invalid == []
+    by_prefix = {r.prefix: r for r in rules}
+    assert by_prefix["notion/"].cap_seconds == 50
+    assert by_prefix["authored/"].cap_seconds == 0  # explicit 0 disables the cap for this rule
+
+
+def test_parse_quiet_rules_sorts_longest_prefix_first_regardless_of_declaration_order():
+    rules_a, _ = fs_sync.parse_quiet_rules("notion/=100,notion/kanban/=50")
+    rules_b, _ = fs_sync.parse_quiet_rules("notion/kanban/=50,notion/=100")
+    assert [r.prefix for r in rules_a] == ["notion/kanban/", "notion/"]
+    assert [r.prefix for r in rules_b] == ["notion/kanban/", "notion/"]
+
+
+def test_parse_quiet_rules_skips_malformed_entries_but_keeps_valid_ones():
+    """The optional-config-gated-paths lesson: a typo must not silently
+    disable the whole feature — the valid rules in the same string still
+    apply, and the broken ones are reported back for `status()` to surface
+    as `quiet_rules_invalid`."""
+    rules, invalid = fs_sync.parse_quiet_rules(
+        "notion/=10800, not-a-rule, authored/=abc, cli_reference/=60"
+    )
+    assert {r.prefix for r in rules} == {"notion/", "cli_reference/"}
+    assert set(invalid) == {"not-a-rule", "authored/=abc"}
+
+
+def test_parse_quiet_rules_empty_or_none_resolves_to_the_default_rule_everywhere():
+    for raw in (None, "", "   "):
+        rules, invalid = fs_sync.parse_quiet_rules(raw)
+        assert rules == []
+        assert invalid == []
+        assert fs_sync._resolve_quiet_rule("anything/at/all.md", rules) == fs_sync._DEFAULT_QUIET_RULE
+
+
+def test_resolve_quiet_rule_longest_prefix_wins_and_unmatched_falls_back_to_default():
+    rules, _ = fs_sync.parse_quiet_rules("notion/=100,notion/kanban/=50")
+    assert fs_sync._resolve_quiet_rule("notion/kanban/card.md", rules) == (50.0, 200.0)
+    assert fs_sync._resolve_quiet_rule("notion/other.md", rules) == (100.0, 400.0)
+    assert fs_sync._resolve_quiet_rule("cli_reference/x.md", rules) == fs_sync._DEFAULT_QUIET_RULE
+
+
+def test_quiet_window_restarts_pending_since_but_never_dirty_since_on_a_further_edit(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§20.2 rule 2 — a file edited again while already mid-hold restarts
+    `pending_since` (a card that keeps churning must never reach a stale
+    quiet window on its old content), but `dirty_since` — the starvation
+    cap's anchor — must NOT restart; it only ever gets set once, on the
+    row's first divergence from `last_synced_hash`."""
+    root = bulk_ingest.kb_root()
+    old_dirty_since = time.time() - 5000
+    _write(root, "notion/card.md", "second edit")
+    digest2 = hashlib.sha256(b"second edit").hexdigest()
+    _seed_uploaded(
+        db, "notion/card.md", sha256="first-edit-hash", last_synced_hash="synced-hash",
+        external_id="doc-1", pending_hash="first-edit-hash",
+        pending_since=time.time() - 4000, dirty_since=old_dirty_since,
+    )
+
+    called = []
+    monkeypatch.setattr(
+        client, "put_document_by_path",
+        lambda *a, **k: called.append(1) or _async({"id": "doc-1", "outcome": "updated", "content_hash": "x"}, None),
+    )
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=10800"))
+
+    assert result["blocked"] is False
+    assert called == []  # the new edit restarts the window — no upload yet
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/card.md")
+    assert row["pending_hash"] == digest2
+    assert row["pending_since"] > time.time() - 10  # just restarted
+    assert row["dirty_since"] == old_dirty_since  # never restarts
+
+
+def test_configured_quiet_period_governs_over_the_built_in_default(
+    _workspace_home, db, lease, monkeypatch
+):
+    """Proves the CONFIGURED rule actually governs, not merely that some
+    rule eventually elapses: 60s held is well past the built-in 30s
+    default but short of the configured 100s quiet for `notion/`."""
+    root = bulk_ingest.kb_root()
+    content = b"a card held past the default debounce"
+    _write(root, "notion/held.md", content.decode())
+    digest = hashlib.sha256(content).hexdigest()
+    _seed_uploaded(
+        db, "notion/held.md", sha256=digest, last_synced_hash="old-hash", external_id="doc-9",
+        pending_hash=digest, pending_since=time.time() - 60, dirty_since=time.time() - 60,
+    )
+
+    called = []
+    monkeypatch.setattr(
+        client, "put_document_by_path",
+        lambda *a, **k: called.append(1) or _async({"id": "doc-9", "outcome": "updated", "content_hash": "x"}, None),
+    )
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=100"))
+
+    assert result["blocked"] is False
+    assert called == []  # still mid-hold under the configured 100s rule
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/held.md")
+    assert row["pending_hash"] == digest  # untouched — still held
+
+
+def test_upload_fires_once_the_configured_quiet_period_elapses(
+    _workspace_home, db, lease, monkeypatch
+):
+    root = bulk_ingest.kb_root()
+    content = b"a quiet card"
+    _write(root, "notion/quiet.md", content.decode())
+    digest = hashlib.sha256(content).hexdigest()
+    _seed_uploaded(
+        db, "notion/quiet.md", sha256=digest, last_synced_hash="old-hash", external_id="doc-9",
+        pending_hash=digest, pending_since=time.time() - 150, dirty_since=time.time() - 150,
+    )
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        return {"id": "doc-9", "rev": 2, "content_hash": "new-hash", "outcome": "updated"}, None
+
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=100"))
+
+    assert result["blocked"] is False
+    assert result["updated"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/quiet.md")
+    assert row["pending_hash"] is None
+    assert row["pending_since"] is None
+    assert row["dirty_since"] is None
+    assert row["last_synced_hash"] == "new-hash"
+
+
+def test_starvation_cap_fires_despite_a_quiet_window_that_has_not_elapsed(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§20.2's starvation cap: a file that keeps changing never reaches a
+    quiet window on its own, but a cap-fire uploads it anyway once
+    `dirty_since` is older than the cap — even though `pending_since`
+    (restarted by the last edit) is nowhere near its own quiet elapse."""
+    root = bulk_ingest.kb_root()
+    content = b"the state the hot card happens to be in right now"
+    _write(root, "notion/hot.md", content.decode())
+    digest = hashlib.sha256(content).hexdigest()
+    _seed_uploaded(
+        db, "notion/hot.md", sha256=digest, last_synced_hash="base-hash", external_id="doc-5",
+        pending_hash=digest, pending_since=time.time() - 5,  # quiet (100s) nowhere near elapsed
+        dirty_since=time.time() - 200,  # continuously dirty well past the 100s cap
+    )
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        return {"id": "doc-5", "rev": 7, "content_hash": "new-hash", "outcome": "updated"}, None
+
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=100:100"))
+
+    assert result["blocked"] is False
+    assert result["updated"] == 1  # cap-fire — quiet never elapsed on its own
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/hot.md")
+    assert row["pending_hash"] is None  # a confirmed upload clears the hold like any other
+
+
+def test_edit_that_reverts_to_the_synced_hash_clears_the_hold(_workspace_home, db, lease):
+    """§20.2 rule 1's second clause: an edit that reverts to the
+    last-synced content cancels its own hold rather than leaving a stale
+    `pending_hash` around forever (or uploading a no-op)."""
+    root = bulk_ingest.kb_root()
+    content = b"back to the synced content"
+    digest = hashlib.sha256(content).hexdigest()
+    _write(root, "notion/reverted.md", content.decode())
+    _seed_uploaded(
+        db, "notion/reverted.md", sha256="some-intermediate-hash", last_synced_hash=digest,
+        external_id="doc-3", pending_hash="some-intermediate-hash",
+        pending_since=time.time() - 10, dirty_since=time.time() - 500,
+    )
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["unchanged"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/reverted.md")
+    assert row["pending_hash"] is None
+    assert row["pending_since"] is None
+    assert row["dirty_since"] is None
+
+
+def test_downsync_write_clears_a_pending_upload_hold(_workspace_home, db, lease, monkeypatch):
+    """§20.2: 'a successful downsync write clears the hold naturally (it
+    sets last_synced_hash to the new content → rule 1 next scan)' — an
+    `authored/` file mid-upload-hold whose pull-pass conflict the remote
+    side wins must not leave a stale `pending_hash` behind once the file
+    is overwritten."""
+    import os
+
+    root = bulk_ingest.kb_root()
+    local_content = b"a stale local edit, mid quiet-hold"
+    _write(root, "authored/note.md", local_content.decode())
+    old_time = time.time() - 1000
+    os.utime(root / "authored/note.md", (old_time, old_time))
+    local_digest = hashlib.sha256(local_content).hexdigest()
+    _seed_uploaded(
+        db, "authored/note.md", sha256=local_digest, last_synced_hash="base-hash", external_id="doc-42",
+        pending_hash=local_digest, pending_since=time.time() - 50, dirty_since=time.time() - 50,
+    )
+
+    remote_content = b"the newer remote edit that wins"
+    remote_hash = hashlib.sha256(remote_content).hexdigest()
+
+    async def fake_changes(since=None, limit=200):
+        return {
+            "changes": [{
+                "external_id": "doc-42", "source_path": "authored/note.md",
+                "rev": 3, "content_hash": remote_hash, "sync_status": None,
+                "updated_at": _iso(time.time()),
+            }],
+            "cursor": "cursor-1",
+        }, None
+
+    async def fake_content(external_id):
+        return remote_content, None
+
+    monkeypatch.setattr(client, "get_document_changes", fake_changes)
+    monkeypatch.setattr(client, "get_document_content", fake_content)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["authored_written"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "authored/note.md")
+    assert row["last_synced_hash"] == remote_hash
+    assert row["pending_hash"] is None
+    assert row["pending_since"] is None
+    assert row["dirty_since"] is None
+
+
+def test_unmatched_prefix_keeps_the_built_in_30s_debounce(_workspace_home, db, lease, monkeypatch):
+    root = bulk_ingest.kb_root()
+    content = b"an authored file, no configured rule covers it"
+    _write(root, "authored/plain.md", content.decode())
+    digest = hashlib.sha256(content).hexdigest()
+    _seed_uploaded(
+        db, "authored/plain.md", sha256=digest, last_synced_hash="old-hash", external_id="doc-1",
+        pending_hash=digest, pending_since=time.time() - 40, dirty_since=time.time() - 40,
+    )
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        return {"id": "doc-1", "rev": 2, "content_hash": "new-hash", "outcome": "updated"}, None
+
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    # Only notion/ is configured — authored/ matches nothing, so it must
+    # still use the built-in 30s rather than going unbounded.
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=10800"))
+
+    assert result["blocked"] is False
+    assert result["updated"] == 1  # 40s > the built-in 30s default
+
+
+def test_status_reports_holding_quiet_rules_and_invalid_entries(_workspace_home, db):
+    bulk_ingest.kb_root().mkdir(parents=True, exist_ok=True)
+    _seed_uploaded(
+        db, "notion/held.md", sha256="h1", last_synced_hash="old",
+        pending_hash="h1", pending_since=time.time(), dirty_since=time.time(),
+    )
+    _seed_uploaded(db, "notion/synced.md", sha256="h2", last_synced_hash="h2")
+
+    payload = fs_sync.status(db, "notion/=10800, garbage-entry")
+
+    assert payload["holding"] == 1
+    assert payload["quiet_rules"] == [
+        {"prefix": "notion/", "quiet_seconds": 10800.0, "cap_seconds": 43200.0}
+    ]
+    assert payload["quiet_rules_invalid"] == ["garbage-entry"]
+
+
+def test_report_gains_per_subtree_holding(_workspace_home, db):
+    bulk_ingest.kb_root().mkdir(parents=True, exist_ok=True)
+    _seed_uploaded(
+        db, "notion/held.md", sha256="h1", last_synced_hash="old",
+        pending_hash="h1", pending_since=time.time(), dirty_since=time.time(),
+    )
+    _seed_uploaded(db, "notion/synced.md", sha256="h2", last_synced_hash="h2")
+
+    payload = fs_sync.report(db, None)
+
+    assert payload["subtrees"]["notion"]["holding"] == 1
+    assert payload["totals"]["holding"] == 1
+
+
+def test_bulk_ingest_scan_stomping_scanned_at_does_not_reset_the_quiet_window(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§20.9's load-bearing gate. `bulk_ingest.scan()` runs inside the
+    "KB bulk-ingest — tick" scheduled task every 15 minutes in production
+    and upserts every row not yet `status` uploaded/skipped — stomping
+    `sha256`/`scanned_at` even on a row this engine is mid-hold on
+    (`bulk_ingest.py`'s own `ON CONFLICT ... DO UPDATE SET sha256 =
+    excluded.sha256, ..., scanned_at = excluded.scanned_at`;
+    `pending_hash`/`pending_since`/`dirty_since` are NOT in that SET
+    clause, so they survive the stomp untouched). Anchoring the quiet
+    clock on `scanned_at` instead would make the window never elapse
+    under this stomp, in production, forever.
+
+    PROOF THIS TEST IS REAL (§20.9's gate, run by hand — not part of what
+    CI enforces): `git stash` the fs_sync.py found-loop fix and re-run —
+    pre-fix the only timing check is `now - row["scanned_at"] <
+    DEBOUNCE_SECONDS`, and `scanned_at` was just reset to "now" by the
+    `scan()` call below, so the row never uploads and this test goes RED."""
+    root = bulk_ingest.kb_root()
+    content = b"a notion card mid-3h-hold"
+    _write(root, "notion/held.md", content.decode())
+    digest = hashlib.sha256(content).hexdigest()
+    pending_since = time.time() - 10800  # exactly notion/'s quiet period, just elapsed
+    bulk_ingest._ensure_table(db)
+    db.execute(
+        fs_sync.TABLE,
+        "INSERT INTO {table} (relpath, sha256, bucket, status, scanned_at, updated_at, "
+        "missing_scans, pending_delete, pending_hash, pending_since, dirty_since) "
+        "VALUES (:relpath, :sha256, :bucket, :status, :since, :since, 0, 0, :sha256, :since, :since)",
+        {
+            "relpath": "notion/held.md", "sha256": digest, "bucket": "main",
+            "status": bulk_ingest.STATUS_PENDING, "since": pending_since,
+        },
+    )
+
+    # The scheduled bulk-ingest tick, run separately — it is NOT part of
+    # fs_sync.run_tick, but it runs on the SAME journal table every 15
+    # minutes in production. This row is still status='pending' (never
+    # uploaded), so scan()'s own frozen-row guard does NOT protect it.
+    bulk_ingest.scan(db)
+    row_after_scan = next(r for r in _journal_rows(db) if r["relpath"] == "notion/held.md")
+    assert row_after_scan["scanned_at"] > pending_since + 1000  # genuinely stomped
+    assert row_after_scan["pending_since"] == pending_since  # untouched by scan()
+
+    async def fake_put(filename, raw, *, source_path, workspace_slug, base_hash=None, title=None):
+        return {"id": "doc-new", "rev": 1, "content_hash": digest, "outcome": "created"}, None
+
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw", quiet_rules="notion/=10800"))
+
+    assert result["blocked"] is False
+    assert result["created"] == 1  # the quiet window elapsed despite the stomp

@@ -85,6 +85,24 @@
           }
         ],
         "enabled": false
+      },
+      {
+        "name": "KB fs-sync — tick",
+        "type": "agentic_output",
+        "command": "aw-workspace-cli knowledgeable-sync run",
+        "notify_exit_codes": [
+          1
+        ],
+        "agent_slug": "coder-sonnet",
+        "prompt": "The `KB fs-sync — tick` task (docs/design/aw-knowledgeable-fs-sync.md §3/§7/§20) just exited non-zero. Run `aw-workspace-cli knowledgeable-sync status` and read the command's own stderr above to tell which case this is: (1) the §6 workspace_slug refusal — AW_WORKSPACE is unset, a real config gap, open a blocker; (2) another fs-sync tick already in progress — expected under overlap, just note it; (3) the §7 mass-delete valve tripped — check `status` for `valve_tripped` and the tree before approving anything in the UI, this is the one that protects the corpus, do not clear it yourself. A §20 per-prefix quiet period holding uploads (`holding` in `status`) is NOT a failure and never produces a non-zero exit on its own. Report which case, and only open a blocker for (1) or an unexplained (3).",
+        "reuse_session": false,
+        "schedules": [
+          {
+            "kind": "cron",
+            "expr": "*/15 * * * *"
+          }
+        ],
+        "enabled": false
       }
     ],
     "knowledge": {
@@ -131,6 +149,12 @@
         "default": true,
         "title": "Require workspace identity on every route",
         "description": "Must be set to false for GET /keys/{slot} (docs/design/knowledgeable-apmt-key-pull-through.md) to answer production aw-knowledgeable, which holds no workspace session or API key \u2014 only the shared X-Internal-Secret. This flag is app-wide, not per-route, so every OTHER route in routes.py carries its own explicit _require_identity dependency to stay protected once this is false; do not add a new route here without the same guard."
+      },
+      "sync_quiet_rules": {
+        "type": "string",
+        "default": "notion/=10800",
+        "title": "Sync quiet periods",
+        "description": "docs/design/aw-knowledgeable-fs-sync.md \u00a720. Comma- or newline-separated rules `prefix=quiet_seconds[:max_hold_seconds]`. A changed file under `prefix` uploads only once its content has been unchanged for quiet_seconds; max_hold (default 4\u00d7 quiet, 0 = unlimited) syncs it anyway if it has been continuously changing that long. Longest matching prefix wins. Paths matching no rule keep the built-in 30s debounce. A malformed entry is skipped and surfaced as quiet_rules_invalid in GET /fs-sync/status rather than silently disabling the feature."
       }
     },
     "required": []

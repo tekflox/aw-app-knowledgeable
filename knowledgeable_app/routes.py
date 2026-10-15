@@ -234,7 +234,12 @@ def build_routes(ctx) -> FastAPI:
     @app.post("/fs-sync/run", dependencies=[Depends(_require_identity)])
     async def fs_sync_run(data: dict = Body(default={})) -> dict:
         max_uploads = data.get("max_uploads")
-        kwargs = {"workspace_slug": workspace_env("AW_WORKSPACE")}
+        kwargs = {
+            "workspace_slug": workspace_env("AW_WORKSPACE"),
+            # §20.5 — the single config seam: absent (None) behaves exactly
+            # as before this amendment (30s debounce everywhere).
+            "quiet_rules": ctx.config.get("sync_quiet_rules"),
+        }
         if max_uploads is not None:
             kwargs["max_uploads"] = int(max_uploads)
         result = await fs_sync.run_tick(ctx.db, ctx.state.lease, **kwargs)
@@ -248,13 +253,13 @@ def build_routes(ctx) -> FastAPI:
 
     @app.get("/fs-sync/status", dependencies=[Depends(_require_identity)])
     async def fs_sync_status() -> dict:
-        payload = await run_in_threadpool(fs_sync.status, ctx.db)
+        payload = await run_in_threadpool(fs_sync.status, ctx.db, ctx.config.get("sync_quiet_rules"))
         payload["valve_tripped"] = await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME)
         return payload
 
     @app.get("/fs-sync/report", dependencies=[Depends(_require_identity)])
     async def fs_sync_report() -> dict:
-        return await run_in_threadpool(fs_sync.report, ctx.db)
+        return await run_in_threadpool(fs_sync.report, ctx.db, ctx.config.get("sync_quiet_rules"))
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

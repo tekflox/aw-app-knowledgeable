@@ -197,6 +197,18 @@ _SYNC_COLUMNS: tuple[tuple[str, str], ...] = (
     # re-marks it two ticks later — the decline/re-mark nag loop §18.2 exists
     # to close.
     ("restore_suppressed", "INTEGER NOT NULL DEFAULT 0"),
+    # §20.2 — the per-prefix quiet-period clock, in columns ONLY fs_sync.py
+    # ever writes. Load-bearing: this table's OWN `scan()` upsert below
+    # stomps `sha256`/`scanned_at` on every row not yet `status`
+    # uploaded/skipped — every 15 minutes in production — so a quiet clock
+    # anchored on either would reset forever on a never-yet-uploaded row.
+    # `pending_hash` is the content hash currently being held (restarts
+    # `pending_since` on every new hash); `dirty_since` is when the row
+    # FIRST diverged from `last_synced_hash` and never restarts — the
+    # starvation cap's anchor. All three NULL means "not currently held."
+    ("pending_hash", "TEXT"),
+    ("pending_since", "DOUBLE PRECISION"),
+    ("dirty_since", "DOUBLE PRECISION"),
 )
 
 #: Mirrors aw-knowledgeable's own cap (`backend/app/api/documents.py`'s
