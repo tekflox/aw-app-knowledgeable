@@ -69,6 +69,24 @@ FS_SYNC_VALVE_KV_NAME = "fs_sync_valve_tripped"
 FS_SYNC_VALVE_KV_TTL = 60 * 60 * 24 * 30
 
 
+def _caller_actor(request: Request) -> str:
+    """Best-effort "who did this" for the pending-deletion audit trail
+    (docs/design/aw-knowledgeable-fs-sync.md §7 approval). `x-aw-caller-agent`
+    / `x-aw-caller-run-id` are the headers aw-mcp-gateway's `HttpUpstream`
+    attaches to every forwarded tool call (`gateway/upstream.py`'s
+    `_client_headers`) — present whenever this route is reached through the
+    gateway, which is every agent call. A direct, non-gateway caller carries
+    neither, so this falls back to the authenticated identity `_require_identity`
+    already proved is real, rather than silently going blank — exactly the
+    "no record of who cleared it" gap this audit trail exists to close."""
+    agent = request.headers.get("x-aw-caller-agent") or ""
+    run_id = request.headers.get("x-aw-caller-run-id") or ""
+    if agent or run_id:
+        return f"{agent or 'agent:?'} run={run_id or '?'}"
+    identity = request.scope.get("aw_identity")
+    return f"identity:{identity}" if identity else "unknown"
+
+
 def _require_identity(request: Request) -> None:
     """401 unless the framework's own ``IdentityGuard`` authenticated this
     caller (a signed-in workspace session, or the workspace API key) —
@@ -266,13 +284,14 @@ def build_routes(ctx) -> FastAPI:
     # ------------------------------------------------------------------
 
     @app.post("/mcp", dependencies=[Depends(_require_identity)])
-    async def mcp_post(data: dict | list = Body(...)):
+    async def mcp_post(request: Request, data: dict | list = Body(...)):
         from .mcp.http_handler import handle_request
 
+        actor = _caller_actor(request)
         messages = data if isinstance(data, list) else [data]
         responses = []
         for m in messages:
-            r = await handle_request(m)
+            r = await handle_request(m, db=ctx.db, actor=actor)
             if r is not None:
                 responses.append(r)
         if not responses:

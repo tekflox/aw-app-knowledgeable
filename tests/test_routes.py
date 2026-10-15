@@ -5,6 +5,7 @@ this one is worth its own test because /settings routes into a fake
 ctx.secrets, not the generic config path)."""
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +15,46 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import routes as routes_mod  # noqa: E402
+from knowledgeable_app import pending_deletions, routes as routes_mod  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_pending_deletion_table_flag(monkeypatch):
+    """Each test's `app_client`/`ungated_app_client` builds a brand new
+    `_FakeDb` — without resetting this module-level flag, the first test to
+    call approve/decline would set it forever and every later test's own
+    fresh `:memory:` db would never get `TABLE` created (same trap
+    `test_fs_sync.py`'s `_fresh_table_flag` guards against for
+    `bulk_ingest._table_ensured`)."""
+    monkeypatch.setattr(pending_deletions, "_table_ensured", False)
+
+
+class _FakeDb:
+    """Double for ``ctx.db`` — same shape as `test_fs_sync.py`/
+    `test_bulk_ingest.py`'s identical class, needed here now that
+    `mcp_post` threads `ctx.db` through to the pending-deletion audit
+    trail on every `/mcp` call, not just `tools/call` against those two
+    tools."""
+
+    def __init__(self) -> None:
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+    def create(self, name: str, columns_sql: str) -> str:
+        self._conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns_sql})")
+        self._conn.commit()
+        return name
+
+    def execute(self, name: str, sql: str, params: dict | None = None):
+        stmt = sql.replace("{table}", name)
+        cur = self._conn.execute(stmt, params or {})
+        if stmt.strip().lower().startswith("select"):
+            rows = cur.fetchall()
+            self._conn.commit()
+            return rows
+        self._conn.commit()
+        return cur
 
 
 class _FakeSecrets:
@@ -61,7 +100,7 @@ def app_client():
     removes the override to prove the gate is real.
     """
     ctx = SimpleNamespace(
-        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv())
+        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv()), db=_FakeDb()
     )
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
     app = routes_mod.build_routes(ctx)
@@ -155,7 +194,65 @@ def test_mcp_post_tools_list(app_client):
     resp = tc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert resp.status_code == 200
     tools = resp.json()["result"]["tools"]
-    assert len(tools) == 8
+    assert len(tools) == 11
+
+
+def test_mcp_post_threads_actor_and_db_into_approve_pending_deletions(app_client, monkeypatch):
+    """The new plumbing this card adds to `mcp_post`: `ctx.db` reaches the
+    audit trail, and the gateway's `x-aw-caller-*` headers become the
+    recorded actor — the exact gap the 12-to-zero-with-no-record incident
+    exposed."""
+    tc, ctx = app_client
+    tc.post("/settings", json={"service_secret": "topsecret"})
+
+    async def fake_pending(bucket=None):
+        return {"documents": [{"id": "doc-1", "source_path": "notion/a.md"}]}, None
+
+    async def fake_delete(node_id, *, bucket):
+        return True, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    resp = tc.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "approve_pending_deletions",
+                "arguments": {"bucket": "main", "path_prefix": "notion/", "expected_count": 1},
+            },
+        },
+        headers={"x-aw-caller-agent": "agent:coder-sonnet", "x-aw-caller-run-id": "run-42"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"]["isError"] is False
+
+    rows = [dict(r) for r in ctx.db.execute(pending_deletions.TABLE, "SELECT * FROM {table}")]
+    assert len(rows) == 1
+    assert rows[0]["actor"] == "agent:coder-sonnet run=run-42"
+    assert rows[0]["outcome"] == "ok"
+
+
+def test_mcp_post_actor_falls_back_to_unknown_without_gateway_headers(app_client, monkeypatch):
+    tc, ctx = app_client
+    tc.post("/settings", json={"service_secret": "topsecret"})
+
+    async def fake_pending(bucket=None):
+        return {"documents": []}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    resp = tc.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "decline_pending_deletions", "arguments": {"bucket": "main"}},
+        },
+    )
+    assert resp.status_code == 200
+    rows = [dict(r) for r in ctx.db.execute(pending_deletions.TABLE, "SELECT * FROM {table}")]
+    assert rows[0]["actor"] == "unknown"
 
 
 def test_mcp_json_endpoint(app_client):
@@ -240,7 +337,7 @@ def ungated_app_client():
     the shape a real deploy has until the real `IdentityGuard` (outside this
     sub-app) attaches `scope["aw_identity"]` for an authenticated caller."""
     ctx = SimpleNamespace(
-        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv())
+        secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv()), db=_FakeDb()
     )
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
     app = routes_mod.build_routes(ctx)

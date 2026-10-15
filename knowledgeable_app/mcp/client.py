@@ -296,16 +296,47 @@ async def get_document_changes(
     return await _get("/api/documents/changes", params)
 
 
-async def get_documents_pending_delete() -> tuple[dict | None, str | None]:
+async def get_documents_pending_delete(bucket: str | None = None) -> tuple[dict | None, str | None]:
     """GET /api/documents?pending_delete=1 (docs/design/aw-knowledgeable-
     fs-sync.md §18.4) — the server's currently-marked set, fetched once by
     the one-time `restore_reconcile_catchup_v1` pass to tell "restored
     through a channel the feed poll never saw" apart from "genuinely still
-    awaiting approval". No bucket/workspace scoping — the server's own
+    awaiting approval". `bucket` is optional — omitted, the server's own
     `resolve_search_scope` spans every bucket this service token can read,
-    matching the documents.py route's own contract. Response is
-    ``{documents: [{source_path, ...}]}``."""
-    return await _get("/api/documents", {"pending_delete": True})
+    matching the documents.py route's own contract; passed, it narrows to
+    just that bucket (the pending-deletion tools' own listing knob). Response
+    is ``{documents: [{source_path, ...}]}``."""
+    params: dict = {"pending_delete": True}
+    if bucket:
+        params["bucket"] = bucket
+    return await _get("/api/documents", params)
+
+
+async def delete_document(node_id: str, *, bucket: str) -> tuple[bool, str | None]:
+    """DELETE /api/documents/{node_id} (204, no body) — §7's approve half of
+    the two-phase delete: permanent, no undo. `bucket` travels as an explicit
+    query param, same `require_bucket_write` reasoning as every other
+    bucket-requiring call in this module (fs-sync-delete-mark-bucket-missing)
+    — omitted, the server resolves it to "the tenant's sole writable bucket",
+    which 400s the moment a second one exists."""
+    async with httpx.AsyncClient(timeout=30) as http_client:
+        try:
+            resp = await http_client.delete(
+                f"{base_url()}/api/documents/{node_id}", params={"bucket": bucket}, headers=_headers()
+            )
+        except httpx.HTTPError as exc:
+            return False, f"could not reach aw-knowledgeable at {base_url()}: {exc}"
+    if resp.status_code >= 400:
+        return False, _describe_error(resp)
+    return True, None
+
+
+async def restore_document(node_id: str, *, bucket: str) -> tuple[dict | None, str | None]:
+    """POST /api/documents/{node_id}/restore — §7's decline half of the
+    two-phase delete: clears a pending-delete mark, reversible. Same explicit
+    `bucket` query param as ``delete_document`` above — this route is gated
+    by `require_bucket_write` too."""
+    return await _post_json(f"/api/documents/{node_id}/restore", {}, params={"bucket": bucket})
 
 
 async def get_document_content(external_id: str) -> tuple[bytes | None, str | None]:
@@ -938,6 +969,115 @@ TOOLS_SCHEMA = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "list_pending_deletions",
+        "description": (
+            "List documents this connector's fs-sync engine has marked pending-delete "
+            "(docs/design/aw-knowledgeable-fs-sync.md §7's two-phase delete — a sync tick "
+            "only ever MARKS a document; nothing is removed until approve_pending_deletions "
+            "is called). Returns each document's id and source_path, plus a "
+            "prefix_breakdown grouping them by immediate parent directory (the same "
+            "grouping the approval UI uses) so you can see the shape of the queue before "
+            "scoping an approve or decline call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bucket": {
+                    "type": "string",
+                    "description": "Knowledge bucket to narrow this listing to. Omit to list every bucket your token can read.",
+                },
+            },
+        },
+    },
+    {
+        "name": "approve_pending_deletions",
+        "description": (
+            "Permanently delete a SCOPED, COUNTED subset of the pending-deletion queue — "
+            "the approval half of §7's two-phase delete. Requires `bucket` (require_bucket_write "
+            "has no cross-bucket mode) and at least one of `path_prefix`/`node_ids` to define "
+            "the scope — there is deliberately no 'approve everything pending'. `expected_count` "
+            "is REQUIRED: this tool lists the current pending-delete queue itself, computes "
+            "which documents match your scope, and refuses to delete anything — returning an "
+            "error instead, with nothing touched — if that count doesn't match `expected_count` "
+            "exactly. Call list_pending_deletions first, count what you mean to approve, then "
+            "pass that count here; it is the one safety net standing behind an irreversible "
+            "action. Every call, including a rejected one, is written to this connector's own "
+            "audit log (actor, timestamp, requested scope, resulting count) — there is no path "
+            "to clearing this queue that leaves no record of who did it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bucket": {"type": "string", "description": "Knowledge bucket to act in. Required."},
+                "path_prefix": {
+                    "type": "string",
+                    "description": (
+                        "Only documents whose source_path starts with this prefix. Composable "
+                        "with node_ids — when both are given a document must match both."
+                    ),
+                },
+                "node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Only these specific document ids. Composable with path_prefix — when "
+                        "both are given a document must match both."
+                    ),
+                },
+                "expected_count": {
+                    "type": "integer",
+                    "description": (
+                        "Exactly how many documents your scope should match right now. "
+                        "Required — a mismatch rejects the whole call and deletes nothing."
+                    ),
+                },
+            },
+            "required": ["bucket", "expected_count"],
+        },
+    },
+    {
+        "name": "decline_pending_deletions",
+        "description": (
+            "Restore a subset of the pending-deletion queue to normal — the reversible half "
+            "of §7's two-phase delete: a document stays in the graph and its pending-delete "
+            "mark clears. Requires `bucket`. Unlike approve, a scope is optional: omitting "
+            "both `path_prefix` and `node_ids` declines EVERY document pending-delete in this "
+            "bucket — safe because decline only restores, it never deletes. Pass "
+            "`expected_count` if you want the same mismatch check approve_pending_deletions "
+            "enforces (optional here, not required). Every call is written to this "
+            "connector's own audit log, same as approve."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bucket": {"type": "string", "description": "Knowledge bucket to act in. Required."},
+                "path_prefix": {
+                    "type": "string",
+                    "description": (
+                        "Only documents whose source_path starts with this prefix. Omit this "
+                        "AND node_ids to decline every pending document in this bucket."
+                    ),
+                },
+                "node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Only these specific document ids. Omit this AND path_prefix to "
+                        "decline every pending document in this bucket."
+                    ),
+                },
+                "expected_count": {
+                    "type": "integer",
+                    "description": (
+                        "Optional safety check — if given, the matched count must equal this "
+                        "or the call is rejected and nothing is restored."
+                    ),
+                },
+            },
+            "required": ["bucket"],
         },
     },
 ]

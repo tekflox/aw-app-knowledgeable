@@ -83,6 +83,10 @@ class _FakeAsyncClient:
         )
         return _FakeAsyncClient._QUEUE.pop(0)
 
+    async def delete(self, url, params=None, headers=None):
+        _FakeAsyncClient._CALLS.append({"method": "DELETE", "url": url, "params": params, "headers": headers})
+        return _FakeAsyncClient._QUEUE.pop(0)
+
 
 @pytest.fixture(autouse=True)
 def _fresh_fake_client(monkeypatch):
@@ -96,14 +100,17 @@ def _fresh_fake_client(monkeypatch):
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: "")
 
 
-def test_all_eight_tools_are_advertised_and_dispatchable():
+def test_all_eleven_tools_are_advertised_and_dispatchable():
     names = {t["name"] for t in client.TOOLS_SCHEMA}
     assert names == {
         "upload_document", "create_node", "create_link",
         "get_graph", "list_documents", "search_nodes", "search_graph",
-        "knowledge_search",
+        "knowledge_search", "list_pending_deletions", "approve_pending_deletions",
+        "decline_pending_deletions",
     }
-    assert names == set(http_handler._DISPATCH)
+    # approve/decline need `db` (the audit trail) so they dispatch through
+    # their own table — see http_handler.py's `_DISPATCH_WITH_DB` docstring.
+    assert names == set(http_handler._DISPATCH) | set(http_handler._DISPATCH_WITH_DB)
 
 
 def test_secret_is_resolved_per_call_not_captured_at_import():
@@ -486,6 +493,14 @@ _BUCKET_REQUIRING_WRITE_CALLS = [
         "mark_delete_by_path",
         lambda: client.mark_delete_by_path("notion/x.md", "aw", bucket="main"),
     ),
+    (
+        "delete_document",
+        lambda: client.delete_document("doc-1", bucket="main"),
+    ),
+    (
+        "restore_document",
+        lambda: client.restore_document("doc-1", bucket="main"),
+    ),
 ]
 
 
@@ -576,7 +591,7 @@ def test_initialize_and_tools_list():
     init = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
     assert init["result"]["serverInfo"]["name"] == "aw-knowledgeable"
     listed = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-    assert len(listed["result"]["tools"]) == 8
+    assert len(listed["result"]["tools"]) == 11
 
 
 def test_initialized_notification_gets_no_response():

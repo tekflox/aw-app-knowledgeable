@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from . import client
+from .. import pending_deletions
 
 log = logging.getLogger("aw_apps.knowledgeable")
 
@@ -27,6 +28,16 @@ _DISPATCH = {
     "search_nodes": client.search_nodes,
     "search_graph": client.search_graph,
     "knowledge_search": client.knowledge_search,
+    "list_pending_deletions": pending_deletions.list_pending_deletions,
+}
+
+#: approve/decline need `ctx.db` for the audit trail (module docstring of
+#: `pending_deletions.py`) — a second table because their handlers take
+#: `(args, db, actor)` rather than `_DISPATCH`'s uniform `(args)`, unlike
+#: every read-only/forwarding tool above.
+_DISPATCH_WITH_DB = {
+    "approve_pending_deletions": pending_deletions.approve_pending_deletions,
+    "decline_pending_deletions": pending_deletions.decline_pending_deletions,
 }
 
 _NO_SECRET = (
@@ -44,7 +55,10 @@ def _result(req_id, text: str, is_error: bool) -> dict:
     }
 
 
-async def handle_request(request: dict) -> dict | None:
+async def handle_request(request: dict, *, db=None, actor: str = "unknown") -> dict | None:
+    """``db``/``actor`` are only used by the two tools in
+    ``_DISPATCH_WITH_DB`` (the pending-deletion audit trail) — every other
+    caller of this function may omit them."""
     method = request.get("method", "")
     req_id = request.get("id")
 
@@ -73,7 +87,8 @@ async def handle_request(request: dict) -> dict | None:
     name = params.get("name", "")
     args = params.get("arguments") or {}
 
-    handler = _DISPATCH.get(name)
+    needs_db = name in _DISPATCH_WITH_DB
+    handler = _DISPATCH_WITH_DB.get(name) if needs_db else _DISPATCH.get(name)
     if not handler:
         return _result(req_id, f"Unknown tool: {name}", True)
 
@@ -81,7 +96,10 @@ async def handle_request(request: dict) -> dict | None:
         return _result(req_id, _NO_SECRET, True)
 
     try:
-        text, is_error = await handler(args)
+        if needs_db:
+            text, is_error = await handler(args, db, actor)
+        else:
+            text, is_error = await handler(args)
     except Exception as exc:  # noqa: BLE001 — last resort, must not 500 the route
         log.exception("knowledgeable MCP tool %s failed", name)
         return _result(req_id, f"{name} failed: {exc}", True)
