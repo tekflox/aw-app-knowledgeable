@@ -268,17 +268,29 @@ async def mark_delete_by_path(
 
 
 async def get_sync_paths(
-    workspace_slug: str, *, after: str | None = None, limit: int = 500
+    workspace_slug: str, *, after: str | None = None, limit: int = 500, bucket: str | None = None
 ) -> tuple[dict | None, str | None]:
     """GET /api/documents/sync-paths (§17.2) — paged, distinct
     `source_path` claims under the same slug-or-NULL filter as
     ``mark_delete_by_path``, including a path whose only claimant is
     already `pending_delete` (the §17.4 catch-up and this engine's own
     per-tick adoption both depend on seeing it). Response is
-    ``{paths: [{source_path, claimant_count}], cursor}``."""
+    ``{paths: [{source_path, claimant_count}], cursor}``.
+
+    `bucket` is the same explicit-not-implicit rule every other call in
+    this module already follows: the route sits behind
+    `require_bucket_read`, which 400s as ambiguous the moment this
+    tenant's service identity can see more than one bucket — silently
+    (caught as `err` by this call's one caller, `fs_sync._adopt_paths`),
+    which previously made adoption, GC and the restore-reconcile catch-up
+    all quietly no-op every tick (they all gate on `sync_paths_seen`).
+    Pass it; don't rely on the implicit single-bucket resolution a second
+    registered bucket breaks."""
     params: dict = {"workspace_slug": workspace_slug, "limit": limit}
     if after:
         params["after"] = after
+    if bucket:
+        params["bucket"] = bucket
     return await _get("/api/documents/sync-paths", params)
 
 

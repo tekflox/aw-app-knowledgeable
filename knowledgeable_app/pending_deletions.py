@@ -49,6 +49,7 @@ import uuid
 
 from fastapi.concurrency import run_in_threadpool
 
+from . import bulk_ingest
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.pending_deletions")
@@ -171,6 +172,49 @@ def _as_text(payload) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def _reconcile_journal_for_succeeded(db, matched: list[dict], succeeded: list[str]) -> int:
+    """Approving deletes the document on the aw-knowledgeable side, but
+    this connector's own fs-sync journal (`bulk_ingest.TABLE`) is a
+    separate table this call never otherwise touches — left to a later
+    tick's `fs_sync._gc_dead_pending_delete_rows`, a `pending_delete=1` row
+    could sit there indefinitely (the tick-level GC is a safety net, not
+    guaranteed to run promptly; see that function's own docstring). This
+    call already knows exactly which `node_id`s it just deleted, so it
+    reconciles the matching journal rows itself, in this same operation,
+    rather than deferring.
+
+    DELETE the row outright rather than merely clearing `pending_delete`:
+    the path is gone from disk (why it was marked) and the document is now
+    gone from the graph too, so a retained row with a dangling
+    `external_id` would have no reader — same choice `_gc_dead_pending_
+    delete_rows` already made for the identical situation.
+
+    Keyed on `(relpath, external_id)`, not `relpath` alone — if some other
+    writer re-claimed this exact path with a new document in the gap
+    between listing and deleting, that row's `external_id` no longer
+    matches the one just deleted, the `DELETE` matches zero rows, and the
+    new claimant's row is correctly left alone."""
+    succeeded_set = set(succeeded)
+    if not succeeded_set:
+        return 0
+    bulk_ingest._ensure_table(db)
+    cleared = 0
+    for doc in matched:
+        if doc["id"] not in succeeded_set:
+            continue
+        relpath = doc.get("source_path")
+        if not relpath:
+            continue
+        cursor = db.execute(
+            bulk_ingest.TABLE,
+            "DELETE FROM {table} WHERE relpath = :relpath AND external_id = :external_id",
+            {"relpath": relpath, "external_id": doc["id"]},
+        )
+        if (getattr(cursor, "rowcount", None) or 0) > 0:
+            cleared += 1
+    return cleared
+
+
 # ---------------------------------------------------------------------------
 # MCP tool bodies — dispatched from `mcp/http_handler.py`.
 # ---------------------------------------------------------------------------
@@ -254,13 +298,17 @@ async def approve_pending_deletions(args: dict, db, actor: str) -> tuple[str, bo
             failed.append({"id": doc["id"], "source_path": doc.get("source_path"), "error": call_err})
 
     outcome = "ok" if not failed else ("partial" if succeeded else "failed")
+    journal_reconciled = await run_in_threadpool(_reconcile_journal_for_succeeded, db, matched, succeeded)
     await run_in_threadpool(
         _record_audit, db, action="approve", actor=actor, bucket=bucket,
         path_prefix=path_prefix, node_ids=sorted_node_ids, expected_count=expected_count,
         matched_count=len(matched), succeeded_count=len(succeeded), failed_count=len(failed),
         outcome=outcome, detail=json.dumps({"succeeded": succeeded, "failed": failed}),
     )
-    payload = {"matched_count": len(matched), "approved": succeeded, "failed": failed, "outcome": outcome}
+    payload = {
+        "matched_count": len(matched), "approved": succeeded, "failed": failed, "outcome": outcome,
+        "journal_reconciled": journal_reconciled,
+    }
     return _as_text(payload), bool(failed)
 
 

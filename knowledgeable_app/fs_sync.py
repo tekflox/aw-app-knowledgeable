@@ -699,7 +699,9 @@ async def _adopt_paths(
     seen: set[str] = set()
     after: str | None = None
     while True:
-        data, err = await client.get_sync_paths(workspace_slug, after=after, limit=SYNC_PATHS_PAGE_LIMIT)
+        data, err = await client.get_sync_paths(
+            workspace_slug, after=after, limit=SYNC_PATHS_PAGE_LIMIT, bucket=bulk_ingest.BUCKET,
+        )
         if err:
             log.warning("fs_sync: adoption GET /sync-paths failed: %s", err)
             return adopted, None

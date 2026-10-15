@@ -100,7 +100,7 @@ def _no_adoptable_paths(monkeypatch):
     (failing) HTTP call to `GET /sync-paths`. Default: nothing to adopt.
     The tests that exercise adoption itself override this explicitly."""
 
-    async def fake_get_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_get_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {"paths": [], "cursor": None}, None
 
     monkeypatch.setattr(client, "get_sync_paths", fake_get_sync_paths)
@@ -668,7 +668,7 @@ def test_adoption_excludes_skipped_paths(_workspace_home, db, lease, monkeypatch
     """
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {
             "paths": [
                 {"source_path": "mapped_folders/repos/foo.md", "claimant_count": 1},
@@ -699,7 +699,7 @@ def test_adoption_no_longer_excludes_authored_paths_now_that_the_pull_pass_exist
     before anything downstream could see it as missing."""
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {
             "paths": [
                 {"source_path": "authored/note.md", "claimant_count": 1},
@@ -730,7 +730,7 @@ def test_adoption_requests_sync_paths_scoped_to_this_workspace_slug(_workspace_h
 
     calls = []
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         calls.append(workspace_slug)
         return {"paths": [], "cursor": None}, None
 
@@ -739,6 +739,32 @@ def test_adoption_requests_sync_paths_scoped_to_this_workspace_slug(_workspace_h
     _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
 
     assert calls == ["aw"]
+
+
+def test_adoption_requests_sync_paths_scoped_to_the_configured_bucket(_workspace_home, db, lease, monkeypatch):
+    """GET /sync-paths sits behind `require_bucket_read`, which resolves an
+    omitted `bucket` to "the tenant's sole readable bucket" and 400s as
+    ambiguous the moment a second one exists — the exact defect already
+    fixed twice for write-side calls (`put_document_by_path`, `mark_
+    delete_by_path`; see test_client.py's `fs-sync-delete-mark-bucket-
+    missing` audit) and missed here because this is the one read-side
+    call. Live symptom before this fix: `get_sync_paths` always returned
+    an error, silently swallowed by `_adopt_paths` into `sync_paths_seen =
+    None`, which made adoption, GC (`_gc_dead_pending_delete_rows`) and the
+    restore-reconcile catch-up all quietly no-op on every tick."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+
+    calls = []
+
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
+        calls.append(bucket)
+        return {"paths": [], "cursor": None}, None
+
+    monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
+
+    _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert calls == [bulk_ingest.BUCKET]
 
 
 def test_adopted_path_whose_file_exists_converges_to_a_normal_synced_row(
@@ -897,7 +923,7 @@ def test_valve_guard1_aborts_before_adoption_or_catchup_touch_anything(
     sync_paths_calls = []
     mark_calls = []
 
-    async def spy_sync_paths(workspace_slug, after=None, limit=500):
+    async def spy_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         sync_paths_calls.append(1)
         return {"paths": [], "cursor": None}, None
 
@@ -1650,7 +1676,7 @@ def test_gc_removes_a_dead_pending_delete_row_absent_from_a_full_sync_paths_enum
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
     _seed_uploaded(db, "notion/gone.md", external_id="doc-1", pending_delete=1)
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {"paths": [{"source_path": "notion/keep.md", "claimant_count": 1}], "cursor": None}, None
 
     monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
@@ -1673,7 +1699,7 @@ def test_gc_leaves_a_dead_row_untouched_when_the_enumeration_errors(
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
     _seed_uploaded(db, "notion/gone.md", external_id="doc-1", pending_delete=1)
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return None, "HTTP 500"
 
     monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
@@ -1715,7 +1741,7 @@ def test_gc_never_touches_a_live_row_with_an_absent_claimant(
     _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
     _seed_uploaded(db, "notion/orphan.md", external_id="doc-2")  # pending_delete=0, not on disk
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {"paths": [{"source_path": "notion/keep.md", "claimant_count": 1}], "cursor": None}, None
 
     monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)
@@ -1801,7 +1827,7 @@ def test_restore_reconcile_catchup_three_way_split(_workspace_home, db, lease, m
     _seed_uploaded(db, "notion/still-pending.md", external_id="doc-p", pending_delete=1)
     _seed_uploaded(db, "notion/dead.md", external_id="doc-d", pending_delete=1)
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {
             "paths": [
                 {"source_path": "notion/keep.md", "claimant_count": 1},
@@ -1844,7 +1870,7 @@ def test_restore_reconcile_catchup_runs_once_then_stays_off(
     _write(root, "notion/keep.md", "keep me")
     _seed_uploaded(db, "notion/restored.md", external_id="doc-r", pending_delete=1)
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {
             "paths": [
                 {"source_path": "notion/keep.md", "claimant_count": 1},
@@ -1882,7 +1908,7 @@ def test_restore_reconcile_catchup_retries_after_a_failed_documents_fetch(
     _write(root, "notion/keep.md", "keep me")
     _seed_uploaded(db, "notion/restored.md", external_id="doc-r", pending_delete=1)
 
-    async def fake_sync_paths(workspace_slug, after=None, limit=500):
+    async def fake_sync_paths(workspace_slug, after=None, limit=500, bucket=None):
         return {
             "paths": [
                 {"source_path": "notion/keep.md", "claimant_count": 1},

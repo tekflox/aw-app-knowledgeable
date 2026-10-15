@@ -465,6 +465,28 @@ def test_mark_delete_by_path_sends_bucket_as_a_query_param():
     }
 
 
+def test_get_sync_paths_sends_bucket_as_a_query_param():
+    """The read-side sibling of test_mark_delete_by_path_sends_bucket_as_a_
+    query_param above — GET /api/documents/sync-paths is gated by
+    `require_bucket_read`, not `require_bucket_write`, but the same defect
+    applies: an omitted `bucket` resolves server-side to "the tenant's sole
+    readable bucket", 400ing as ambiguous the moment a second readable
+    bucket exists. Found live: this call's own caller, `fs_sync.
+    _adopt_paths`, only logs the resulting error and returns `sync_paths_
+    seen=None`, which silently no-ops adoption, GC and the restore-
+    reconcile catch-up every single tick — not a crash, so nothing short
+    of this assertion would have caught it."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(200, {"paths": [{"source_path": "notion/x.md", "claimant_count": 1}], "cursor": "notion/x.md"})
+    )
+    data, err = _run(client.get_sync_paths("aw", after="notion/a.md", limit=500, bucket="main"))
+    assert err is None
+    assert data == {"paths": [{"source_path": "notion/x.md", "claimant_count": 1}], "cursor": "notion/x.md"}
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/documents/sync-paths"
+    assert call["params"] == {"workspace_slug": "aw", "limit": 500, "after": "notion/a.md", "bucket": "main"}
+
+
 # ---------------------------------------------------------------------------
 # fs-sync-delete-mark-bucket-missing's audit — EVERY client method that
 # hits a `require_bucket_write`-gated route and can name a bucket at all

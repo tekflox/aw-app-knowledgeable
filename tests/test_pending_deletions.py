@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import pending_deletions  # noqa: E402
+from knowledgeable_app import bulk_ingest, pending_deletions  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -53,6 +53,13 @@ def db():
 @pytest.fixture(autouse=True)
 def _fresh_table_flag(monkeypatch):
     monkeypatch.setattr(pending_deletions, "_table_ensured", False)
+    # Journal-reconcile tests below call through to `bulk_ingest._ensure_
+    # table` on this same module-level-guarded table — reset its flag too,
+    # same reason `test_fs_sync.py`/`test_bulk_ingest.py` each reset it for
+    # their own module-level `db` fixture (a fresh in-memory sqlite
+    # connection per test; the flag must not survive past the connection
+    # it was set for).
+    monkeypatch.setattr(bulk_ingest, "_table_ensured", False)
 
 
 def _audit_rows(db):
@@ -74,6 +81,29 @@ def _pending(docs):
         return {"documents": list(docs)}, None
 
     return fake
+
+
+def _seed_journal_row(db, relpath: str, external_id: str) -> None:
+    """A pending-delete fs-sync journal row, same shape `test_fs_sync.py`'s
+    own `_seed_uploaded` seeds — this file doesn't import that one (two
+    separate test modules by this repo's own stated convention), so a
+    trimmed local equivalent lives here instead."""
+    bulk_ingest._ensure_table(db)
+    db.execute(
+        bulk_ingest.TABLE,
+        "INSERT INTO {table} (relpath, sha256, bucket, status, external_id, scanned_at, updated_at, "
+        "missing_scans, pending_delete) "
+        "VALUES (:relpath, 'abc', 'main', :status, :external_id, 0, 0, 2, 1)",
+        {"relpath": relpath, "status": bulk_ingest.STATUS_UPLOADED, "external_id": external_id},
+    )
+
+
+def _journal_row(db, relpath: str):
+    rows = db.execute(
+        bulk_ingest.TABLE, "SELECT * FROM {table} WHERE relpath = :relpath", {"relpath": relpath}
+    )
+    rows = list(rows)
+    return dict(rows[0]) if rows else None
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +273,116 @@ def test_approve_reports_a_partial_failure_as_an_error(db, monkeypatch):
     assert rows[0]["succeeded_count"] == 1
     assert rows[0]["failed_count"] == 1
     assert rows[0]["outcome"] == "partial"
+
+
+# ---------------------------------------------------------------------------
+# approve_pending_deletions reconciles this connector's own fs-sync
+# journal for every document it just deleted, in the same operation —
+# rather than leaving a dangling `pending_delete=1` row for a tick's
+# `fs_sync._gc_dead_pending_delete_rows` that may never promptly run.
+# ---------------------------------------------------------------------------
+
+
+def test_approve_deletes_the_journal_row_for_every_succeeded_document(db, monkeypatch):
+    monkeypatch.setattr(client, "get_documents_pending_delete", _pending([_DOC_A, _DOC_B]))
+    _seed_journal_row(db, _DOC_A["source_path"], _DOC_A["id"])
+    _seed_journal_row(db, _DOC_B["source_path"], _DOC_B["id"])
+
+    async def fake_delete(node_id, *, bucket):
+        return True, None
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(
+        pending_deletions.approve_pending_deletions(
+            {"bucket": "main", "path_prefix": "notion/kanban/", "expected_count": 2}, db, "actor"
+        )
+    )
+    assert is_error is False
+    payload = json.loads(text)
+    assert payload["journal_reconciled"] == 2
+    assert _journal_row(db, _DOC_A["source_path"]) is None
+    assert _journal_row(db, _DOC_B["source_path"]) is None
+
+
+def test_approve_only_reconciles_the_journal_for_documents_that_actually_succeeded(db, monkeypatch):
+    """The partial-failure sibling of the test above — a failed delete must
+    leave that document's journal row exactly as it was, still
+    `pending_delete=1`, so a later tick's GC (or a retried approve) still
+    has something to act on."""
+    monkeypatch.setattr(client, "get_documents_pending_delete", _pending([_DOC_A, _DOC_B]))
+    _seed_journal_row(db, _DOC_A["source_path"], _DOC_A["id"])
+    _seed_journal_row(db, _DOC_B["source_path"], _DOC_B["id"])
+
+    async def fake_delete(node_id, *, bucket):
+        if node_id == _DOC_A["id"]:
+            return True, None
+        return False, "HTTP 404: Node not found"
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(
+        pending_deletions.approve_pending_deletions(
+            {"bucket": "main", "path_prefix": "notion/kanban/", "expected_count": 2}, db, "actor"
+        )
+    )
+    assert is_error is True  # the partial failure itself
+    payload = json.loads(text)
+    assert payload["journal_reconciled"] == 1
+    assert _journal_row(db, _DOC_A["source_path"]) is None
+    assert _journal_row(db, _DOC_B["source_path"]) is not None
+
+
+def test_approve_leaves_a_journal_row_alone_when_a_different_document_has_since_reclaimed_its_path(
+    db, monkeypatch
+):
+    """A race the `(relpath, external_id)` match guards against: between
+    this call's own listing and its delete, some other writer re-created
+    a document at the same `source_path` (e.g. the fs-sync upload pass
+    picking the file back up). That new document's `external_id` differs
+    from the one this call just deleted, so the journal row — now
+    correctly describing the NEW claimant — must not be swept away with
+    the old one."""
+    monkeypatch.setattr(client, "get_documents_pending_delete", _pending([_DOC_A]))
+    _seed_journal_row(db, _DOC_A["source_path"], "doc-a-reclaimed")
+
+    async def fake_delete(node_id, *, bucket):
+        return True, None
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(
+        pending_deletions.approve_pending_deletions(
+            {"bucket": "main", "node_ids": [_DOC_A["id"]], "expected_count": 1}, db, "actor"
+        )
+    )
+    assert is_error is False
+    payload = json.loads(text)
+    assert payload["journal_reconciled"] == 0
+    row = _journal_row(db, _DOC_A["source_path"])
+    assert row is not None
+    assert row["external_id"] == "doc-a-reclaimed"
+
+
+def test_approve_with_no_journal_row_at_all_still_succeeds(db, monkeypatch):
+    """Not every approved document necessarily has a connector journal row
+    (e.g. one marked some other way) — reconciliation must be a no-op for
+    those, not an error."""
+    monkeypatch.setattr(client, "get_documents_pending_delete", _pending([_DOC_A]))
+
+    async def fake_delete(node_id, *, bucket):
+        return True, None
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(
+        pending_deletions.approve_pending_deletions(
+            {"bucket": "main", "node_ids": [_DOC_A["id"]], "expected_count": 1}, db, "actor"
+        )
+    )
+    assert is_error is False
+    payload = json.loads(text)
+    assert payload["journal_reconciled"] == 0
 
 
 # ---------------------------------------------------------------------------
