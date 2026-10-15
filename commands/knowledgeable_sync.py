@@ -12,6 +12,7 @@ Usage:
     aw-workspace-cli knowledgeable-sync status                 # journal counts: synced/missing/pending-delete
     aw-workspace-cli knowledgeable-sync report                 # per-subtree §3/§7 deliverable report
     aw-workspace-cli knowledgeable-sync reconcile-orphans [--apply] [--limit N]
+    aw-workspace-cli knowledgeable-sync unmark-not-ready
 
 Exit codes for `run`: 0 progressed or nothing to do, 1 the tick was
 blocked — the §6 workspace_slug refusal, another tick already in
@@ -26,6 +27,12 @@ MARKS (the two-phase approval queue still gates every actual delete), and
 it refuses to mark more than the §7 valve's own ceiling in one pass
 (`--limit` defaults to 100). Approve the resulting queue with the
 `approve_pending_deletions` MCP tool, or decline it to undo.
+
+`unmark-not-ready` (card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263`) clears
+`pending_delete` — never declines — on every already-pending document
+whose live twin has not finished embedding yet. No `--apply` flag: every
+candidate it finds is, by construction, already wrongly marked, so there
+is nothing to preview that isn't also the fix.
 """
 from __future__ import annotations
 
@@ -97,6 +104,17 @@ def run(args: list[str] | None = None) -> int:
         # rule `run`'s own `blocked` check follows.
         if not body.get("ok"):
             print(f"reconcile-orphans: {body.get('error')}", file=sys.stderr)
+            return 1
+        return 0
+
+    if sub == "unmark-not-ready":
+        status, body = local_client.request("POST", f"{_BASE}/unmark-not-ready", {})
+        if status != 200:
+            print(f"unmark-not-ready failed: HTTP {status} {body}", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2))
+        if not body.get("ok"):
+            print(f"unmark-not-ready: {body.get('error')}", file=sys.stderr)
             return 1
         return 0
 

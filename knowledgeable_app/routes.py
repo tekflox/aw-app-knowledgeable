@@ -344,6 +344,18 @@ def build_routes(ctx) -> FastAPI:
             kwargs["bucket"] = str(data["bucket"])
         return await orphan_reconcile.reconcile(ctx.db, **kwargs)
 
+    @app.post("/fs-sync/unmark-not-ready", dependencies=[Depends(_require_identity)])
+    async def fs_sync_unmark_not_ready(request: Request, data: dict = Body(default={})) -> dict:
+        """Card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263`, deliverable 2: clear
+        `pending_delete` (never decline — see `orphan_reconcile.
+        unmark_not_ready`'s own docstring for why) on every pending
+        document whose live twin is not yet `ready`. No `apply` flag: every
+        candidate this finds is, by construction, already wrongly marked."""
+        kwargs: dict = {"actor": _caller_actor(request)}
+        if data.get("bucket"):
+            kwargs["bucket"] = str(data["bucket"])
+        return await orphan_reconcile.unmark_not_ready(ctx.db, **kwargs)
+
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.
     # ------------------------------------------------------------------

@@ -25,7 +25,9 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import bulk_ingest, fs_sync, pending_deletions, routes as routes_mod  # noqa: E402
+from knowledgeable_app import (  # noqa: E402
+    bulk_ingest, fs_sync, orphan_reconcile, pending_deletions, routes as routes_mod,
+)
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -115,6 +117,21 @@ def _no_pending_changes(monkeypatch):
         return {"changes": [], "cursor": since}, None
 
     monkeypatch.setattr(client, "get_document_changes", fake_get_document_changes)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_siblings(monkeypatch):
+    """Default stub for the twin-readiness check `approve_pending_deletions`
+    now runs (card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263`, deliverable 3) —
+    an empty listing means no sibling is ever found, so the §21 acceptance
+    tests below (whose auto-approve pass reaches `approve_pending_
+    deletions` internally) keep their original behavior. Overridden by
+    tests exercising the new guard itself."""
+
+    async def fake_get_documents(bucket=None):
+        return {"documents": []}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_get_documents)
 
 
 @pytest.fixture()
@@ -781,3 +798,257 @@ def test_fs_sync_status_and_report_thread_delete_policy_config(route_ctx, monkey
     assert resp.json()["delete_policy"] == [
         {"prefix": "random/", "mode": "auto", "min_missing_scans": 3}
     ]
+
+
+# ---------------------------------------------------------------------------
+# Card 3fa5bf3b-9510-8112-8f3f-d9fdaadd8263 — twin-ready ordering guard the
+# orphan-reconciler delivery missed. The exact shape measured live: an
+# orphan already `ready` sharing `source_path` with its journal-tracked
+# twin, which is still `pending`. Approving that mark de-indexes a file
+# that is healthy on disk and in the journal.
+# ---------------------------------------------------------------------------
+
+_ORPHAN = {"id": "doc-orphan", "source_path": "memory/preferences.md", "sync_status": ""}
+_TWIN_PENDING = {"id": "doc-twin", "source_path": "memory/preferences.md", "processing_status": "pending"}
+_TWIN_READY = {"id": "doc-twin", "source_path": "memory/preferences.md", "processing_status": "ready"}
+
+
+def test_classify_an_orphan_whose_twin_is_not_ready_is_reported_not_eligible():
+    claims = {"memory/preferences.md": "doc-twin"}
+    claimed_ids = {"doc-twin"}
+    classes = orphan_reconcile.classify([_ORPHAN, _TWIN_PENDING], claims, claimed_ids)
+    assert classes["eligible"] == []
+    assert classes["twin_not_ready"] == [_ORPHAN]
+    assert classes["already_marked"] == []
+    assert classes["no_live_claimant"] == []
+
+
+def test_classify_the_same_orphan_becomes_eligible_once_the_twin_is_ready():
+    claims = {"memory/preferences.md": "doc-twin"}
+    claimed_ids = {"doc-twin"}
+    classes = orphan_reconcile.classify([_ORPHAN, _TWIN_READY], claims, claimed_ids)
+    assert classes["eligible"] == [_ORPHAN]
+    assert classes["twin_not_ready"] == []
+
+
+def test_classify_a_claimant_missing_from_the_listing_is_treated_as_not_ready():
+    """Defensive default (see `classify`'s docstring): a live claimant id
+    the journal names but this listing didn't return is NOT confirmed
+    `ready`, so it must not be treated as eligible."""
+    claims = {"memory/preferences.md": "doc-twin"}
+    claimed_ids = {"doc-twin"}
+    classes = orphan_reconcile.classify([_ORPHAN], claims, claimed_ids)
+    assert classes["eligible"] == []
+    assert classes["twin_not_ready"] == [_ORPHAN]
+
+
+def test_reconcile_never_marks_an_orphan_whose_twin_is_not_ready(db, monkeypatch):
+    _seed_uploaded(db, "memory/preferences.md", external_id="doc-twin", pending_delete=0)
+
+    async def fake_get_documents(bucket=None):
+        return {"documents": [_ORPHAN, _TWIN_PENDING]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_get_documents)
+
+    marked: list[str] = []
+
+    async def fake_mark_delete(doc_id, *, bucket=None, reason=None):
+        marked.append(doc_id)
+        return {"id": doc_id, "sync_status": "pending_delete"}, None
+
+    monkeypatch.setattr(client, "mark_delete", fake_mark_delete)
+
+    report = _run(orphan_reconcile.reconcile(db, apply=True))
+    assert report["eligible"] == 0
+    assert report["twin_not_ready"] == 1
+    assert marked == []
+
+
+def test_reconcile_marks_the_same_orphan_once_the_twin_is_ready(db, monkeypatch):
+    _seed_uploaded(db, "memory/preferences.md", external_id="doc-twin", pending_delete=0)
+
+    async def fake_get_documents(bucket=None):
+        return {"documents": [_ORPHAN, _TWIN_READY]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_get_documents)
+
+    marked: list[str] = []
+
+    async def fake_mark_delete(doc_id, *, bucket=None, reason=None):
+        marked.append(doc_id)
+        return {"id": doc_id, "sync_status": "pending_delete"}, None
+
+    monkeypatch.setattr(client, "mark_delete", fake_mark_delete)
+
+    report = _run(orphan_reconcile.reconcile(db, apply=True))
+    assert report["eligible"] == 1
+    assert report["twin_not_ready"] == 0
+    assert marked == ["doc-orphan"]
+
+
+def test_approve_pending_deletions_refuses_when_the_live_twin_is_not_ready(db, monkeypatch):
+    async def fake_pending(bucket=None):
+        return {"documents": [{"id": "doc-orphan", "source_path": "memory/preferences.md"}]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live(bucket=None):
+        return {"documents": [_TWIN_PENDING]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_live)
+
+    async def fail_delete(node_id, *, bucket):
+        raise AssertionError("must not delete while the live twin is not ready")
+
+    monkeypatch.setattr(client, "delete_document", fail_delete)
+
+    text, is_error = _run(pending_deletions.approve_pending_deletions(
+        {"bucket": "main", "node_ids": ["doc-orphan"], "expected_count": 1}, db, "tester",
+    ))
+    assert is_error is True
+    assert "twin" in text.lower()
+
+    audit = _audit_rows(db)
+    assert audit[-1]["outcome"] == "rejected_twin_not_ready"
+
+
+def test_approve_pending_deletions_proceeds_once_the_live_twin_is_ready(db, monkeypatch):
+    async def fake_pending(bucket=None):
+        return {"documents": [{"id": "doc-orphan", "source_path": "memory/preferences.md"}]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live(bucket=None):
+        return {"documents": [_TWIN_READY]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_live)
+
+    deleted: list[str] = []
+
+    async def fake_delete(node_id, *, bucket):
+        deleted.append(node_id)
+        return True, None
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(pending_deletions.approve_pending_deletions(
+        {"bucket": "main", "node_ids": ["doc-orphan"], "expected_count": 1}, db, "tester",
+    ))
+    assert is_error is False
+    assert deleted == ["doc-orphan"]
+
+
+def test_approve_pending_deletions_fails_open_when_the_twin_check_cannot_verify(db, monkeypatch):
+    """A verification outage must not become a new way to wedge every
+    approval — including §21's unattended pass. See `_twin_not_ready`'s
+    docstring."""
+    async def fake_pending(bucket=None):
+        return {"documents": [{"id": "doc-orphan", "source_path": "memory/preferences.md"}]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live_error(bucket=None):
+        return None, "could not reach aw-knowledgeable"
+
+    monkeypatch.setattr(client, "get_documents", fake_live_error)
+
+    deleted: list[str] = []
+
+    async def fake_delete(node_id, *, bucket):
+        deleted.append(node_id)
+        return True, None
+
+    monkeypatch.setattr(client, "delete_document", fake_delete)
+
+    text, is_error = _run(pending_deletions.approve_pending_deletions(
+        {"bucket": "main", "node_ids": ["doc-orphan"], "expected_count": 1}, db, "tester",
+    ))
+    assert is_error is False
+    assert deleted == ["doc-orphan"]
+
+
+def test_unmark_not_ready_clears_but_does_not_decline(db, monkeypatch):
+    _seed_uploaded(db, "memory/preferences.md", external_id="doc-twin", pending_delete=0)
+
+    async def fake_pending(bucket=None):
+        return {"documents": [
+            {"id": "doc-orphan", "source_path": "memory/preferences.md", "sync_status": "pending_delete"},
+        ]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live(bucket=None):
+        return {"documents": [_TWIN_PENDING]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_live)
+
+    restored: list[str] = []
+
+    async def fake_restore(doc_id, *, bucket=None):
+        restored.append(doc_id)
+        return {"id": doc_id}, None
+
+    monkeypatch.setattr(client, "restore_document", fake_restore)
+
+    report = _run(orphan_reconcile.unmark_not_ready(db))
+    assert report["ok"] is True
+    assert report["cleared"] == ["doc-orphan"]
+    assert restored == ["doc-orphan"]
+
+    audit = _audit_rows(db)
+    assert audit[-1]["action"] == orphan_reconcile.UNMARK_AUDIT_ACTION
+    assert audit[-1]["action"] != "decline"
+
+
+def test_unmark_not_ready_leaves_a_ready_twins_orphan_alone(db, monkeypatch):
+    _seed_uploaded(db, "memory/preferences.md", external_id="doc-twin", pending_delete=0)
+
+    async def fake_pending(bucket=None):
+        return {"documents": [
+            {"id": "doc-orphan", "source_path": "memory/preferences.md", "sync_status": "pending_delete"},
+        ]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live(bucket=None):
+        return {"documents": [_TWIN_READY]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_live)
+
+    async def fail_restore(*args, **kwargs):
+        raise AssertionError("must not restore a document whose twin is already ready")
+
+    monkeypatch.setattr(client, "restore_document", fail_restore)
+
+    report = _run(orphan_reconcile.unmark_not_ready(db))
+    assert report["cleared"] == []
+    assert report["not_ready"] == 0
+
+
+def test_unmark_not_ready_skips_a_path_whose_tracked_document_is_itself_mid_deletion(db, monkeypatch):
+    """The journal's own tracked document for this path is independently
+    being deleted (fs-sync's missing-file flow) — a different, legitimate
+    deletion in progress, not a twin-not-ready mismark."""
+    _seed_uploaded(db, "memory/preferences.md", external_id="doc-twin", pending_delete=1)
+
+    async def fake_pending(bucket=None):
+        return {"documents": [
+            {"id": "doc-orphan", "source_path": "memory/preferences.md", "sync_status": "pending_delete"},
+        ]}, None
+
+    monkeypatch.setattr(client, "get_documents_pending_delete", fake_pending)
+
+    async def fake_live(bucket=None):
+        return {"documents": [_TWIN_PENDING]}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_live)
+
+    async def fail_restore(*args, **kwargs):
+        raise AssertionError("must not restore while the path's own tracked document is mid-deletion")
+
+    monkeypatch.setattr(client, "restore_document", fail_restore)
+
+    report = _run(orphan_reconcile.unmark_not_ready(db))
+    assert report["cleared"] == []
+    assert len(report["skipped"]) == 1
+    assert "mid-deletion" in report["skipped"][0]["reason"]

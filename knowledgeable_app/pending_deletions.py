@@ -172,6 +172,57 @@ def _as_text(payload) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+async def _twin_not_ready(matched: list[dict], bucket: str) -> list[dict]:
+    """Deliverable 3 of card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263` —
+    defence in depth at the approve boundary. `orphan_reconcile`'s own
+    eligibility gate is the primary defense, but §21's auto-approve pass
+    and the Library UI both reach this function independently of that
+    reconciler, so the check is repeated here against whichever OTHER
+    live (non pending-delete) document shares a matched document's
+    `source_path`, straight from the one listing already fetched for
+    this purpose — no journal lookup needed, any live sibling that is not
+    `processing_status == "ready"` is enough to refuse.
+
+    Fails OPEN (returns `[]`, logging a warning) if the verification
+    listing itself cannot be fetched — an aw-knowledgeable outage on this
+    one read must not become a new way to wedge every approval, including
+    §21's unattended pass that this card found already running in
+    production. A genuine not-ready twin is only ever caught when this
+    check actually ran.
+    """
+    live_data, live_err = await client.get_documents(bucket=bucket)
+    if live_err:
+        log.warning(
+            "approve_pending_deletions: could not verify twin readiness (%s) — "
+            "proceeding without this check; the reconciler's own eligibility gate "
+            "is still the primary defense", live_err,
+        )
+        return []
+
+    siblings_by_path: dict[str, list[dict]] = {}
+    for d in (live_data or {}).get("documents") or []:
+        source_path = d.get("source_path")
+        if source_path:
+            siblings_by_path.setdefault(source_path, []).append(d)
+
+    not_ready: list[dict] = []
+    for doc in matched:
+        source_path = doc.get("source_path") or ""
+        for sibling in siblings_by_path.get(source_path, []):
+            if sibling.get("id") == doc.get("id"):
+                continue
+            if sibling.get("sync_status") == "pending_delete":
+                continue  # not a live claimant either
+            if sibling.get("processing_status") != "ready":
+                not_ready.append({
+                    "id": doc.get("id"),
+                    "source_path": source_path,
+                    "live_claimant": sibling.get("id"),
+                    "live_claimant_processing_status": sibling.get("processing_status"),
+                })
+    return not_ready
+
+
 def _reconcile_journal_for_succeeded(db, matched: list[dict], succeeded: list[str]) -> int:
     """Approving deletes the document on the aw-knowledgeable side, but
     this connector's own fs-sync journal (`bulk_ingest.TABLE`) is a
@@ -295,6 +346,23 @@ async def approve_pending_deletions(args: dict, db, actor: str) -> tuple[str, bo
             f"expected_count mismatch: scope matched {len(matched)} document(s), not "
             f"{expected_count} — nothing was deleted. Re-check the scope (bucket={bucket!r}, "
             f"path_prefix={path_prefix!r}, node_ids={sorted_node_ids})."
+        ), True
+
+    not_ready = await _twin_not_ready(matched, bucket)
+    if not_ready:
+        await run_in_threadpool(
+            _record_audit, db, action="approve", actor=actor, bucket=bucket,
+            path_prefix=path_prefix, node_ids=sorted_node_ids, expected_count=expected_count,
+            matched_count=len(matched), succeeded_count=0, failed_count=0,
+            outcome="rejected_twin_not_ready",
+            detail=json.dumps({"not_ready": not_ready}),
+        )
+        return (
+            f"approve_pending_deletions refused: {len(not_ready)} document(s) in scope have a "
+            "live twin that is not ready yet — approving now would make that source_path "
+            f"unanswerable: {json.dumps(not_ready)}. Nothing was deleted. Re-run once the twin "
+            "reaches processing_status=ready, or use orphan_reconcile.unmark_not_ready to clear "
+            "the mark in the meantime."
         ), True
 
     results = await asyncio.gather(

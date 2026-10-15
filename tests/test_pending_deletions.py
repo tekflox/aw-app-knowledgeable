@@ -62,6 +62,21 @@ def _fresh_table_flag(monkeypatch):
     monkeypatch.setattr(bulk_ingest, "_table_ensured", False)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_siblings(monkeypatch):
+    """Default stub for the twin-readiness check `approve_pending_deletions`
+    now runs (card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263`, deliverable 3) —
+    an empty listing means no sibling is ever found, so every existing
+    approve test here keeps its original behavior. Tests exercising the
+    new guard itself override this with their own `client.get_documents`
+    monkeypatch."""
+
+    async def fake_get_documents(bucket=None):
+        return {"documents": []}, None
+
+    monkeypatch.setattr(client, "get_documents", fake_get_documents)
+
+
 def _audit_rows(db):
     try:
         rows = db.execute(pending_deletions.TABLE, "SELECT * FROM {table} ORDER BY ts")

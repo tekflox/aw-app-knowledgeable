@@ -123,10 +123,17 @@ def _seed(db: _FakeDb, relpath: str, external_id: str | None) -> None:
     )
 
 
-def _doc(doc_id: str, source_path: str, *, slug: str | None = None, sync_status: str = "") -> dict:
+def _doc(
+    doc_id: str, source_path: str, *, slug: str | None = None, sync_status: str = "",
+    processing_status: str = "ready",
+) -> dict:
+    """`processing_status` defaults to `"ready"` — the ordinary case these
+    pre-existing tests model (an already-synced live claimant), not the
+    twin-not-ready case card `3fa5bf3b-9510-8112-8f3f-d9fdaadd8263` adds its
+    own dedicated tests for below."""
     return {
         "id": doc_id, "source_path": source_path, "workspace_slug": slug,
-        "sync_status": sync_status,
+        "sync_status": sync_status, "processing_status": processing_status,
     }
 
 
