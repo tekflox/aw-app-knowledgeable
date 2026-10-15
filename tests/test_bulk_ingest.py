@@ -26,6 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from knowledgeable_app import bulk_ingest, git_backend  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
+#: Card `3fa5bf3b` — `run_tick` uploads by path now, so a tick needs the
+#: §6 workspace slug (a quarter of the document identity) and refuses
+#: without one. Every tick below passes it explicitly; the refusal itself
+#: is covered in `test_upload_identity.py` alongside the other uploader.
+SLUG = "aw"
+
 
 def _run(coro):
     return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
@@ -358,14 +364,16 @@ def test_run_tick_picks_up_an_unlisted_subtree_without_a_manual_scan(
 
     uploaded = []
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         uploaded.append(source_path)
-        return {"id": "doc-1", "deduplicated": False}, None
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["uploaded"] == 1
     assert uploaded == ["random/me.md"]
@@ -378,13 +386,15 @@ def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, d
 
     uploaded = {"calls": 0}
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         uploaded["calls"] += 1
-        return {"id": "doc-1", "deduplicated": False}, None
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
-    result = _run(bulk_ingest.run_tick(db, lease))
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
     assert result["uploaded"] == 1
     assert uploaded["calls"] == 1
 
@@ -402,7 +412,7 @@ def test_rescan_does_not_duplicate_or_regress_an_uploaded_row(_workspace_home, d
 def test_run_tick_with_nothing_pending_is_a_noop(_workspace_home, db, lease, monkeypatch):
     calls = []
     monkeypatch.setattr(client, "get_ingest_status", lambda bucket=None: calls.append(bucket))
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
     assert result == {
         "blocked": False,
         "uploaded": 0,
@@ -425,12 +435,12 @@ def test_run_tick_ignition_guard_blocks_when_extraction_is_claiming(_workspace_h
 
     async def fake_upload(*a, **k):
         upload_calls.append((a, k))
-        return {"id": "doc-1", "deduplicated": False}, None
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status(claiming=True))
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["blocked"] is True
     assert "claiming" in result["reason"]
@@ -453,13 +463,13 @@ def test_run_tick_blocks_when_a_bucket_cannot_be_ensured(_workspace_home, db, le
 
     async def fake_upload(*a, **k):
         upload_calls.append((a, k))
-        return {"id": "doc-1", "deduplicated": False}, None
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "create_bucket", fake_create_bucket)
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["blocked"] is True
     assert "could not ensure bucket" in result["reason"]
@@ -475,7 +485,7 @@ def test_run_tick_blocks_when_status_check_itself_fails(_workspace_home, db, lea
         return None, "could not reach aw-knowledgeable"
 
     monkeypatch.setattr(client, "get_ingest_status", fake_status)
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
     assert result["blocked"] is True
 
 
@@ -493,18 +503,20 @@ def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home,
     first_may_finish = asyncio.Event()
     upload_calls = []
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         upload_calls.append(source_path)
         await first_may_finish.wait()
-        return {"id": "doc-1", "deduplicated": False}, None
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
     async def scenario():
-        first = asyncio.ensure_future(bulk_ingest.run_tick(db, lease))
+        first = asyncio.ensure_future(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
         await asyncio.sleep(0)  # let the first tick claim the lease and start uploading
-        second_result = await bulk_ingest.run_tick(db, lease)
+        second_result = await bulk_ingest.run_tick(db, lease, workspace_slug=SLUG)
         first_may_finish.set()
         first_result = await first
         return first_result, second_result
@@ -514,7 +526,7 @@ def test_run_tick_refuses_to_overlap_a_tick_already_in_progress(_workspace_home,
     assert second_result["blocked"] is True
     assert "already in progress" in second_result["reason"]
     assert first_result["uploaded"] == 1
-    assert upload_calls == ["crispal/a.md"], "the second tick must never reach upload_bytes"
+    assert upload_calls == ["crispal/a.md"], "the second tick must never reach put_document_by_path"
 
 
 def test_run_tick_respects_the_backlog_ceiling(_workspace_home, db, lease, monkeypatch):
@@ -534,16 +546,18 @@ def test_run_tick_respects_the_backlog_ceiling(_workspace_home, db, lease, monke
 
     uploaded = []
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         uploaded.append(bucket)
-        return {"id": f"doc-{len(uploaded)}", "deduplicated": False}, None
+        return {"id": f"doc-{len(uploaded)}", "outcome": "created"}, None
 
     monkeypatch.setattr(
         client, "get_ingest_status", _ok_status(pending=bulk_ingest.MAX_PENDING_BACKLOG)
     )
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert uploaded == []
     assert result["blocked"] is False
@@ -554,7 +568,7 @@ def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, db,
     """The collapse, as a behavioural assertion: six subtrees, one `bucket=`
     argument, and the subtree carried by `source_path` instead.
 
-    MUTATION: pass `bucket=subtree` to `upload_bytes` and this goes red on
+    MUTATION: pass `bucket=subtree` to `put_document_by_path` and this goes red on
     the bucket set — which is the shape that would re-create per-folder
     buckets one upload at a time.
     """
@@ -566,14 +580,16 @@ def test_run_tick_uploads_every_subtree_into_the_one_bucket(_workspace_home, db,
 
     seen = []
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         seen.append((bucket, source_path))
-        return {"id": f"doc-{len(seen)}", "deduplicated": False}, None
+        return {"id": f"doc-{len(seen)}", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["uploaded"] == 3
     assert result["bucket"] == "main"
@@ -596,14 +612,16 @@ def test_run_tick_respects_the_max_uploads_ceiling_across_buckets(_workspace_hom
 
     uploaded = []
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         uploaded.append(source_path)
-        return {"id": f"doc-{len(uploaded)}", "deduplicated": False}, None
+        return {"id": f"doc-{len(uploaded)}", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease, max_uploads=4))
+    result = _run(bulk_ingest.run_tick(db, lease, max_uploads=4, workspace_slug=SLUG))
 
     assert result["uploaded"] == 4
     assert len(uploaded) == 4
@@ -619,14 +637,19 @@ def test_run_tick_counts_a_server_dedup_hit_separately_from_a_fresh_upload(_work
     _write(root, "crispal/b.md", "content b")
     bulk_ingest.scan(db)
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         dedup = source_path == "crispal/b.md"
-        return {"id": "doc-shared" if dedup else "doc-a", "deduplicated": dedup}, None
+        return {
+            "id": "doc-shared" if dedup else "doc-a",
+            "outcome": "unchanged" if dedup else "created",
+        }, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["uploaded"] == 1
     assert result["deduplicated"] == 1
@@ -639,15 +662,17 @@ def test_run_tick_marks_an_upload_error_as_failed_and_keeps_going(_workspace_hom
     _write(root, "crispal/b.md", "content b")
     bulk_ingest.scan(db)
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
         if source_path == "crispal/a.md":
             return None, "HTTP 500: internal error"
-        return {"id": "doc-b", "deduplicated": False}, None
+        return {"id": "doc-b", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
 
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
 
     assert result["failed"] == 1
     assert result["uploaded"] == 1
@@ -677,7 +702,7 @@ def test_run_tick_without_a_git_config_never_touches_the_git_backend(
         git_backend, "sync_tick", lambda *a, **k: calls.append((a, k)) or None
     )
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    result = _run(bulk_ingest.run_tick(db, lease))
+    result = _run(bulk_ingest.run_tick(db, lease, workspace_slug=SLUG))
     assert calls == []
     assert "git_state" not in result
 
@@ -703,7 +728,7 @@ def test_run_tick_folds_a_configured_git_backends_state_into_the_result(
         "token": "a-token",
         "workspace_slug": "aw",
     }
-    result = _run(bulk_ingest.run_tick(db, lease, git_config=git_config))
+    result = _run(bulk_ingest.run_tick(db, lease, git_config=git_config, workspace_slug=SLUG))
 
     assert seen["args"] == (
         "https://github.com/f/k.git", "main", "a-token", "aw",
@@ -723,7 +748,9 @@ def test_run_tick_runs_the_git_step_even_when_nothing_was_pending(
         git_backend, "sync_tick",
         lambda *a, **k: {"state": git_backend.STATE_OK, "detail": "pushed", "committed": True},
     )
-    result = _run(bulk_ingest.run_tick(db, lease, git_config={"remote_url": "https://x/y.git"}))
+    result = _run(bulk_ingest.run_tick(
+        db, lease, git_config={"remote_url": "https://x/y.git"}, workspace_slug=SLUG
+    ))
     assert result["note"] == "nothing pending — run scan() first, or the pass is already complete"
     assert result["git_state"] == git_backend.STATE_OK
 
@@ -737,17 +764,21 @@ def test_run_tick_a_git_failure_never_blocks_or_rolls_back_the_graph_work(
     _write(root, "crispal/a.md", "content")
     bulk_ingest.scan(db)
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
-        return {"id": "doc-1", "deduplicated": False}, None
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
+        return {"id": "doc-1", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
     monkeypatch.setattr(
         git_backend, "sync_tick",
         lambda *a, **k: {"state": git_backend.STATE_PUSH_FAILED, "detail": "network unreachable", "committed": False},
     )
 
-    result = _run(bulk_ingest.run_tick(db, lease, git_config={"remote_url": "https://x/y.git"}))
+    result = _run(bulk_ingest.run_tick(
+        db, lease, git_config={"remote_url": "https://x/y.git"}, workspace_slug=SLUG
+    ))
 
     assert result["uploaded"] == 1
     assert result["git_state"] == git_backend.STATE_PUSH_FAILED
@@ -765,12 +796,14 @@ def test_report_tallies_scanned_uploaded_deduplicated_and_pending(_workspace_hom
     _write(root, "mapped_folders/docs/c.md", "content a")  # alias of a.md's content
     bulk_ingest.scan(db)
 
-    async def fake_upload(filename, raw, *, bucket, source_path=None, title=None):
-        return {"id": "doc-a", "deduplicated": False}, None
+    async def fake_upload(
+        filename, raw, *, bucket, source_path, workspace_slug, base_hash=None, title=None
+    ):
+        return {"id": "doc-a", "outcome": "created"}, None
 
     monkeypatch.setattr(client, "get_ingest_status", _ok_status())
-    monkeypatch.setattr(client, "upload_bytes", fake_upload)
-    _run(bulk_ingest.run_tick(db, lease, max_uploads=1))
+    monkeypatch.setattr(client, "put_document_by_path", fake_upload)
+    _run(bulk_ingest.run_tick(db, lease, max_uploads=1, workspace_slug=SLUG))
 
     report = bulk_ingest.report(db)
     assert report["bucket"] == "main"

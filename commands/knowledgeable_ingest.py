@@ -26,10 +26,13 @@ Usage:
 
 Exit codes for `run`: 0 progressed or nothing pending, 1 the ignition guard
 blocked the tick (extraction is claiming, or the status check itself
-failed), or the git backend's own tick (docs/design/aw-knowledgeable-fs-
-sync.md §16.3) came back anything other than `ok`/not-configured —
-`no_secret`/`auth_failed`/`diverged`/`push_failed` all exit 1 too, the same
-code the contributed scheduled task escalates to an agent on.
+failed), the §6 `workspace_slug` refusal (`AW_WORKSPACE` unset — this
+driver uploads by path since card `3fa5bf3b`, so the slug is part of the
+document identity and is never defaulted), or the git backend's own tick
+(docs/design/aw-knowledgeable-fs-sync.md §16.3) came back anything other
+than `ok`/not-configured — `no_secret`/`auth_failed`/`diverged`/
+`push_failed` all exit 1 too, the same code the contributed scheduled task
+escalates to an agent on.
 """
 from __future__ import annotations
 

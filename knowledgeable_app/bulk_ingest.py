@@ -35,13 +35,57 @@ documents, let's rely on it." They were 7,329 of 9,216 ingested documents,
 remember: `scan()` never walks them, so they can never re-enter the journal
 and no tick can re-upload what the §8 migration deleted.
 
-**Dedup lives in two layers, with different jobs (§13.2).** The server's own
-`content_hash` MERGE gate (`POST /api/documents`) is the idempotency safety
-net — re-running this driver, or any other caller, never duplicates. THIS
-module's job is the other layer: cross-prefix canonicalization. It is the
-only thing with a full-corpus view, so it hashes every file first, groups by
-hash, and uploads exactly one canonical copy per group — the rest are
-recorded as journal aliases, never POSTed at all.
+**Dedup lives in two layers, with different jobs (§13.2).** The idempotency
+safety net is the server's **path-keyed** upsert (`PUT /api/documents/
+by-path`, `upsert_document_by_path`) — re-running this driver, or any other
+caller sending the same `source_path`, never duplicates. THIS module's job
+is the other layer: cross-prefix canonicalization. It is the only thing with
+a full-corpus view, so it hashes every file first, groups by hash, and
+uploads exactly one canonical copy per group — the rest are recorded as
+journal aliases, never PUT at all.
+
+**Why by-path and not the content-hash route any more** (card
+`3fa5bf3b-9510-812c-a439-d7fcc773f2bd`, 2026-10-15; §1.1 of docs/design/
+aw-knowledgeable-fs-sync.md). This driver used to upload through `POST
+/api/documents` → `create_document`, whose MERGE key is `(tenant, bucket,
+content_hash)`. §1.1 reserves that route for "callers that send **no**
+`source_path`: the UI upload, the ad-hoc `upload_document` MCP tool" — and
+this driver sends `source_path` on every single upload. The route never
+stamps `workspace_slug`, so the node it created could never be found by
+`fs_sync.py`'s by-path MERGE on `(tenant, bucket, workspace_slug,
+source_path)` (Neo4j MERGE needs an exact match on every pattern property;
+absent never matches a value), and fs-sync minted a second, disjoint
+document for the same file. The journal holds ONE `external_id` per path and
+both uploaders overwrote it on success, so the first writer's document was
+orphaned the moment the second landed — undeletable, because delete
+detection only ever reads identity from that one column. Measured live:
+2,623 graph documents against 2,079 journal `external_id`s, 544 orphans, all
+of them slug-less documents sharing a path with exactly one slugged sibling.
+Both uploaders now land in the SAME identity scheme, so a second upload of
+unchanged content is a true no-op that returns the same id.
+
+Two consequences of that switch, neither incidental:
+
+* `workspace_slug` is now a REQUIRED argument of `run_tick` (§6 — a quarter
+  of the document identity). Like `fs_sync.run_tick`, this driver **refuses
+  to run** rather than default it; `routes.py` threads
+  `workspace_env("AW_WORKSPACE")` in, same as it already does for fs-sync.
+* the successful-upload journal write now also sets `last_synced_hash`
+  (§3.2's three-way base). Without it every row this driver uploaded looked,
+  to `fs_sync.py`'s upload decision (driven entirely by `last_synced_hash`/
+  `pending_hash`, never by `status`), like a path that had never been synced
+  — which is why the duplicate fired on essentially every shared file rather
+  than only on a race. `pending_hash`/`pending_since`/`dirty_since` stay
+  untouched: they are fs-sync-owned columns, and its own rule 1 clears them
+  on the next tick that sees `digest == last_synced_hash`.
+
+`scan()`'s frozen-row rule is deliberately NOT inverted here (design §13
+risk 4). At the system level `fs_sync.py` already un-freezes it — it
+re-hashes the whole tree every tick and diffs against `last_synced_hash`, so
+an edit to an `uploaded` file is picked up there. Re-staging changed rows as
+`pending` in this module would hand edits back to THIS driver, which has no
+quiet window, and so would bypass §20's per-prefix hold (`notion/` = 3h)
+that the design asks for explicitly.
 
 **No work without a ceiling (§13.5.3, the 228-container/37.2GB incident).**
 `run_tick()` — the one entrypoint both doors call — enforces, in order: the
@@ -493,7 +537,11 @@ async def _run_git_step(git_config: dict | None) -> dict | None:
 
 
 async def run_tick(
-    db, lease, max_uploads: int = MAX_UPLOADS_PER_TICK, git_config: dict | None = None
+    db,
+    lease,
+    max_uploads: int = MAX_UPLOADS_PER_TICK,
+    git_config: dict | None = None,
+    workspace_slug: str = "",
 ) -> dict:
     """One bounded tick — the only entrypoint either door (CLI `run`, the
     contributed scheduled task) ever calls. Re-`scan()`s first (card
@@ -521,7 +569,23 @@ async def run_tick(
     second lease. A git failure never rolls back or re-runs the graph work
     above it (§16.6): its outcome is folded into the result as `git_state`/
     `git_detail`, not raised.
+
+    §6 / card `3fa5bf3b` — refuses to run at all with an empty
+    `workspace_slug`, exactly as `fs_sync.run_tick` does and for the same
+    reason: it is a quarter of the path-keyed document identity this driver
+    now uploads under, so a defaulted slug would interleave two workspaces'
+    documents under one identity. Checked before the lease claim — a refusal
+    is not work, so it must not take the tick lock from a caller that does
+    have a slug.
     """
+    if not (workspace_slug or "").strip():
+        return {
+            "blocked": True,
+            "reason": "AW_WORKSPACE is unset — refusing to run with a defaulted workspace_slug (§6)",
+            "uploaded": 0,
+            "deduplicated": 0,
+            "failed": 0,
+        }
     if not lease.claim(LEASE_NAME):
         return {
             "blocked": True,
@@ -531,7 +595,7 @@ async def run_tick(
             "failed": 0,
         }
     try:
-        result = await _run_tick_locked(db, max_uploads)
+        result = await _run_tick_locked(db, max_uploads, workspace_slug.strip())
         git_result = await _run_git_step(git_config)
         if git_result is not None:
             result["git_state"] = git_result["state"]
@@ -541,7 +605,7 @@ async def run_tick(
         lease.release(LEASE_NAME)
 
 
-async def _run_tick_locked(db, max_uploads: int) -> dict:
+async def _run_tick_locked(db, max_uploads: int, workspace_slug: str) -> dict:
     max_uploads = max(0, min(max_uploads, MAX_UPLOADS_PER_TICK))
     await run_in_threadpool(_ensure_table, db)
 
@@ -660,9 +724,18 @@ async def _run_tick_locked(db, max_uploads: int) -> dict:
 
             # `source_path` is the load-bearing argument now: the server
             # derives the collection from it (§15.1), so the subtree this
-            # file came from is carried by the path, not by the bucket.
-            data, err = await client.upload_bytes(
-                Path(relpath).name, raw, bucket=BUCKET, source_path=relpath
+            # file came from is carried by the path, not by the bucket —
+            # and since card `3fa5bf3b` it is also a quarter of the
+            # document's identity, which is why this is
+            # `put_document_by_path` and not `upload_bytes` any more (see
+            # this module's docstring). `base_hash` is deliberately not
+            # sent: this driver keeps no three-way base of its own, and the
+            # server records it for the conflict audit rather than
+            # enforcing it (§1.2), so a fabricated value would be worse
+            # than its absence.
+            data, err = await client.put_document_by_path(
+                Path(relpath).name, raw, bucket=BUCKET,
+                source_path=relpath, workspace_slug=workspace_slug,
             )
             now = time.time()
             if err:
@@ -676,24 +749,41 @@ async def _run_tick_locked(db, max_uploads: int) -> dict:
                 b_failed += 1
                 continue
 
+            # §1.2's response contract: `{id, rev, content_hash, outcome}`
+            # with outcome ∈ created|updated|unchanged. `unchanged` is this
+            # route's own idempotency-gate hit — the direct successor of the
+            # content-hash route's `deduplicated`, so it keeps feeding the
+            # same journal column and the same `deduplicated` counter
+            # `report()`/the CLI already read.
+            outcome = (data or {}).get("outcome")
             await run_in_threadpool(
                 db.execute,
                 TABLE,
                 """
                 UPDATE {table}
                 SET status = :status, external_id = :external_id,
+                    last_synced_hash = :content_hash,
                     server_deduplicated = :server_deduplicated, error = NULL, updated_at = :now
                 WHERE relpath = :relpath
                 """,
                 {
                     "status": STATUS_UPLOADED,
                     "external_id": (data or {}).get("id"),
-                    "server_deduplicated": int(bool((data or {}).get("deduplicated"))),
+                    # The server's own hash of what it stored, not a local
+                    # re-hash: `fs_sync.py` compares its scan digest against
+                    # this column, so the two must come from the same source
+                    # of truth (same rule that module's own upload journals
+                    # by). Falls back to hashing the bytes we just sent only
+                    # if a future server stops returning it.
+                    "content_hash": (
+                        (data or {}).get("content_hash") or hashlib.sha256(raw).hexdigest()
+                    ),
+                    "server_deduplicated": int(outcome == "unchanged"),
                     "now": now,
                     "relpath": relpath,
                 },
             )
-            if (data or {}).get("deduplicated"):
+            if outcome == "unchanged":
                 b_dedup += 1
             else:
                 b_uploaded += 1

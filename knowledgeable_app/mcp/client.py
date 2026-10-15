@@ -267,6 +267,51 @@ async def mark_delete_by_path(
     return await _post_json("/api/documents/mark-delete-by-path", body, params=params)
 
 
+async def mark_delete(
+    node_id: str, *, bucket: str, reason: str | None = None
+) -> tuple[dict | None, str | None]:
+    """POST /api/documents/{node_id}/mark-delete — the BY-ID half of §7's
+    two-phase delete, deliberately without ``force``: it sets
+    ``sync_status: pending_delete`` and nothing else, so the document stays
+    searchable until a human (or `approve_pending_deletions`) approves it.
+
+    fs-sync's per-tick delete marking does NOT use this — it uses
+    ``mark_delete_by_path`` above, because a journal row's `external_id` can
+    only ever name one of several documents sharing a path (§17.1). This
+    one exists for the opposite case: `orphan_reconcile.py` has to mark ONE
+    specific document out of such a group and must leave its live sibling
+    alone, which a by-path mark cannot express.
+
+    `bucket` travels as a query param — same `require_bucket_write`
+    reasoning as every other write in this module (memory
+    `fs-sync-writes-need-an-explicit-bucket`: an omitted bucket 400s as
+    ambiguous the moment a second writable bucket exists, and it has
+    already broken two call sites in this file)."""
+    body: dict = {}
+    if reason:
+        body["reason"] = reason
+    return await _post_json(
+        f"/api/documents/{node_id}/mark-delete", body, params={"bucket": bucket}
+    )
+
+
+async def get_documents(bucket: str | None = None) -> tuple[dict | None, str | None]:
+    """GET /api/documents — the full document listing for a bucket, as JSON
+    (the sibling of the `list_documents` MCP tool below, which returns the
+    same payload shaped as agent-facing text). `orphan_reconcile.py` joins
+    this against the journal, so it needs the structured form.
+
+    `bucket` is optional for the same reason `get_documents_pending_delete`
+    leaves it optional: this route resolves an omitted bucket through
+    `resolve_search_scope` (every bucket the token can read), not through
+    `require_bucket_read`'s single-bucket rule — so there is no ambiguity
+    400 to avoid here. Pass it anyway when you mean one bucket."""
+    params: dict = {}
+    if bucket:
+        params["bucket"] = bucket
+    return await _get("/api/documents", params or None)
+
+
 async def get_sync_paths(
     workspace_slug: str, *, after: str | None = None, limit: int = 500, bucket: str | None = None
 ) -> tuple[dict | None, str | None]:

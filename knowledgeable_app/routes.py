@@ -27,7 +27,17 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
-from . import bulk_ingest, fs_sync, git_backend, ingest_key_push, key_vault, label_key_push, mcp_config, playground_key_push
+from . import (
+    bulk_ingest,
+    fs_sync,
+    git_backend,
+    ingest_key_push,
+    key_vault,
+    label_key_push,
+    mcp_config,
+    orphan_reconcile,
+    playground_key_push,
+)
 from .mcp import client
 from .workspace_env import workspace_env
 
@@ -220,7 +230,14 @@ def build_routes(ctx) -> FastAPI:
             "token": ctx.secrets.read(GIT_TOKEN_KEY) or "",
             "workspace_slug": workspace_env("AW_WORKSPACE"),
         }
-        kwargs = {"git_config": git_config}
+        kwargs = {
+            "git_config": git_config,
+            # Card `3fa5bf3b` — this driver uploads by path now, so the slug
+            # is a quarter of the document identity here exactly as it
+            # already is for `fs_sync_run` below. Same `workspace_env`
+            # source (§6); `run_tick` refuses rather than defaulting it.
+            "workspace_slug": workspace_env("AW_WORKSPACE"),
+        }
         if max_uploads is not None:
             kwargs["max_uploads"] = int(max_uploads)
         result = await bulk_ingest.run_tick(ctx.db, ctx.state.lease, **kwargs)
@@ -278,6 +295,21 @@ def build_routes(ctx) -> FastAPI:
     @app.get("/fs-sync/report", dependencies=[Depends(_require_identity)])
     async def fs_sync_report() -> dict:
         return await run_in_threadpool(fs_sync.report, ctx.db, ctx.config.get("sync_quiet_rules"))
+
+    @app.post("/fs-sync/reconcile-orphans", dependencies=[Depends(_require_identity)])
+    async def fs_sync_reconcile_orphans(request: Request, data: dict = Body(default={})) -> dict:
+        """Card `3fa5bf3b` — mark the journal-orphaned duplicate documents
+        the two-identity gap stranded. `apply` defaults to FALSE: an
+        un-parameterized call is a dry-run measurement, and marking is the
+        explicit opt-in. `_caller_actor` is the same audit identity the MCP
+        approve/decline tools already record, so a mark and its later
+        approval appear in one log with the same shape."""
+        kwargs: dict = {"apply": bool(data.get("apply")), "actor": _caller_actor(request)}
+        if data.get("limit") is not None:
+            kwargs["limit"] = int(data["limit"])
+        if data.get("bucket"):
+            kwargs["bucket"] = str(data["bucket"])
+        return await orphan_reconcile.reconcile(ctx.db, **kwargs)
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

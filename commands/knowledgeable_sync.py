@@ -11,12 +11,21 @@ Usage:
     aw-workspace-cli knowledgeable-sync run [--max-uploads N]  # one bounded tick (default 200)
     aw-workspace-cli knowledgeable-sync status                 # journal counts: synced/missing/pending-delete
     aw-workspace-cli knowledgeable-sync report                 # per-subtree §3/§7 deliverable report
+    aw-workspace-cli knowledgeable-sync reconcile-orphans [--apply] [--limit N]
 
 Exit codes for `run`: 0 progressed or nothing to do, 1 the tick was
 blocked — the §6 workspace_slug refusal, another tick already in
 progress, or the §7 mass-delete valve tripped (check `status` for
 `valve_tripped` and verify the tree before clearing it or approving in
 the UI).
+
+`reconcile-orphans` (card `3fa5bf3b`) marks the duplicate documents no
+journal row references any more — the ones delete detection structurally
+cannot reach. It is a DRY RUN unless `--apply` is passed, it only ever
+MARKS (the two-phase approval queue still gates every actual delete), and
+it refuses to mark more than the §7 valve's own ceiling in one pass
+(`--limit` defaults to 100). Approve the resulting queue with the
+`approve_pending_deletions` MCP tool, or decline it to undo.
 """
 from __future__ import annotations
 
@@ -72,6 +81,23 @@ def run(args: list[str] | None = None) -> int:
             print(f"report failed: HTTP {status} {body}", file=sys.stderr)
             return 1
         print(json.dumps(body, indent=2))
+        return 0
+
+    if sub == "reconcile-orphans":
+        payload = {"apply": "--apply" in rest}
+        if "--limit" in rest:
+            payload["limit"] = int(rest[rest.index("--limit") + 1])
+        status, body = local_client.request("POST", f"{_BASE}/reconcile-orphans", payload)
+        if status != 200:
+            print(f"reconcile-orphans failed: HTTP {status} {body}", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2))
+        # `ok: False` is a reachability/listing failure, not "nothing to
+        # reconcile" — exit non-zero so a scripted caller notices, same
+        # rule `run`'s own `blocked` check follows.
+        if not body.get("ok"):
+            print(f"reconcile-orphans: {body.get('error')}", file=sys.stderr)
+            return 1
         return 0
 
     print(f"unknown subcommand {sub!r}", file=sys.stderr)
