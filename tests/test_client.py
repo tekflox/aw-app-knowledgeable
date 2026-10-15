@@ -432,6 +432,81 @@ def test_put_document_by_path_sends_bucket_as_a_query_param():
     assert call["files"] == {"file": ("notes.md", b"kb body")}
 
 
+def test_mark_delete_by_path_sends_bucket_as_a_query_param():
+    """fs-sync-delete-mark-bucket-missing — the sibling of
+    test_put_document_by_path_sends_bucket_as_a_query_param above.
+    POST /api/documents/mark-delete-by-path is gated by the same
+    `require_bucket_write` dependency: an omitted `bucket` resolves
+    server-side to "the tenant's sole writable bucket", 400ing as
+    ambiguous the moment a second writable bucket exists. This was the
+    second call site carrying the exact defect `put_document_by_path` was
+    fixed for — missed because that fix was scoped to the upload call
+    only."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(200, {"source_path": "notion/x.md", "marked": ["doc-1"], "count": 1})
+    )
+    data, err = _run(
+        client.mark_delete_by_path("notion/x.md", "aw", bucket="main", reason="2 consecutive misses")
+    )
+    assert err is None
+    assert data == {"source_path": "notion/x.md", "marked": ["doc-1"], "count": 1}
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/documents/mark-delete-by-path"
+    assert call["params"] == {"bucket": "main"}
+    assert call["json"] == {
+        "source_path": "notion/x.md", "workspace_slug": "aw", "reason": "2 consecutive misses",
+    }
+
+
+# ---------------------------------------------------------------------------
+# fs-sync-delete-mark-bucket-missing's audit — EVERY client method that
+# hits a `require_bucket_write`-gated route and can name a bucket at all
+# (i.e. not `upload_document`/`create_node`/`create_link`, whose MCP tool
+# schemas have no `bucket` argument for an agent to fill in — a structural
+# inability to name one, not an omission; see
+# `_resolve_implicit_write_bucket`'s own docstring in identity.py) MUST
+# send it explicitly. A test that only pins one method's call shape — the
+# mistake that let this exact defect ship twice — can't catch the next
+# missed call site; this one is table-driven so adding a new bucket-
+# requiring method means adding a row here, not writing a new test file.
+# ---------------------------------------------------------------------------
+
+_BUCKET_REQUIRING_WRITE_CALLS = [
+    (
+        "upload_bytes",
+        lambda: client.upload_bytes("notes.md", b"body", bucket="main", source_path="x.md"),
+    ),
+    (
+        "put_document_by_path",
+        lambda: client.put_document_by_path(
+            "notes.md", b"body", bucket="main", source_path="authored/x.md", workspace_slug="aw",
+        ),
+    ),
+    (
+        "mark_delete_by_path",
+        lambda: client.mark_delete_by_path("notion/x.md", "aw", bucket="main"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,call", _BUCKET_REQUIRING_WRITE_CALLS, ids=[row[0] for row in _BUCKET_REQUIRING_WRITE_CALLS]
+)
+def test_every_bucket_requiring_write_call_sends_an_explicit_bucket(name, call):
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {
+        "id": "doc-1", "rev": 1, "content_hash": "h", "outcome": "created",
+        "deduplicated": False, "source_path": "x.md", "marked": [], "count": 0,
+    }))
+    _run(call())
+    sent_params = _FakeAsyncClient._CALLS[0]["params"] or {}
+    assert sent_params.get("bucket") == "main", (
+        f"{name} must send bucket explicitly as a query param — "
+        "require_bucket_write resolves an omitted bucket to the tenant's "
+        "sole writable bucket, which 400s the moment a second one exists "
+        "(fs-sync-delete-mark-bucket-missing)"
+    )
+
+
 def test_push_playground_key_sends_the_value_and_secret_header():
     _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"ok": True, "configured": True}))
     ok, err = _run(client.push_playground_key("apmt-scoped-key"))

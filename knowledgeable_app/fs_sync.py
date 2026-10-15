@@ -837,7 +837,7 @@ async def _run_restore_reconcile_catchup(
     return reconciled
 
 
-async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBudget") -> int:
+async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBudget") -> tuple[int, int]:
     """§17.4 — the one-time heal for the live 35 (and any sibling like
     them): for every journal row already `pending_delete=1`, re-issue the
     by-path mark once. Idempotent server-side (`SET` on an already-marked
@@ -852,11 +852,15 @@ async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBud
     already-swept row's re-mark returns `count: 0`), and "done" must mean
     every `pending_delete=1` row at the start of this run was actually
     attempted, not "we got through some of them."
-    """
+
+    Returns ``(swept, failed)`` — ``failed`` is the count of calls that came
+    back with an error (rather than silently vanishing into the `deferred`
+    log line), summed into the tick result's `delete_marks_failed`."""
     await run_in_threadpool(_ensure_flags_table, db)
     if await run_in_threadpool(_catchup_done, db):
-        return 0
+        return 0, 0
     swept = 0
+    failed = 0
     deferred = False
     for relpath, row in journal.items():
         if not row["pending_delete"]:
@@ -865,17 +869,19 @@ async def _run_catchup(db, journal: dict, workspace_slug: str, budget: "_MarkBud
             deferred = True
             break
         data, err = await client.mark_delete_by_path(
-            relpath, workspace_slug, reason="fs-sync §17.4 one-time catch-up",
+            relpath, workspace_slug, bucket=bulk_ingest.BUCKET,
+            reason="fs-sync §17.4 one-time catch-up",
         )
         if err:
             log.warning("fs_sync: catch-up mark-delete-by-path failed for %s: %s", relpath, err)
             deferred = True
+            failed += 1
             continue
         budget.record((data or {}).get("count") or 0)
         swept += 1
     if not deferred:
         await run_in_threadpool(_mark_catchup_done, db)
-    return swept
+    return swept, failed
 
 
 def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
@@ -885,6 +891,7 @@ def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
         "updated": 0,
         "unchanged": 0,
         "deleted_marked": 0,
+        "delete_marks_failed": 0,
         "failed": 0,
     }
     if reason is not None:
@@ -1008,7 +1015,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
     # below share one `_MarkBudget`, drawing on the SAME threshold guard 2
     # already computed: one document-marking ceiling per tick, not two.
     mark_budget = _MarkBudget(doc_ceiling)
-    catchup_marked = await _run_catchup(db, journal, workspace_slug, mark_budget)
+    catchup_marked, catchup_failed = await _run_catchup(db, journal, workspace_slug, mark_budget)
 
     created = updated = unchanged = failed = 0
     upload_remaining = upload_budget
@@ -1159,7 +1166,9 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
         else:
             updated += 1
 
-    deleted_marked = await _mark_missing_as_deleted(db, journal, found, workspace_slug, mark_budget)
+    deleted_marked, delete_marks_failed_live = await _mark_missing_as_deleted(
+        db, journal, found, workspace_slug, mark_budget
+    )
 
     result = {
         "blocked": False,
@@ -1167,6 +1176,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
         "updated": updated,
         "unchanged": unchanged,
         "deleted_marked": deleted_marked,
+        "delete_marks_failed": delete_marks_failed_live + catchup_failed,
         "failed": failed,
         "bucket": bulk_ingest.BUCKET,
         "adopted": adopted_count,
@@ -1200,7 +1210,7 @@ async def _run_tick_locked(db, max_uploads: int, workspace_slug: str, quiet_rule
 
 async def _mark_missing_as_deleted(
     db, journal: dict, found: dict[str, str], workspace_slug: str, budget: "_MarkBudget",
-) -> int:
+) -> tuple[int, int]:
     """§3.3 step 1 / §7, by-path since §17.2: advance `missing_scans` for
     every tracked path no longer on disk; at the SECOND consecutive miss,
     mark the WHOLE path via `mark_delete_by_path` — never `external_id`
@@ -1216,8 +1226,18 @@ async def _mark_missing_as_deleted(
     the existing `pending_delete` exclusion (both still advance
     `missing_scans`, harmlessly, via the `else` branch below; only the
     MARK itself is withheld). Clearing the flag is the found-loop's job
-    (`_run_tick_locked`, the moment the file reappears), not this one's."""
+    (`_run_tick_locked`, the moment the file reappears), not this one's.
+
+    Returns ``(marked, failed)`` — ``failed`` counts a `mark_delete_by_path`
+    call that came back with an error. That used to vanish into a
+    `log.warning` with no trace in the tick's own JSON result, which is
+    exactly how `deleted_marked: 0` read as "nothing to do" while rows sat
+    at 7/10/14/15 missing scans for hours — see the sibling card that
+    diagnosed this. `failed` is summed into `delete_marks_failed` by the
+    caller so a broken marking path can never again read as a quiet
+    success."""
     marked = 0
+    failed = 0
     for relpath, row in journal.items():
         if relpath in found:
             continue
@@ -1229,10 +1249,12 @@ async def _mark_missing_as_deleted(
             and not row["restore_suppressed"] and budget.allows_more()
         ):
             data, err = await client.mark_delete_by_path(
-                relpath, workspace_slug, reason="missing from source tree for 2 consecutive scans",
+                relpath, workspace_slug, bucket=bulk_ingest.BUCKET,
+                reason="missing from source tree for 2 consecutive scans",
             )
             if err:
                 log.warning("fs_sync: mark-delete-by-path failed for %s: %s", relpath, err)
+                failed += 1
                 await run_in_threadpool(
                     db.execute, TABLE,
                     "UPDATE {table} SET missing_scans = :missing WHERE relpath = :relpath",
@@ -1252,7 +1274,7 @@ async def _mark_missing_as_deleted(
                 "UPDATE {table} SET missing_scans = :missing WHERE relpath = :relpath",
                 {"missing": new_missing, "relpath": relpath},
             )
-    return marked
+    return marked, failed
 
 
 def status(db, quiet_rules: str | None = None) -> dict:

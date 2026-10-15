@@ -243,7 +243,7 @@ def test_valve_guard2_trips_past_the_mass_delete_threshold(_workspace_home, db, 
 
     calls = []
 
-    async def fake_mark_delete_by_path(source_path, workspace_slug, reason=None):
+    async def fake_mark_delete_by_path(source_path, workspace_slug, *, bucket=None, reason=None):
         calls.append(source_path)
         return {"source_path": source_path, "marked": ["doc-x"], "count": 1}, None
 
@@ -458,7 +458,7 @@ def test_missing_file_is_marked_on_the_second_consecutive_scan(_workspace_home, 
 
     called = []
 
-    async def fake_mark_delete_by_path(source_path, workspace_slug, reason=None):
+    async def fake_mark_delete_by_path(source_path, workspace_slug, *, bucket=None, reason=None):
         called.append(source_path)
         return {"source_path": source_path, "marked": ["doc-99"], "count": 1}, None
 
@@ -570,7 +570,7 @@ def test_backlog_ceiling_skips_uploads_but_still_tracks_deletes(
         lambda *a, **k: called.append(1) or _async({"id": "doc-1", "outcome": "updated", "content_hash": "x"}, None),
     )
 
-    async def fake_mark_delete_by_path(source_path, workspace_slug, reason=None):
+    async def fake_mark_delete_by_path(source_path, workspace_slug, *, bucket=None, reason=None):
         return {"source_path": source_path, "marked": ["doc-99"], "count": 1}, None
 
     monkeypatch.setattr(client, "mark_delete_by_path", fake_mark_delete_by_path)
@@ -618,7 +618,7 @@ def test_adopted_row_is_marked_via_by_path_on_the_second_miss(_workspace_home, d
 
     calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         calls.append((source_path, workspace_slug))
         return {"source_path": source_path, "marked": ["doc-x"], "count": 1}, None
 
@@ -632,6 +632,33 @@ def test_adopted_row_is_marked_via_by_path_on_the_second_miss(_workspace_home, d
     row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/gone.md")
     assert row["missing_scans"] == 2
     assert row["pending_delete"] == 1
+
+
+def test_a_failed_mark_delete_by_path_is_counted_not_swallowed(_workspace_home, db, lease, monkeypatch):
+    """fs-sync-delete-mark-bucket-missing — the silent-swallow half of the
+    fix. Before this, `_mark_missing_as_deleted` turned a `mark_delete_by_
+    path` error into nothing but a `log.warning`: the tick's own JSON
+    result had no trace of it, which is exactly how `deleted_marked: 0`
+    read as "nothing to do" for hours while rows sat well past the
+    2-scan threshold (the bucket-param omission this card fixes was the
+    actual cause of every one of those errors in production). A failed
+    mark must now surface as `delete_marks_failed` instead of vanishing."""
+    _write(bulk_ingest.kb_root(), "notion/keep.md", "keep me")
+    _seed_adopted(db, "notion/gone.md", missing_scans=1)
+
+    async def failing_mark(source_path, workspace_slug, *, bucket=None, reason=None):
+        return None, "HTTP 400: bucket is required"
+
+    monkeypatch.setattr(client, "mark_delete_by_path", failing_mark)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["deleted_marked"] == 0
+    assert result["delete_marks_failed"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/gone.md")
+    assert row["missing_scans"] == 2  # still advances — only the MARK itself failed
+    assert row["pending_delete"] == 0  # never set on a failed mark
 
 
 def test_adoption_excludes_skipped_paths(_workspace_home, db, lease, monkeypatch):
@@ -804,7 +831,7 @@ def test_in_pass_document_ceiling_stops_marking_sets_the_flag_and_exits_non_zero
 
     calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         calls.append(source_path)
         return {
             "source_path": source_path,
@@ -840,7 +867,7 @@ def test_catchup_reissues_mark_delete_by_path_once_then_stays_off(
 
     calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         calls.append(source_path)
         return {"source_path": source_path, "marked": ["doc-1", "doc-1-sibling"], "count": 2}, None
 
@@ -874,7 +901,7 @@ def test_valve_guard1_aborts_before_adoption_or_catchup_touch_anything(
         sync_paths_calls.append(1)
         return {"paths": [], "cursor": None}, None
 
-    async def spy_mark(source_path, workspace_slug, reason=None):
+    async def spy_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         mark_calls.append(source_path)
         return {"source_path": source_path, "marked": [], "count": 0}, None
 
@@ -1446,7 +1473,7 @@ def test_decline_restore_arriving_on_the_feed_clears_the_stale_journal_mark(
 
     mark_calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         mark_calls.append(source_path)
         return {"source_path": source_path, "marked": [], "count": 0}, None
 
@@ -1536,7 +1563,7 @@ def test_restore_suppression_holds_across_further_ticks_while_the_file_stays_mis
 
     mark_calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         mark_calls.append(source_path)
         return {"source_path": source_path, "marked": [], "count": 0}, None
 
@@ -1581,7 +1608,7 @@ def test_restore_suppression_clears_on_reappearance_then_re_marks_after_normal_t
 
     mark_calls = []
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         mark_calls.append(source_path)
         return {"source_path": source_path, "marked": ["doc-7"], "count": 1}, None
 
@@ -1787,7 +1814,7 @@ def test_restore_reconcile_catchup_three_way_split(_workspace_home, db, lease, m
     async def fake_pending_delete():
         return {"documents": [{"source_path": "notion/still-pending.md"}]}, None
 
-    async def fake_mark(source_path, workspace_slug, reason=None):
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
         return {"source_path": source_path, "marked": [], "count": 0}, None
 
     monkeypatch.setattr(client, "get_sync_paths", fake_sync_paths)

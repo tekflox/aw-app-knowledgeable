@@ -240,7 +240,7 @@ async def put_document_by_path(
 
 
 async def mark_delete_by_path(
-    source_path: str, workspace_slug: str, *, reason: str | None = None
+    source_path: str, workspace_slug: str, *, bucket: str, reason: str | None = None
 ) -> tuple[dict | None, str | None]:
     """POST /api/documents/mark-delete-by-path (docs/design/aw-knowledgeable-
     fs-sync.md §17.2) — marks EVERY document claiming
@@ -252,11 +252,19 @@ async def mark_delete_by_path(
     documents sharing a path (§17.1's 35 structurally-unreachable
     `cli_reference/` documents), so this engine stops dereferencing it for
     deletes entirely. Service-only, two-phase, no `force` variant.
-    Response is ``{source_path, marked: [ids], count}``."""
+    Response is ``{source_path, marked: [ids], count}``.
+
+    `bucket` travels as a query param, same as ``put_document_by_path`` and
+    ``upload_bytes`` above — this route is gated by ``require_bucket_write``
+    too, which reads `bucket` off the query string and 400s as ambiguous
+    the moment a second writable bucket exists. This was the same omission
+    `put_document_by_path` had until it was fixed; this call site had been
+    missed."""
+    params: dict = {"bucket": bucket}
     body: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
     if reason:
         body["reason"] = reason
-    return await _post_json("/api/documents/mark-delete-by-path", body)
+    return await _post_json("/api/documents/mark-delete-by-path", body, params=params)
 
 
 async def get_sync_paths(
