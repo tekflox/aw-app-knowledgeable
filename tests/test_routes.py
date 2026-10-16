@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import pending_deletions, routes as routes_mod  # noqa: E402
+from knowledgeable_app import forwarding, pending_deletions, routes as routes_mod  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -103,9 +103,21 @@ def app_client():
         secrets=_FakeSecrets(), config={}, state=SimpleNamespace(kv=_FakeKv()), db=_FakeDb()
     )
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "")
+    # Same manual-wiring pattern as `client.configure` above — `build_routes`
+    # itself calls neither; only `plugin.activate` does in production. See
+    # feature:knowledgeable-connector-forwards-to-codegraph.
+    forwarding.configure(lambda: ctx.config or {})
     app = routes_mod.build_routes(ctx)
     app.dependency_overrides[routes_mod._require_identity] = lambda: None
     return TestClient(app), ctx
+
+
+@pytest.fixture(autouse=True)
+def _reset_forwarding_registry():
+    forwarding._availability_cache.clear()
+    yield
+    forwarding.configure(lambda: {})
+    forwarding._availability_cache.clear()
 
 
 def test_status_starts_logged_out(app_client):
@@ -115,6 +127,57 @@ def test_status_starts_logged_out(app_client):
     body = resp.json()
     assert body["logged_in"] is False
     assert body["tools"] == [t["name"] for t in client.TOOLS_SCHEMA]
+
+
+def test_status_forward_upstreams_empty_by_default(app_client):
+    """No `forward_upstreams` configured → the block is present and empty,
+    never missing (design §6's "always an explicit verdict" contract)."""
+    tc, _ = app_client
+    resp = tc.get("/status")
+    assert resp.json()["forward_upstreams"] == []
+
+
+def test_status_forward_upstreams_reports_a_configured_entry(app_client, monkeypatch):
+    tc, ctx = app_client
+    ctx.config = {
+        "forward_upstreams": [
+            {
+                "id": "codegraph",
+                "transport": "app-mcp",
+                "app_slug": "codegraph",
+                "tools": {"codegraph_status": {"args": []}},
+                "probe": {"tool": "codegraph_status", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 5},
+                "timeout_s": 10,
+            }
+        ]
+    }
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text", "text": "ok"}], "isError": False},
+            }
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(forwarding, "httpx", type("M", (), {"AsyncClient": _FakeAsyncClient}))
+    resp = tc.get("/status")
+    rows = resp.json()["forward_upstreams"]
+    assert rows == [{"id": "codegraph", "available": True, "checked_at": rows[0]["checked_at"], "reason": None}]
 
 
 def test_settings_requires_a_secret(app_client):

@@ -161,6 +161,42 @@
         "default": "",
         "title": "Unattended deletion approval",
         "description": "docs/design/aw-knowledgeable-fs-sync.md \u00a721. Comma- or newline-separated rules `prefix=auto[:min_missing_scans]` or `prefix=manual`. Longest matching prefix wins; paths matching no rule stay `manual` (today's behaviour \u2014 a human approves in the Library UI). `min_missing_scans` defaults to 2, the same tick a delete mark lands. An empty prefix is rejected (no blanket auto-approve, ever) and so is an `auto` rule anchored at `authored/` (\u00a74's downsync is not yet exercised) \u2014 both are skipped and surfaced as delete_policy_invalid in GET /fs-sync/status rather than silently disabling or silently enabling anything. Default empty ships inert, byte-identical to today. Auto-approval also stays off whenever the \u00a77 mass-delete valve is latched, until an audited POST /fs-sync/valve/clear."
+      },
+      "forward_upstreams": {
+        "type": "array",
+        "title": "Forwardable upstreams",
+        "description": "docs/design/knowledgeable-connector-tool-forwarder.md. Each entry is {id, transport, app_slug, tools (tool allow-list, each with a per-tool argument allow-list), probe {tool, ttl_ok_s, ttl_fail_s, timeout_s}, timeout_s} \u2014 a forwarded `knowledge_search(include_code=true)` call reaches `http://127.0.0.1:$AW_PORT/api/apps/<app_slug>/mcp` with `X-Api-Key=$AW_WORKSPACE_API_KEY`, under this connector's own authorization, never the caller's. `transport` must be `app-mcp` (the only kind in v1 \u2014 any other installed app's own self-registered /mcp route; a non-app upstream is a new transport kind and deliberately a code change, aw-mcp-gateway's job instead). An unlisted tool or argument is rejected by name at the boundary, never silently dropped \u2014 `projectPath` is deliberately absent from codegraph's own arg allow-list below, since it would otherwise be a filesystem-read primitive over repos/**. Ships with codegraph as the default first entry so this path is exercised, not dormant.",
+        "default": [
+          {
+            "id": "codegraph",
+            "transport": "app-mcp",
+            "app_slug": "codegraph",
+            "tools": {
+              "codegraph_explore": {
+                "args": ["query", "maxFiles"]
+              },
+              "codegraph_search": {
+                "args": ["query", "limit"]
+              },
+              "codegraph_callers": {
+                "args": ["symbol", "limit"]
+              },
+              "codegraph_status": {
+                "args": []
+              }
+            },
+            "probe": {
+              "tool": "codegraph_status",
+              "ttl_ok_s": 60,
+              "ttl_fail_s": 15,
+              "timeout_s": 5
+            },
+            "timeout_s": 10
+          }
+        ],
+        "items": {
+          "type": "object"
+        }
       }
     },
     "required": []

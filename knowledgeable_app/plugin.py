@@ -15,7 +15,7 @@ import logging
 import os
 from contextlib import suppress
 
-from . import ingest_key_push, label_key_push, mcp_config, playground_key_push, routes as routes_mod
+from . import forwarding, ingest_key_push, label_key_push, mcp_config, playground_key_push, routes as routes_mod
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable")
@@ -29,6 +29,10 @@ class KnowledgeableAppPlugin:
             base_url_resolver=lambda: (ctx.config or {}).get("base_url") or client.DEFAULT_BASE_URL,
             secret_resolver=lambda: ctx.secrets.read(routes_mod.SECRET_KEY) or "",
         )
+        # feature:knowledgeable-connector-forwards-to-codegraph — same
+        # read-fresh-every-call rule as `client.configure` above, so a saved
+        # `forward_upstreams` edit takes effect on the next tool call.
+        forwarding.configure(lambda: ctx.config or {})
 
         ctx.routes.register(routes_mod.build_routes(ctx))
 

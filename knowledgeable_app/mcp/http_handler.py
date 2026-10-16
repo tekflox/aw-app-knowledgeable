@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from . import client
-from .. import pending_deletions
+from .. import forwarding, pending_deletions
 
 log = logging.getLogger("aw_apps.knowledgeable")
 
@@ -27,7 +27,11 @@ _DISPATCH = {
     "list_documents": client.list_documents,
     "search_nodes": client.search_nodes,
     "search_graph": client.search_graph,
-    "knowledge_search": client.knowledge_search,
+    # Re-pointed at the forwarding composition wrapper (design
+    # docs/design/knowledgeable-connector-tool-forwarder.md §10) —
+    # `include_code` absent/false delegates straight to `client.knowledge_search`
+    # unchanged; no other dispatch row changes.
+    "knowledge_search": forwarding.compose_knowledge_search,
     "list_pending_deletions": pending_deletions.list_pending_deletions,
 }
 

@@ -617,23 +617,17 @@ async def search_graph(args: dict) -> tuple[str, bool]:
     return _as_text(data), False
 
 
-async def knowledge_search(args: dict) -> tuple[str, bool]:
-    """POST /api/knowledge/search (feature:knowledge-search-tunable-
-    endpoint) — the bounded plan -> fan-out -> fuse -> synthesize pipeline,
-    distinct from `search_graph`'s single-arm retrieval: this tool runs
-    MULTIPLE sub-queries across MULTIPLE arms in parallel and fuses them
-    with Reciprocal Rank Fusion before optionally synthesizing an answer.
-
-    Every knob below is advisory — the backend clamps, never 400s, on an
-    out-of-floor value, and reports every override in the response's own
-    `effective`/`clamped` fields. This tool forwards every knob field-by-
-    field (never the raw `args` dict) and never re-validates a range
-    itself, same rule `search_graph` already follows: the backend's own
-    floors are the single source of truth.
+async def knowledge_search_data(args: dict) -> tuple[dict | None, str | None]:
+    """Same request shaping/timeout as `knowledge_search` below, returning
+    the raw parsed JSON instead of pre-formatted text — the forwarding
+    composition wrapper (`forwarding.compose_knowledge_search`,
+    feature:knowledgeable-connector-forwards-to-codegraph) needs the dict to
+    assemble the `{knowledge, code}` response; `knowledge_search` itself is
+    the other caller, unchanged below.
     """
     query = (args.get("query") or "").strip()
     if not query:
-        return "query is required", True
+        return None, "query is required"
 
     body: dict = {"query": query}
     for field in ("mode", "radius", "limit", "subqueries", "rounds", "budget_ms", "synthesize"):
@@ -655,7 +649,28 @@ async def knowledge_search(args: dict) -> tuple[str, bool]:
     budget_ms = body.get("budget_ms") or 20000
     timeout = min(45.0, max(30.0, budget_ms / 1000.0 + 10.0))
 
-    data, err = await _post_json("/api/knowledge/search", body, params=params, timeout=timeout)
+    return await _post_json("/api/knowledge/search", body, params=params, timeout=timeout)
+
+
+async def knowledge_search(args: dict) -> tuple[str, bool]:
+    """POST /api/knowledge/search (feature:knowledge-search-tunable-
+    endpoint) — the bounded plan -> fan-out -> fuse -> synthesize pipeline,
+    distinct from `search_graph`'s single-arm retrieval: this tool runs
+    MULTIPLE sub-queries across MULTIPLE arms in parallel and fuses them
+    with Reciprocal Rank Fusion before optionally synthesizing an answer.
+
+    Every knob below is advisory — the backend clamps, never 400s, on an
+    out-of-floor value, and reports every override in the response's own
+    `effective`/`clamped` fields. This tool forwards every knob field-by-
+    field (never the raw `args` dict) and never re-validates a range
+    itself, same rule `search_graph` already follows: the backend's own
+    floors are the single source of truth.
+    """
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "query is required", True
+
+    data, err = await knowledge_search_data(args)
     if err:
         return f"knowledge_search failed: {err}", True
     return _as_text(data), False
@@ -926,12 +941,40 @@ TOOLS_SCHEMA = [
             "provenance), `citations`, `answer` (null if `synthesize=false` or "
             "if the synthesis door is degraded — retrieval still runs either way), "
             "and `plan` (which sub-queries actually ran, and whether the planner "
-            "or a deterministic fallback produced them)."
+            "or a deterministic fallback produced them). "
+            "`include_code` (default false) additionally forwards a code-reality "
+            "question to the workspace code graph, when installed/available "
+            "(docs/design/knowledgeable-connector-tool-forwarder.md) — the "
+            "response then wraps as `{knowledge, code}` instead of the plain "
+            "retrieval payload: `knowledge` is this tool's unchanged payload, "
+            "`code` is a SEPARATE section (`status: 'ok'|'unavailable'`, "
+            "`result`/`reason`, `elapsed_ms`) that is NEVER fused into `chunks` "
+            "or `citations` — the knowledge graph and the code graph are "
+            "disjoint key spaces, so a code result standing in for KG evidence "
+            "would be fabricated comparability. Omitting `include_code` keeps "
+            "the response byte-identical to today."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "The question to search for. Required."},
+                "include_code": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. true also asks the workspace code graph "
+                        "(codegraph), when installed and reachable, and returns its "
+                        "answer in a separate top-level `code` section beside "
+                        "`knowledge`. Absent entirely, the response is unchanged."
+                    ),
+                },
+                "code_query": {
+                    "type": "string",
+                    "description": (
+                        "Only used when `include_code` is true. The code-side "
+                        "question, when it should differ from `query` (e.g. a "
+                        "symbol name vs. a natural-language ask). Defaults to `query`."
+                    ),
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["vector", "lexical", "graph", "fused"],

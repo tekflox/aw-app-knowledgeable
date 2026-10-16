@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import (
     bulk_ingest,
+    forwarding,
     fs_sync,
     git_backend,
     ingest_key_push,
@@ -134,6 +135,11 @@ def build_routes(ctx) -> FastAPI:
             "base_url": base,
             "tools": [t["name"] for t in client.TOOLS_SCHEMA],
             "mcp_server": mcp_config.SERVER_NAME,
+            # feature:knowledgeable-connector-forwards-to-codegraph —
+            # operator visibility into each forward_upstreams entry's
+            # availability (design §6), greppable by doctor tooling, not
+            # only inside tool responses.
+            "forward_upstreams": await forwarding.status_block(),
             # §16.3 point 3 — the git backend's own failure surface. `enabled`
             # mirrors git_backend.sync_tick's own "no git_remote_url, nothing
             # to do" contract; `state`/`detail` are whatever the last tick
