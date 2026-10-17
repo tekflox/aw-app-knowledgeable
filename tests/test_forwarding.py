@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -253,6 +254,22 @@ def test_status_block_reports_unavailable_with_reason():
 def test_status_block_empty_registry_when_unconfigured():
     forwarding.configure(lambda: {})
     assert _run(forwarding.status_block()) == []
+
+
+def test_registry_logs_when_the_config_resolver_raises(caplog):
+    """A broken resolver and an unconfigured app both yield an empty
+    registry, so the only thing that tells them apart is the log line.
+    Pin it: forwarding may degrade, but never silently."""
+
+    def _boom():
+        raise RuntimeError("config store unreachable")
+
+    forwarding.configure(_boom)
+    with caplog.at_level(logging.ERROR, logger="aw_apps.knowledgeable"):
+        assert forwarding._registry() == []
+    assert any(
+        "forwarding disabled" in r.message and r.exc_info for r in caplog.records
+    ), caplog.text
 
 
 # ---------------------------------------------------------------------------

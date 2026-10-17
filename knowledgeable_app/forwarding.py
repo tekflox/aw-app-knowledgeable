@@ -68,6 +68,11 @@ def _registry() -> list[dict]:
     try:
         cfg = _config_resolver() or {}
     except Exception:
+        # Forwarding stays off when config can't be read — but never
+        # silently: an empty registry and a broken resolver are
+        # indistinguishable to every caller below, and this estate's
+        # failure mode is silent degradation, not crashes.
+        log.exception("forward_upstreams: config resolver failed; forwarding disabled")
         return []
     raw = cfg.get("forward_upstreams")
     if raw is None:
