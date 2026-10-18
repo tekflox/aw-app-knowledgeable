@@ -19,11 +19,15 @@ Four facts this file stands on, each verified rather than assumed:
   identity is ``runs.source_slug`` (§12 risk 2). The graph property keeps the
   name ``agent_slug`` because that is what the measurement's Cypher and the
   tool prompts already use.
-* **``run_events.payload`` contains literal ``\\u0000``.** Any server-side
-  ``payload::text``/``payload->>`` over the whole document fails with
-  "unsupported Unicode escape sequence", so the document is never cast
-  server-side: psycopg parses it client-side (where the escape is legal) and
-  the NULs are stripped before anything leaves here.
+* **``run_events.payload`` contains literal ``\\u0000``, and the column is
+  ``json``, not ``jsonb``.** So *no* server-side extraction is safe — not
+  ``payload::text``, and not ``payload->>'key'`` over a single key either,
+  because a text-backed ``json`` has to parse the whole document to reach any
+  part of it and the NUL fails the conversion ("unsupported Unicode escape
+  sequence"). The payload is therefore only ever selected raw: psycopg parses
+  it client-side (where the escape is legal) and the NULs are stripped before
+  anything leaves here. The ``->>'name'`` exception this file used to claim
+  was wrong and crashed the backfill mid-flight — see :func:`rollup_called`.
 * **``runs`` has NO ``updated_at``.** §8 told the Coder to check and tighten
   the re-sweep to it if present. Checked against
   ``agents-platform-multitenant/backend/app/models.py`` (``class Run``, lines
@@ -173,13 +177,54 @@ SQL_TOOL_CALLS = """
 """
 
 #: §5's `CALLED {n}` rollup, kept alongside `MADE_CALL` exactly as the
-#: measurement's graph had it.
-SQL_CALLED = """
-    SELECT e.run_id, e.payload->>'name' AS name, count(*) AS n
-    FROM run_events e
-    WHERE e.kind = 'tool_call' AND e.run_id = ANY(%(run_ids)s)
-    GROUP BY e.run_id, e.payload->>'name'
-"""
+#: measurement's graph had it — computed CLIENT-SIDE, with no SQL of its own.
+#:
+#: There used to be a second aggregate query here doing
+#: ``GROUP BY e.run_id, e.payload->>'name'``. It crashed the backfill on
+#: 2026-10-18 after ~21.4k runs had landed, with
+#: ``psycopg2.errors.UntranslatableCharacter: unsupported Unicode escape
+#: sequence``, and the first nine 2000-run ticks had passed only because no
+#: payload in those windows happened to carry a NUL.
+#:
+#: The reason is the one this module's docstring already states, applied one
+#: step further than it was: ``run_events.payload`` is ``json``, NOT
+#: ``jsonb`` — a text-backed type — so **every** server-side extraction,
+#: ``->>`` over a single key very much included, has to parse the whole
+#: document first, and a literal ``\\u0000`` anywhere in it fails the
+#: conversion. Verified straight against the production table, outside this
+#: code path entirely::
+#:
+#:     SELECT count(*) FROM run_events e
+#:      WHERE e.kind='tool_call' AND e.payload->>'name' IS NOT NULL;
+#:     DETAIL:  \\u0000 cannot be converted to text.
+#:
+#: So there is no narrower server-side form to retreat to, and the rollup is
+#: derived from the rows :data:`SQL_TOOL_CALLS` has already fetched and
+#: psycopg has already parsed client-side. That is exact rather than
+#: approximate: both used the identical predicate
+#: (``kind = 'tool_call' AND run_id = ANY(...)``) with no LIMIT, so they
+#: always described the same row set — and it is now one query per batch
+#: instead of two.
+
+
+def rollup_called(toolcall_rows: list[dict]) -> list[dict]:
+    """``[{run_id, name, n}]`` — the per-run tool-name counts, from the
+    already-parsed tool-call rows.
+
+    Rows with no name are dropped, exactly as the old ``GROUP BY`` did: a
+    ``CALLED`` edge needs a tool to point at.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for row in toolcall_rows:
+        name = row.get("name")
+        if not name:
+            continue
+        key = (row["run_id"], name)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"run_id": run_id, "name": name, "n": n}
+        for (run_id, name), n in counts.items()
+    ]
 
 #: The weekly count-reconcile's SQL side (§8). Mirrors `exec_counts`'
 #: Cypher arms label for label, so a mismatch names which layer drifted
@@ -421,7 +466,7 @@ async def _run_tick_locked(
         for batch in plan_batches(run_rows, batch_bytes=batch_bytes):
             run_ids = [r["id"] for r in batch]
             toolcalls = _fetch_tool_calls(conn, run_ids, scrubber)
-            called = _fetch_called(conn, run_ids)
+            called = rollup_called(toolcalls)
             ok, err = await client.post_exec_ingest(
                 runs=batch, tool_calls=toolcalls, called=called
             )
@@ -476,19 +521,6 @@ def _fetch_tool_calls(conn, run_ids: list[str], scrubber: exec_scrub.Scrubber) -
     try:
         cur.execute(SQL_TOOL_CALLS, {"run_ids": run_ids})
         return [build_toolcall_row(record, scrubber) for record in cur]
-    finally:
-        cur.close()
-
-
-def _fetch_called(conn, run_ids: list[str]) -> list[dict]:
-    cur = conn.cursor()
-    try:
-        cur.execute(SQL_CALLED, {"run_ids": run_ids})
-        return [
-            {"run_id": run_id, "name": _clean(name), "n": int(n)}
-            for run_id, name, n in cur
-            if name
-        ]
     finally:
         cur.close()
 

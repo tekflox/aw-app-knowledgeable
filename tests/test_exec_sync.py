@@ -66,9 +66,16 @@ class _FakeCursor:
         elif "row_number()" in sql:
             ids = set((params or {}).get("run_ids") or [])
             self._rows = [r for r in self._conn.tool_calls if r[0] in ids]
-        elif "GROUP BY e.run_id" in sql:
-            ids = set((params or {}).get("run_ids") or [])
-            self._rows = [r for r in self._conn.called if r[0] in ids]
+        elif "payload->>" in sql or "payload::text" in sql:
+            # The fake refuses what production refuses. `run_events.payload` is
+            # `json` (text-backed) and holds literal `\u0000`, so ANY
+            # server-side extraction parses the whole document and fails. A
+            # rollup query that came back here would pass a mock and crash the
+            # real backfill — which is exactly what happened on 2026-10-18.
+            raise AssertionError(
+                "server-side payload extraction is not usable on this corpus: "
+                f"{sql.strip()[:160]}"
+            )
         elif "count(" in sql:
             self._rows = [(self._conn.counts.pop(0),)]
         else:  # pragma: no cover - a query this fake was not taught
@@ -85,10 +92,9 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, runs=(), tool_calls=(), called=(), counts=()):
+    def __init__(self, runs=(), tool_calls=(), counts=()):
         self.runs = list(runs)
         self.tool_calls = list(tool_calls)
-        self.called = list(called)
         self.counts = list(counts)
         self.executed: list = []
         self.closed = False
@@ -261,7 +267,6 @@ def test_a_tick_posts_runs_tool_calls_and_called_then_stamps_the_sentinel(calls,
             ("run-1", {"name": "Bash", "input": {"command": "ls"}},
              datetime(2026, 10, 18, 10, 1, tzinfo=timezone.utc), 1),
         ],
-        called=[("run-1", "Bash", 1)],
     )
     result = _tick(conn, monkeypatch)
 
@@ -305,7 +310,6 @@ def test_every_text_field_goes_through_the_scrubber(calls, monkeypatch):
             ("run-1", {"name": "read_secret", "input": {"name": "neo4j_password"}},
              datetime(2026, 10, 18, 10, 2, tzinfo=timezone.utc), 2),
         ],
-        called=[("run-1", "Bash", 1), ("run-1", "read_secret", 1)],
     )
     result = _tick(conn, monkeypatch)
     assert result["blocked"] is False
@@ -617,14 +621,97 @@ def test_the_run_query_selects_source_slug_and_never_agent_slug():
     assert "r.agent_slug" not in exec_sync.SQL_RUNS
 
 
-def test_no_query_casts_the_event_payload_server_side():
-    """`run_events.payload` holds literal `\\u0000`, so any server-side
-    `payload::text` / `payload->>` over the WHOLE document fails with
-    "unsupported Unicode escape sequence". `payload->>'name'` over one key is
-    fine and is what the CALLED rollup uses; a cast of the document is not."""
-    assert "payload::text" not in exec_sync.SQL_TOOL_CALLS
+def test_the_called_rollup_counts_per_run_and_per_tool_name():
+    """`CALLED {n}` is derived from the tool-call rows already fetched, so it
+    describes exactly the same row set the `MADE_CALL` layer does — the old
+    second aggregate query could drift from it, this cannot."""
+    rows = [
+        {"run_id": "run-1", "seq": 1, "name": "Bash", "args_text": "ls"},
+        {"run_id": "run-1", "seq": 2, "name": "Bash", "args_text": "pwd"},
+        {"run_id": "run-1", "seq": 3, "name": "Read", "args_text": "f"},
+        {"run_id": "run-2", "seq": 1, "name": "Bash", "args_text": "ls"},
+    ]
+    rollup = {(r["run_id"], r["name"]): r["n"] for r in exec_sync.rollup_called(rows)}
+    assert rollup == {("run-1", "Bash"): 2, ("run-1", "Read"): 1, ("run-2", "Bash"): 1}
+    # The total must equal the number of named tool calls, or MADE_CALL and
+    # CALLED describe different things.
+    assert sum(rollup.values()) == len([r for r in rows if r["name"]])
+
+
+def test_the_called_rollup_drops_rows_with_no_tool_name():
+    """A `CALLED` edge needs a tool to point at. The removed `GROUP BY` had a
+    `if name` filter for this; losing it when the rollup moved client-side
+    would have produced an edge to a nameless node."""
+    rows = [
+        {"run_id": "run-1", "seq": 1, "name": None, "args_text": "x"},
+        {"run_id": "run-1", "seq": 2, "name": "", "args_text": "x"},
+        {"run_id": "run-1", "seq": 3, "name": "Bash", "args_text": "x"},
+    ]
+    assert exec_sync.rollup_called(rows) == [{"run_id": "run-1", "name": "Bash", "n": 1}]
+
+
+def test_a_nul_bearing_payload_syncs_instead_of_crashing_the_pass(calls, monkeypatch):
+    """The 2026-10-18 backfill crash, as a test.
+
+    A `tool_call` payload carrying a literal NUL — a screenshot byte stream
+    quoted into a tool result is the real shape — used to reach a server-side
+    `payload->>'name'` and abort the whole tick with
+    `UntranslatableCharacter`. Now the payload is only ever selected raw and
+    psycopg has already parsed it client-side by the time it gets here, so the
+    NUL is simply stripped and the pass completes.
+    """
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[
+            (
+                "run-1",
+                {"name": "Bash\x00", "input": {"command": "200 36707 image/png\x00PNG"}},
+                datetime(2026, 10, 18, 10, 1, tzinfo=timezone.utc),
+                1,
+            ),
+        ],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["blocked"] is False
+    assert result["reason"] is None
+    assert result["tool_calls"] == 1
+    assert result["called"] == 1
+
+    posted = calls.ingest[0]
+    # No NUL survives into anything heading for the graph, in any field.
+    assert "\x00" not in str(posted)
+    assert posted["tool_calls"][0]["name"] == "Bash"
+    assert posted["called"][0] == {"run_id": "run-1", "name": "Bash", "n": 1}
+    # And the watermark advanced, i.e. the pass really did complete.
+    assert calls.sync_state[0]["last_error"] is None
+
+
+def test_no_query_extracts_the_event_payload_server_side():
+    """`run_events.payload` is `json` (text-backed) and holds literal
+    `\\u0000`, so EVERY server-side extraction fails — a `payload::text` cast
+    of the document and a `payload->>'key'` over a single key alike, because a
+    text-backed `json` parses the whole document to reach any part of it.
+
+    This used to allow `payload->>'name'` for the CALLED rollup. That crashed
+    the production backfill after ~21.4k runs with
+    `UntranslatableCharacter: unsupported Unicode escape sequence`; the first
+    nine 2000-run ticks passed only because no payload in those windows
+    carried a NUL. Verified against the production table directly:
+    `SELECT count(*) ... WHERE e.payload->>'name' IS NOT NULL` fails with
+    "\\u0000 cannot be converted to text".
+    """
+    for name in dir(exec_sync):
+        if not name.startswith("SQL_"):
+            continue
+        sql = getattr(exec_sync, name)
+        statements = sql.values() if isinstance(sql, dict) else [sql]
+        for statement in statements:
+            assert "payload::text" not in statement, name
+            assert "payload->>" not in statement, name
     assert "e.payload," in exec_sync.SQL_TOOL_CALLS, "the payload must come back unparsed"
-    assert "payload::text" not in exec_sync.SQL_CALLED
+    # And the rollup has no SQL of its own left to get this wrong in.
+    assert not hasattr(exec_sync, "SQL_CALLED")
 
 
 def test_every_query_is_scoped_to_one_source_tenant_or_to_explicit_run_ids():
@@ -632,7 +719,6 @@ def test_every_query_is_scoped_to_one_source_tenant_or_to_explicit_run_ids():
     are scoped by `run_ids` instead, which are themselves the output of the
     tenant-scoped run query, so neither can read another tenant's rows."""
     assert "r.tenant_id = %(tenant)s" in exec_sync.SQL_RUNS
-    for sql in (exec_sync.SQL_TOOL_CALLS, exec_sync.SQL_CALLED):
-        assert "e.run_id = ANY(%(run_ids)s)" in sql
+    assert "e.run_id = ANY(%(run_ids)s)" in exec_sync.SQL_TOOL_CALLS
     for entity, sql in exec_sync.SQL_RECONCILE.items():
         assert "%(tenant)s" in sql, f"{entity}'s reconcile SQL is not tenant-scoped"
