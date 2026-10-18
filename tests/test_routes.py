@@ -464,3 +464,141 @@ def test_pull_key_needs_no_identity_at_all(ungated_app_client):
     ctx.secrets.write("service_secret", "shh")
     resp = tc.get("/keys/bogus", headers={"x-internal-secret": "shh"})
     assert resp.status_code == 404, "reached the handler, past any identity gate"
+
+
+# ---------------------------------------------------------------------------
+# docs/design/execution-history-in-production-neo4j.md §4/§8 — the exec-sync
+# doors. What is worth testing at the ROUTE level (the engine's own decisions
+# are test_exec_sync.py's): that the DSN lands in the secret store and not in
+# plain config, that the absent/present/empty contract on `/settings` does
+# not clobber a key the caller did not send, and that the status surface
+# reports degraded for an unreachable sentinel instead of a cheerful `None`.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLease:
+    def __init__(self):
+        self.claims = []
+
+    def claim(self, name):
+        self.claims.append(name)
+        return True
+
+    def release(self, name):
+        pass
+
+
+@pytest.fixture()
+def exec_app_client(app_client):
+    tc, ctx = app_client
+    ctx.state.lease = _FakeLease()
+    return tc, ctx
+
+
+def test_the_apmt_dsn_goes_to_the_secret_store_never_plain_config(exec_app_client):
+    """A DSN carries a password, and app config is plain and cloud-syncable
+    — same split `service_secret` already uses."""
+    tc, ctx = exec_app_client
+    resp = tc.post(
+        "/settings",
+        json={"service_secret": "s", "apmt_database_url": "postgresql://u:p@h/db"},
+    )
+    assert resp.status_code == 200
+    assert ctx.secrets.read(routes_mod.APMT_DSN_KEY) == "postgresql://u:p@h/db"
+    assert "apmt_database_url" not in ctx.config
+
+
+def test_saving_settings_without_the_dsn_key_leaves_it_untouched(exec_app_client):
+    """The clobber scar (memory knowledgeable-connector-settings-route-
+    clobbers-service-secret): a key the caller did not send must be left
+    alone, never cleared. An ordinary secret-rotation POST from the settings
+    form sends only `service_secret`."""
+    tc, ctx = exec_app_client
+    ctx.secrets.write(routes_mod.APMT_DSN_KEY, "postgresql://kept@h/db")
+    resp = tc.post("/settings", json={"service_secret": "rotated"})
+    assert resp.status_code == 200
+    assert ctx.secrets.read(routes_mod.APMT_DSN_KEY) == "postgresql://kept@h/db"
+
+
+def test_sending_an_empty_dsn_clears_it(exec_app_client):
+    tc, ctx = exec_app_client
+    ctx.secrets.write(routes_mod.APMT_DSN_KEY, "postgresql://old@h/db")
+    tc.post("/settings", json={"service_secret": "s", "apmt_database_url": ""})
+    assert ctx.secrets.read(routes_mod.APMT_DSN_KEY) is None
+
+
+def test_exec_sync_run_is_a_no_op_while_the_flag_is_off(exec_app_client):
+    """§9 step 2 — the flag ships false and the tick must do nothing, not
+    "nothing, successfully"."""
+    tc, _ = exec_app_client
+    body = tc.post("/exec-sync/run", json={}).json()
+    assert body["blocked"] is True
+    assert "exec_sync_enabled is false" in body["reason"]
+
+
+def test_exec_sync_status_distinguishes_off_from_running_against_nothing(
+    exec_app_client, monkeypatch
+):
+    """"The sync is not running" and "the sync is running against nothing"
+    are different problems and must not read the same."""
+    tc, ctx = exec_app_client
+
+    async def _unreachable():
+        return None, "HTTP 503"
+
+    monkeypatch.setattr(client, "get_exec_status", _unreachable)
+
+    off = tc.get("/exec-sync/status").json()
+    assert off["enabled"] is False
+    assert off["dsn_configured"] is False
+    # Off is NOT degraded — a disabled feature must not page anyone.
+    assert off["degraded"] is False
+
+    ctx.config["exec_sync_enabled"] = True
+    ctx.config["exec_sync_source_tenant"] = "tenant-bootstrap"
+    ctx.secrets.write(routes_mod.APMT_DSN_KEY, "postgresql://u:p@h/db")
+    on = tc.get("/exec-sync/status").json()
+    assert on["enabled"] is True
+    assert on["dsn_configured"] is True
+    assert on["source_tenant"] == "tenant-bootstrap"
+    # An unreachable sentinel IS degraded. A status surface that reported
+    # `None` here would read as healthy, which is this workspace's named
+    # failure mode.
+    assert on["degraded"] is True
+    assert on["error"] == "HTTP 503"
+
+
+def test_exec_sync_status_is_degraded_when_the_sentinel_says_stale(
+    exec_app_client, monkeypatch
+):
+    tc, ctx = exec_app_client
+    ctx.config["exec_sync_enabled"] = True
+
+    async def _stale():
+        return {"staleness": {"state": "stale", "degraded": True, "age_seconds": 9999}}, None
+
+    monkeypatch.setattr(client, "get_exec_status", _stale)
+    assert tc.get("/exec-sync/status").json()["degraded"] is True
+
+    async def _fresh():
+        return {"staleness": {"state": "fresh", "degraded": False, "age_seconds": 30}}, None
+
+    monkeypatch.setattr(client, "get_exec_status", _fresh)
+    assert tc.get("/exec-sync/status").json()["degraded"] is False
+
+
+def test_the_exec_sync_routes_require_identity(app_client):
+    """`auth_required: false` on this mount means the framework gate does not
+    protect these; each route carries its own `_require_identity`. Proven by
+    REMOVING the override, same shape as the existing identity tests."""
+    tc, ctx = app_client
+    ctx.state.lease = _FakeLease()
+    tc.app.dependency_overrides.clear()
+    for method, path in (
+        ("post", "/exec-sync/run"),
+        ("get", "/exec-sync/status"),
+        ("post", "/exec-sync/reconcile"),
+        ("post", "/exec-sync/retention"),
+    ):
+        resp = getattr(tc, method)(path, json={}) if method == "post" else tc.get(path)
+        assert resp.status_code == 401, f"{method.upper()} {path} -> {resp.status_code}"

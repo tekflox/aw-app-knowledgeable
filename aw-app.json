@@ -103,6 +103,42 @@
           }
         ],
         "enabled": false
+      },
+      {
+        "name": "KB exec-history sync — tick",
+        "type": "agentic_output",
+        "command": "aw-workspace-cli knowledgeable-exec-sync run",
+        "notify_exit_codes": [
+          1
+        ],
+        "agent_slug": "coder-sonnet",
+        "prompt": "The `KB exec-history sync — tick` task (docs/design/execution-history-in-production-neo4j.md §4/§8) just exited non-zero. Run `aw-workspace-cli knowledgeable-exec-sync status` and read the command's own stderr above to tell which case this is: (1) `exec_sync_enabled is false` — expected while the feature is off, just note it, do NOT turn the flag on yourself; (2) `apmt_database_url is not set` or `exec_sync_source_tenant is not set` — a real config gap, open a blocker (never guess either value: a wrong tenant reads zero rows and reports a clean tick); (3) `no service secret saved` — the connector's X-Internal-Secret is missing, open a blocker; (4) `another exec-sync tick is already in progress` — expected under overlap with a manual run, just note it; (5) `cannot read the sync sentinel` — aw-knowledgeable is unreachable or the exec routes are not deployed yet, report it; (6) `partial: ingest batch N failed` — the watermark only advanced over the prefix that landed, so the next tick resumes at the gap; one blip is fine, a repeating one is a blocker. NEVER point this at the production Neo4j directly and never run `scripts/load_exec_retrieval_neo4j.py` against it — that script wipes its target. Do not enable anything that spends on an LLM provider.",
+        "reuse_session": false,
+        "schedules": [
+          {
+            "kind": "cron",
+            "expr": "*/10 * * * *"
+          }
+        ],
+        "enabled": false
+      },
+      {
+        "name": "KB exec-history — weekly reconcile",
+        "type": "agentic_output",
+        "command": "aw-workspace-cli knowledgeable-exec-sync reconcile",
+        "notify_exit_codes": [
+          1
+        ],
+        "agent_slug": "coder-sonnet",
+        "prompt": "The `KB exec-history — weekly reconcile` task (docs/design/execution-history-in-production-neo4j.md §8) reported a count mismatch between AP-MT Postgres and the exec projection in Neo4j. Read the printed table before concluding drift — the rows fail for different reasons: a `CHILD_OF`/`QA_OF` mismatch is frequently CORRECT behaviour (an endpoint outside the loaded window creates no edge by design, which is why those two rows are counted as SQL joins rather than column-not-null counts), whereas a missing `ExecRun`/`ExecToolCall` count is an ingest batch that failed and should show up in the sync tick's own history too. Postgres is the system of record: the supported repair is forward — wipe and re-backfill the projection (`POST /api/exec/wipe` then let the sync catch up), never editing the graph by hand and never editing Postgres. Report which rows drifted and by how much; open a blocker only if the drift is in a node/ToolCall count and is growing.",
+        "reuse_session": false,
+        "schedules": [
+          {
+            "kind": "cron",
+            "expr": "17 4 * * 1"
+          }
+        ],
+        "enabled": false
       }
     ],
     "knowledge": {
@@ -161,6 +197,26 @@
         "default": "",
         "title": "Unattended deletion approval",
         "description": "docs/design/aw-knowledgeable-fs-sync.md \u00a721. Comma- or newline-separated rules `prefix=auto[:min_missing_scans]` or `prefix=manual`. Longest matching prefix wins; paths matching no rule stay `manual` (today's behaviour \u2014 a human approves in the Library UI). `min_missing_scans` defaults to 2, the same tick a delete mark lands. An empty prefix is rejected (no blanket auto-approve, ever) and so is an `auto` rule anchored at `authored/` (\u00a74's downsync is not yet exercised) \u2014 both are skipped and surfaced as delete_policy_invalid in GET /fs-sync/status rather than silently disabling or silently enabling anything. Default empty ships inert, byte-identical to today. Auto-approval also stays off whenever the \u00a77 mass-delete valve is latched, until an audited POST /fs-sync/valve/clear."
+      },
+      "exec_sync_enabled": {
+        "type": "boolean",
+        "default": false,
+        "title": "Execution-history sync — enabled",
+        "description": "docs/design/execution-history-in-production-neo4j.md §9 step 2. Ships FALSE: step 1 (aw-knowledgeable's schema, templates and K7 test) is deployable on its own, and turning this on is a separate operator decision. With this off the tick is a no-op and nothing is written to the production graph. Turning it on starts a 10-minute incremental MERGE-upsert of AP-MT run metadata and SCRUBBED run/tool-call text into an Exec*-labelled subgraph in the reserved, unregistered `_exec-history` bucket — structurally disjoint from the knowledge corpus (no shared labels, zero edges between them) and reachable only by the service caller. Postgres stays the system of record; rollback is POST /api/exec/wipe, one batched label-scoped delete."
+      },
+      "exec_sync_source_tenant": {
+        "type": "string",
+        "default": "",
+        "title": "Execution-history sync — AP-MT source tenant",
+        "description": "The agents-platform-multitenant `tenant_id` to READ runs from. Deliberately not defaulted (§12 risk 7): AP-MT's tenant namespace and aw-knowledgeable's graph `tenant` namespace are different things that happen to be 1:1 today, the write-side tenant is whatever this connector's service secret resolves to server-side, and a wrong value here reads zero rows and reports a clean tick. The tick refuses to run while this is empty rather than guessing `tenant-bootstrap`. Recorded on the sync sentinel so a mis-mapped sync is visible instead of silent."
+      },
+      "apmt_database_url": {
+        "type": "string",
+        "x-secret": true,
+        "default": "",
+        "title": "Execution-history sync — AP-MT Postgres DSN",
+        "description": "The Postgres DSN the exec sync reads AP-MT runs from, e.g. postgresql://postgres:…@aw-remote-host-postgres:5432/agents_platform_multitenant (reachable BY NAME; 127.0.0.1 is refused from app containers). Stored in the workspace secret store like `service_secret`, never in plain app config — a DSN carries a password. This connector holds the Postgres credential and the service secret, and deliberately NEVER holds the Neo4j password: scrubbing and loading are connector-side for exactly that reason (§4), and this side never speaks Bolt.",
+        "x-reason": "read-only access to AP-MT runs for the execution-history projection"
       },
       "forward_upstreams": {
         "type": "array",

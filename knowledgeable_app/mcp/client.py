@@ -476,6 +476,86 @@ async def push_label_key(value: str) -> tuple[bool, str | None]:
     return bool(data and data.get("ok")), None
 
 
+# ---------------------------------------------------------------------------
+# The exec-history projection (docs/design/execution-history-in-production-
+# neo4j.md §4). Not in ``TOOLS_SCHEMA`` below — these are the sync engine's
+# own calls (``exec_sync.py``), driven by a scheduled task and a CLI, not by
+# an agent tool call. §9 step 4 adds agent-facing MCP tools over the search
+# routes once the flag has been on and the reconcile is green.
+#
+# Same ``X-Internal-Secret`` channel every other call here uses, which is
+# also the only credential involved: the exec routes are service-caller-only
+# in v1, and this side never holds the Neo4j password.
+# ---------------------------------------------------------------------------
+
+
+async def get_exec_status() -> tuple[dict | None, str | None]:
+    """GET /api/exec/status — the freshness sentinel plus live graph counts.
+
+    This is where a tick reads its WATERMARK from: the server owns it, on the
+    sentinel node, rather than the connector keeping a local copy. A local
+    copy would survive a graph wipe (§9's rollback) and the next tick would
+    then skip every run before the stale watermark — a rollback that silently
+    half-restores.
+    """
+    return await _get("/api/exec/status")
+
+
+async def post_exec_ingest(
+    *, runs: list[dict], tool_calls: list[dict], called: list[dict]
+) -> tuple[bool, str | None]:
+    """POST /api/exec/ingest — one byte-bounded batch.
+
+    `timeout=120`, not the module default of 30: an ingest batch is the one
+    call here that writes thousands of nodes, and production is single-worker.
+    The 30 s tunnel-edge cut does not apply — this call is container-to-
+    container on aw-stack-net, by name, never through the edge (§4).
+    """
+    data, err = await _post_json(
+        "/api/exec/ingest",
+        {"runs": runs, "tool_calls": tool_calls, "called": called},
+        timeout=120,
+    )
+    if err:
+        return False, err
+    return bool(data and data.get("ok")), None
+
+
+async def put_exec_sync_state(
+    *,
+    source_tenant: str,
+    watermark: str | None,
+    counts: dict | None = None,
+    last_error: str | None = None,
+) -> tuple[bool, str | None]:
+    """POST /api/exec/sync-state — stamp the sentinel, once, at the end of a
+    pass (§8).
+
+    `source_tenant` is the AP-MT tenant the pass READ, which is a different
+    namespace from the graph tenant it was written to; the route requires it
+    rather than defaulting it, so a mis-mapped sync is visible on the
+    sentinel instead of silent.
+    """
+    data, err = await _post_json(
+        "/api/exec/sync-state",
+        {
+            "source_tenant": source_tenant,
+            "watermark": watermark,
+            "counts": counts or {},
+            "last_error": last_error,
+        },
+    )
+    if err:
+        return False, err
+    return bool(data and data.get("ok")), None
+
+
+async def post_exec_retention(days: int | None = None) -> tuple[dict | None, str | None]:
+    """POST /api/exec/retention — §8's 180-day `args_text` valve. A monthly
+    task; a no-op (`trimmed: 0`) when nothing is old enough."""
+    return await _post_json("/api/exec/retention", {"days": days} if days is not None else {})
+
+
 async def create_node(args: dict) -> tuple[str, bool]:
     label = (args.get("label") or "").strip()
     node_type = (args.get("type") or "").strip()

@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import (
     bulk_ingest,
+    exec_sync,
     forwarding,
     fs_sync,
     git_backend,
@@ -65,6 +66,13 @@ _PULL_SLOTS = {
     ),
 }
 GIT_TOKEN_KEY = git_backend.GIT_TOKEN_SECRET
+
+#: docs/design/execution-history-in-production-neo4j.md §4 — the AP-MT
+#: Postgres DSN the exec sync reads from. In the SECRET store, not app
+#: config, for the same reason `service_secret` is: a DSN carries a password,
+#: and app config is plain and cloud-syncable. `x-secret` on the manifest
+#: field only makes the settings UI render a password input.
+APMT_DSN_KEY = "apmt_database_url"
 #: `ctx.state.kv` name the last tick's git_state/git_detail is cached under,
 #: so `/status` can show it between ticks (§16.3 point 3) without re-running
 #: git. 1 day: generous enough to span the 15-minute schedule across a
@@ -167,6 +175,17 @@ def build_routes(ctx) -> FastAPI:
                 ctx.secrets.write(GIT_TOKEN_KEY, git_token)
             else:
                 ctx.secrets.delete(GIT_TOKEN_KEY)
+        # Same present/empty/absent contract as `git_token` above, for the
+        # AP-MT Postgres DSN the exec sync reads from. Memory
+        # knowledgeable-connector-settings-route-clobbers-service-secret is
+        # the scar this shape avoids: a key the caller did not send must be
+        # left untouched, never cleared.
+        if APMT_DSN_KEY in data:
+            dsn = (data.get(APMT_DSN_KEY) or "").strip()
+            if dsn:
+                ctx.secrets.write(APMT_DSN_KEY, dsn)
+            else:
+                ctx.secrets.delete(APMT_DSN_KEY)
         # No restart, no gateway reload: client.py resolves the secret through
         # a per-call callable, so the very next tool call already uses it.
         return {"ok": True, "logged_in": True}
@@ -361,6 +380,70 @@ def build_routes(ctx) -> FastAPI:
         if data.get("bucket"):
             kwargs["bucket"] = str(data["bucket"])
         return await orphan_reconcile.unmark_not_ready(ctx.db, **kwargs)
+
+    # ------------------------------------------------------------------
+    # docs/design/execution-history-in-production-neo4j.md §4/§8 — the
+    # exec-history sync engine. Same one-engine-reached-through-routes shape
+    # as bulk-ingest and fs-sync above: the engine has to run here,
+    # in-process, to reuse this app's configured `mcp/client.py` (base_url +
+    # X-Internal-Secret) and the workspace `SecretStore` the scrubber's
+    # exact-match pass reads.
+    #
+    # `exec_sync_enabled` ships FALSE (§9 step 2). Turning it on is an
+    # operator decision after the schema-only step 1 is deployed.
+    # ------------------------------------------------------------------
+
+    def _exec_sync_kwargs() -> dict:
+        return {
+            "dsn": ctx.secrets.read(APMT_DSN_KEY) or "",
+            "source_tenant": (ctx.config.get("exec_sync_source_tenant") or "").strip(),
+            "enabled": bool(ctx.config.get("exec_sync_enabled")),
+        }
+
+    @app.post("/exec-sync/run", dependencies=[Depends(_require_identity)])
+    async def exec_sync_run(data: dict = Body(default={})) -> dict:
+        kwargs = _exec_sync_kwargs()
+        if data.get("max_runs") is not None:
+            kwargs["max_runs"] = int(data["max_runs"])
+        return await exec_sync.run_tick(ctx.state.lease, **kwargs)
+
+    @app.get("/exec-sync/status", dependencies=[Depends(_require_identity)])
+    async def exec_sync_status() -> dict:
+        """The §8 doctor surface: the sentinel, its staleness verdict, the
+        live graph counts — and this side's own config, so "the sync is not
+        running" and "the sync is running against nothing" are
+        distinguishable without reading two places."""
+        cfg = _exec_sync_kwargs()
+        payload: dict = {
+            "enabled": cfg["enabled"],
+            "source_tenant": cfg["source_tenant"] or None,
+            "dsn_configured": bool(cfg["dsn"]),
+            "secret_configured": bool(ctx.secrets.read(SECRET_KEY)),
+        }
+        remote, err = await client.get_exec_status()
+        payload["graph"] = remote
+        payload["error"] = err
+        # Degraded is computed on THIS side too, not only read off the
+        # sentinel: a sentinel we cannot reach is itself degraded, and a
+        # status surface that reports `None` for that reads as healthy.
+        staleness = ((remote or {}).get("staleness") or {})
+        payload["degraded"] = bool(
+            cfg["enabled"] and (err or not remote or staleness.get("degraded"))
+        )
+        return payload
+
+    @app.post("/exec-sync/reconcile", dependencies=[Depends(_require_identity)])
+    async def exec_sync_reconcile() -> dict:
+        cfg = _exec_sync_kwargs()
+        return await exec_sync.reconcile(
+            dsn=cfg["dsn"], source_tenant=cfg["source_tenant"]
+        )
+
+    @app.post("/exec-sync/retention", dependencies=[Depends(_require_identity)])
+    async def exec_sync_retention(data: dict = Body(default={})) -> dict:
+        days = data.get("days")
+        result, err = await client.post_exec_retention(None if days is None else int(days))
+        return {"ok": err is None, "error": err, "result": result}
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

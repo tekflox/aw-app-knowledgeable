@@ -1,0 +1,536 @@
+"""The execution-history sync job (docs/design/execution-history-in-
+production-neo4j.md §4/§8).
+
+One bounded tick: read AP-MT Postgres, **scrub** (``exec_scrub``), post
+byte-bounded batches to aw-knowledgeable's service-authed ingest route, stamp
+the freshness sentinel. Runs every 10 minutes as a contributed scheduled
+task, behind ``exec_sync_enabled`` which ships **false**.
+
+Why the work lives on this side, matching Frederico's 2026-10-12 direction
+that the connector does the heavy work: this process holds the Postgres
+credential and the service secret it already had, and **never holds the Neo4j
+password** (§4). That is also what retires the v2 throwaway loader's
+direct-HTTP-to-Neo4j pattern from anything production-facing — see
+``scripts/load_exec_retrieval_neo4j.py``'s refusal guard in aw-workspace.
+
+Four facts this file stands on, each verified rather than assumed:
+
+* **``runs.agent_slug`` does not exist.** The column carrying the agent
+  identity is ``runs.source_slug`` (§12 risk 2). The graph property keeps the
+  name ``agent_slug`` because that is what the measurement's Cypher and the
+  tool prompts already use.
+* **``run_events.payload`` contains literal ``\\u0000``.** Any server-side
+  ``payload::text``/``payload->>`` over the whole document fails with
+  "unsupported Unicode escape sequence", so the document is never cast
+  server-side: psycopg parses it client-side (where the escape is legal) and
+  the NULs are stripped before anything leaves here.
+* **``runs`` has NO ``updated_at``.** §8 told the Coder to check and tighten
+  the re-sweep to it if present. Checked against
+  ``agents-platform-multitenant/backend/app/models.py`` (``class Run``, lines
+  474-720, 2026-10-18): there is no such column — ``started_at`` and
+  ``ended_at`` are the only timestamps. So the re-sweep stays on the
+  design's fallback shape: every non-terminal run started inside
+  ``RESWEEP_HOURS``. Do not "optimise" that to a watermark-only pass; a run
+  mutates after insert (status flips, output lands at the end) and a
+  watermark on ``started_at`` alone would freeze it mid-flight forever.
+* **Batches are bounded by BYTES, not row count** (§12 risk 4). Run text is
+  wildly variable; production is single-worker and the tunnel edge cuts
+  requests at 30 s, so an over-large batch does not fail loudly — it starves
+  live search and then gets cut mid-request.
+
+Every statement behind the ingest route is a MERGE, so a tick killed
+mid-flight (the nightly backup stops the Neo4j container; the host stalls) is
+simply re-run by the next tick. The watermark is advanced **once, at the
+end** — never per batch, or a pass that died halfway would skip every run it
+had not reached.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+
+from . import exec_scrub
+from .mcp import client
+
+log = logging.getLogger("aw_apps.knowledgeable.exec_sync")
+
+#: `ctx.state.lease` name — one tick at a time, same non-blocking flock
+#: mechanism `fs_sync`/`bulk_ingest` already use. Production is
+#: single-worker, but a manual CLI run overlapping the scheduled tick is the
+#: realistic collision and MERGE idempotency is not a reason to let two
+#: passes fight over the watermark.
+LEASE_NAME = "exec_sync_tick"
+
+#: §8 — re-sweep every non-terminal run started inside this window, on top of
+#: the watermark pass. Runs mutate after insert; 48 h is the design's figure.
+RESWEEP_HOURS = 48
+
+#: AP-MT run statuses that will never change again. Everything else is
+#: re-swept. Taken from `models.py`'s own comment on `Run.status`
+#: ("pending|queued|running|success|error|cancelled").
+TERMINAL_STATUSES = ("success", "error", "cancelled")
+
+#: Serialised payload bytes per ingest request (§12 risk 4). 2 MB, half the
+#: throwaway loader's 4 MB: that one wrote straight to a dedicated instance
+#: with nothing else on it, whereas this shares a single-worker service with
+#: live search traffic and crosses a tunnel that cuts at 30 s.
+BATCH_BYTES = 2_000_000
+
+#: Hard ceiling on runs per tick, so a first-ever pass over ~28k runs is many
+#: bounded ticks rather than one unbounded one. The backfill is the same
+#: route run repeatedly, off-hours — not a special path.
+MAX_RUNS_PER_TICK = 2_000
+
+#: Fetched this many runs at a time from the server-side cursor.
+_CURSOR_ITERSIZE = 200
+
+
+def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
+    return {
+        "blocked": blocked,
+        "reason": reason,
+        "runs": 0,
+        "tool_calls": 0,
+        "batches": 0,
+        "watermark": None,
+        **extra,
+    }
+
+
+def _clean(value):
+    """Strip NUL from anything heading for the graph (see module docstring)."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    return value
+
+
+def _as_text(value):
+    """A JSON column -> one string, compactly re-serialised. psycopg has
+    already parsed it client-side, so a `\\u0000` inside is a Python string
+    here and `_clean` can reach it."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _clean(value)
+    return _clean(json.dumps(value, ensure_ascii=False))
+
+
+def _iso(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# SQL — one place, so what is loaded and what the reconcile counts cannot
+# drift apart. Scoped to ONE source tenant per pass: §2's two namespaces
+# (AP-MT's `tenant_id` and aw-knowledgeable's graph `tenant`) are different,
+# and the write-side tenant is whatever this connector's service secret
+# resolves to server-side. The source tenant is config, looked up at runtime
+# — never the AP-MT string assumed to equal the graph tenant (§12 risk 7).
+# ---------------------------------------------------------------------------
+
+#: The selection predicate, in words: anything that STARTED or ENDED after
+#: the watermark, plus anything still non-terminal inside the re-sweep
+#: window. `ended_at` is in there because a run that started before the
+#: watermark and finished after it is exactly the row whose output just
+#: landed.
+_RUN_SCOPE = """
+    r.tenant_id = %(tenant)s
+    AND (
+        %(watermark)s IS NULL
+        OR r.started_at > %(watermark)s
+        OR r.ended_at > %(watermark)s
+        OR (r.status NOT IN %(terminal)s AND r.started_at > %(resweep_since)s)
+    )
+"""
+
+SQL_RUNS = f"""
+    SELECT r.id, r.source_slug, r.status, r.model_slug, r.flow_slug,
+           r.flow_outcome, r.hop_count, r.cost_usd, r.tokens_in, r.tokens_out,
+           r.started_at, r.ended_at,
+           r.parent_run_id, r.qa_run_id, r.session_id, r.notion_task_id,
+           r.input, r.output
+    FROM runs r
+    WHERE {_RUN_SCOPE}
+    ORDER BY r.started_at
+    LIMIT %(max_runs)s
+"""
+
+#: Tool calls for a batch of run ids. Fetched per batch rather than in one
+#: sweep so a batch arrives at the ingest route with its own calls — the
+#: route refuses a tool call whose run is not in the same request, because
+#: the template MATCHes the run and would otherwise silently write nothing.
+SQL_TOOL_CALLS = """
+    SELECT e.run_id, e.payload, e.ts,
+           row_number() OVER (PARTITION BY e.run_id ORDER BY e.ts, e.id) AS seq
+    FROM run_events e
+    WHERE e.kind = 'tool_call' AND e.run_id = ANY(%(run_ids)s)
+    ORDER BY e.run_id, e.ts, e.id
+"""
+
+#: §5's `CALLED {n}` rollup, kept alongside `MADE_CALL` exactly as the
+#: measurement's graph had it.
+SQL_CALLED = """
+    SELECT e.run_id, e.payload->>'name' AS name, count(*) AS n
+    FROM run_events e
+    WHERE e.kind = 'tool_call' AND e.run_id = ANY(%(run_ids)s)
+    GROUP BY e.run_id, e.payload->>'name'
+"""
+
+#: The weekly count-reconcile's SQL side (§8). Mirrors `exec_counts`'
+#: Cypher arms label for label, so a mismatch names which layer drifted
+#: rather than only that something did.
+SQL_RECONCILE = {
+    "ExecRun": "SELECT count(*) FROM runs r WHERE r.tenant_id = %(tenant)s",
+    "ExecSession": (
+        "SELECT count(DISTINCT r.session_id) FROM runs r "
+        "WHERE r.tenant_id = %(tenant)s AND r.session_id IS NOT NULL"
+    ),
+    "ExecCard": (
+        "SELECT count(DISTINCT r.notion_task_id) FROM runs r "
+        "WHERE r.tenant_id = %(tenant)s AND r.notion_task_id IS NOT NULL"
+    ),
+    "ExecToolCall": (
+        "SELECT count(*) FROM run_events e JOIN runs r ON r.id = e.run_id "
+        "WHERE e.kind = 'tool_call' AND r.tenant_id = %(tenant)s"
+    ),
+    "IN_SESSION": (
+        "SELECT count(*) FROM runs r "
+        "WHERE r.tenant_id = %(tenant)s AND r.session_id IS NOT NULL"
+    ),
+    "ON_CARD": (
+        "SELECT count(*) FROM runs r "
+        "WHERE r.tenant_id = %(tenant)s AND r.notion_task_id IS NOT NULL"
+    ),
+    # CHILD_OF/QA_OF are joins, not column-not-null counts: an endpoint
+    # outside the loaded set creates no edge (the ingest template OPTIONAL
+    # MATCHes it), so counting the raw column would report drift that is
+    # correct behaviour.
+    "CHILD_OF": (
+        "SELECT count(*) FROM runs r JOIN runs p ON p.id = r.parent_run_id "
+        "AND p.tenant_id = %(tenant)s WHERE r.tenant_id = %(tenant)s "
+        "AND r.parent_run_id IS NOT NULL"
+    ),
+    "QA_OF": (
+        "SELECT count(*) FROM runs r JOIN runs q ON q.id = r.qa_run_id "
+        "AND q.tenant_id = %(tenant)s WHERE r.tenant_id = %(tenant)s "
+        "AND r.qa_run_id IS NOT NULL"
+    ),
+}
+
+
+def connect(dsn: str):
+    """A psycopg2 connection to AP-MT Postgres.
+
+    Imported lazily so this module is importable (and its tests runnable)
+    without the driver — the app's `pip_requires` only guarantees httpx, and
+    a hard import here would take the whole plugin down on a host that has
+    no psycopg2 rather than degrading this one feature.
+    """
+    import psycopg2  # noqa: PLC0415
+
+    return psycopg2.connect(dsn, connect_timeout=15)
+
+
+def build_run_row(record, scrubber: exec_scrub.Scrubber) -> dict:
+    """One Postgres row -> one ingest row, scrubbed.
+
+    `agent_slug` <- `source_slug` happens HERE and nowhere else, so there is
+    one place the §12 risk 2 fact is encoded.
+    """
+    (
+        run_id, source_slug, status, model_slug, flow_slug, flow_outcome,
+        hop_count, cost_usd, tokens_in, tokens_out, started_at, ended_at,
+        parent_run_id, qa_run_id, session_id, notion_task_id, run_input, run_output,
+    ) = record
+    return {
+        "id": run_id,
+        "agent_slug": source_slug,
+        "status": status,
+        "model_slug": model_slug,
+        "flow_slug": flow_slug,
+        "flow_outcome": flow_outcome,
+        "hop_count": hop_count,
+        # Postgres `float`/`numeric` -> float; the exact value stays in
+        # Postgres, which is the system of record for anything billing-shaped.
+        "cost_usd": None if cost_usd is None else float(cost_usd),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "started_at": _iso(started_at),
+        "ended_at": _iso(ended_at),
+        "parent_run_id": parent_run_id,
+        "qa_run_id": qa_run_id,
+        "session_id": session_id,
+        "card_page_id": notion_task_id,
+        "input_text": scrubber.scrub(_as_text(run_input)),
+        "output_text": scrubber.scrub(_as_text(run_output)),
+    }
+
+
+def build_toolcall_row(record, scrubber: exec_scrub.Scrubber) -> dict:
+    """One `run_events` tool_call row -> one ingest row, scrubbed — and with
+    a secret-handling tool's arguments DROPPED, not scrubbed (§6 point 3)."""
+    run_id, payload, ts, seq = record
+    payload = payload if isinstance(payload, dict) else {}
+    name = _clean(payload.get("name"))
+    return {
+        "run_id": run_id,
+        "seq": int(seq),
+        "name": name,
+        "args_text": scrubber.scrub_tool_args(
+            name=name, args_text=_as_text(payload.get("input"))
+        ),
+        "ts": _iso(ts),
+    }
+
+
+def _batch_bytes(rows) -> int:
+    return len(json.dumps(rows, ensure_ascii=False, default=str))
+
+
+def plan_batches(run_rows: list[dict], *, batch_bytes: int = BATCH_BYTES) -> list[list[dict]]:
+    """Split run rows into byte-bounded batches (§12 risk 4).
+
+    A single row larger than `batch_bytes` gets its own batch rather than
+    being dropped or split: run text really is that variable, and a run whose
+    output is 5 MB is exactly the one worth having in the graph. Splitting a
+    row is not an option (it is one node), so the bound is advisory for that
+    one row and exact for every other.
+    """
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    size = 0
+    for row in run_rows:
+        row_size = _batch_bytes([row])
+        if current and size + row_size > batch_bytes:
+            batches.append(current)
+            current, size = [], 0
+        current.append(row)
+        size += row_size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _watermark_of(run_rows: list[dict]) -> str | None:
+    """The highest timestamp this pass actually saw, across BOTH columns.
+
+    Max over `ended_at` as well as `started_at`: a run that started before
+    the old watermark and ended after it advanced the frontier, and a
+    watermark taken from `started_at` alone would re-read it forever.
+    """
+    stamps = [
+        value
+        for row in run_rows
+        for value in (row.get("started_at"), row.get("ended_at"))
+        if value
+    ]
+    return max(stamps) if stamps else None
+
+
+async def run_tick(
+    lease,
+    *,
+    dsn: str,
+    source_tenant: str,
+    enabled: bool,
+    max_runs: int = MAX_RUNS_PER_TICK,
+    batch_bytes: int = BATCH_BYTES,
+    now: datetime | None = None,
+) -> dict:
+    """One bounded sync tick.
+
+    Refuses rather than guesses, in three places, because each one is a
+    silent-wrong-answer if defaulted:
+
+    * `enabled` false -> no-op (the flag ships false; §9 step 2);
+    * no `dsn` -> blocked, not "sync nothing successfully";
+    * no `source_tenant` -> blocked. Defaulting it to `tenant-bootstrap`
+      would reproduce exactly the class of bug `resolve_tenant_id`'s minting
+      branch exists to prevent (§12 risk 7), and it would do so invisibly,
+      since a wrong tenant reads zero rows and reports a clean tick.
+    """
+    if not enabled:
+        return _empty_result(True, "exec_sync_enabled is false — nothing to do")
+    if not dsn:
+        return _empty_result(True, "apmt_database_url is not set — refusing to guess a DSN")
+    if not source_tenant:
+        return _empty_result(
+            True,
+            "exec_sync_source_tenant is not set — refusing to default the AP-MT "
+            "tenant to read (§12 risk 7: a wrong tenant reads zero rows and looks "
+            "like a clean tick)",
+        )
+    if not client.configured():
+        return _empty_result(True, "no service secret saved — cannot reach the ingest route")
+    if not lease.claim(LEASE_NAME):
+        return _empty_result(True, "another exec-sync tick is already in progress")
+    try:
+        return await _run_tick_locked(
+            dsn=dsn,
+            source_tenant=source_tenant,
+            max_runs=max_runs,
+            batch_bytes=batch_bytes,
+            now=now or datetime.now(timezone.utc),
+        )
+    finally:
+        lease.release(LEASE_NAME)
+
+
+async def _run_tick_locked(
+    *, dsn: str, source_tenant: str, max_runs: int, batch_bytes: int, now: datetime
+) -> dict:
+    status, err = await client.get_exec_status()
+    if err:
+        return _empty_result(True, f"cannot read the sync sentinel: {err}")
+    watermark = (status or {}).get("watermark")
+
+    scrubber = exec_scrub.Scrubber.from_workspace()
+    params = {
+        "tenant": source_tenant,
+        "watermark": watermark,
+        "terminal": TERMINAL_STATUSES,
+        "resweep_since": (now - timedelta(hours=RESWEEP_HOURS)).replace(tzinfo=None),
+        "max_runs": max_runs,
+    }
+
+    conn = connect(dsn)
+    try:
+        run_rows = _fetch_runs(conn, params, scrubber)
+        if not run_rows:
+            # A tick that found nothing still stamps the sentinel: freshness
+            # means "the sync ran", not "the sync wrote". Without this, a
+            # quiet night reads as six missed passes and trips the staleness
+            # alarm.
+            await client.put_exec_sync_state(
+                source_tenant=source_tenant,
+                watermark=watermark,
+                counts={},
+                last_error=None,
+            )
+            return _empty_result(
+                False, "no runs due", watermark=watermark, scrub=scrubber.status
+            )
+
+        totals = {"runs": 0, "tool_calls": 0, "called": 0, "batches": 0}
+        last_error = None
+        for batch in plan_batches(run_rows, batch_bytes=batch_bytes):
+            run_ids = [r["id"] for r in batch]
+            toolcalls = _fetch_tool_calls(conn, run_ids, scrubber)
+            called = _fetch_called(conn, run_ids)
+            ok, err = await client.post_exec_ingest(
+                runs=batch, tool_calls=toolcalls, called=called
+            )
+            totals["batches"] += 1
+            if not ok:
+                # Stop at the first failed batch rather than pressing on: the
+                # watermark must not advance past a gap, and a partial pass
+                # that keeps going produces a graph missing an arbitrary
+                # middle slice that no count-reconcile can localise.
+                last_error = f"ingest batch {totals['batches']} failed: {err}"
+                log.warning("exec sync: %s", last_error)
+                break
+            totals["runs"] += len(batch)
+            totals["tool_calls"] += len(toolcalls)
+            totals["called"] += len(called)
+    finally:
+        conn.close()
+
+    # Only advance the watermark over the prefix that actually landed.
+    landed = run_rows[: totals["runs"]]
+    new_watermark = _watermark_of(landed) or watermark
+    await client.put_exec_sync_state(
+        source_tenant=source_tenant,
+        watermark=new_watermark,
+        counts={k: v for k, v in totals.items() if k != "batches"},
+        last_error=last_error,
+    )
+    return {
+        "blocked": False,
+        "reason": last_error,
+        "watermark": new_watermark,
+        "scrub": scrubber.status,
+        **totals,
+    }
+
+
+def _fetch_runs(conn, params: dict, scrubber: exec_scrub.Scrubber) -> list[dict]:
+    """Streamed through a named (server-side) cursor so a 28k-run first pass
+    does not materialise in this process's memory — the same reason the
+    throwaway loader used one."""
+    cur = conn.cursor("exec_sync_runs")
+    cur.itersize = _CURSOR_ITERSIZE
+    try:
+        cur.execute(SQL_RUNS, params)
+        return [build_run_row(record, scrubber) for record in cur]
+    finally:
+        cur.close()
+
+
+def _fetch_tool_calls(conn, run_ids: list[str], scrubber: exec_scrub.Scrubber) -> list[dict]:
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_TOOL_CALLS, {"run_ids": run_ids})
+        return [build_toolcall_row(record, scrubber) for record in cur]
+    finally:
+        cur.close()
+
+
+def _fetch_called(conn, run_ids: list[str]) -> list[dict]:
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_CALLED, {"run_ids": run_ids})
+        return [
+            {"run_id": run_id, "name": _clean(name), "n": int(n)}
+            for run_id, name, n in cur
+            if name
+        ]
+    finally:
+        cur.close()
+
+
+async def reconcile(*, dsn: str, source_tenant: str) -> dict:
+    """§8's weekly count-reconcile: SQL counts vs the graph's own
+    `exec_counts`, per label/type, mismatch -> degraded.
+
+    Reports every row rather than just a verdict. A reconcile that only says
+    "drift" sends the next person to re-derive which layer drifted, and the
+    layers fail for different reasons: a missing `ExecToolCall` is an ingest
+    batch that failed, a missing `CHILD_OF` is usually an endpoint outside
+    the loaded window, which is correct behaviour.
+    """
+    if not dsn or not source_tenant:
+        return {"ok": False, "error": "apmt_database_url and exec_sync_source_tenant are required"}
+    status, err = await client.get_exec_status()
+    if err:
+        return {"ok": False, "error": f"cannot read graph counts: {err}"}
+    graph_counts = (status or {}).get("graph_counts") or {}
+
+    conn = connect(dsn)
+    rows = []
+    try:
+        for label, sql in SQL_RECONCILE.items():
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, {"tenant": source_tenant})
+                sql_n = cur.fetchone()[0]
+            finally:
+                cur.close()
+            graph_n = graph_counts.get(label, 0)
+            rows.append(
+                {"entity": label, "sql": sql_n, "graph": graph_n, "match": sql_n == graph_n}
+            )
+    finally:
+        conn.close()
+
+    degraded = [r for r in rows if not r["match"]]
+    return {
+        "ok": not degraded,
+        "degraded": bool(degraded),
+        "rows": rows,
+        "source_tenant": source_tenant,
+    }
