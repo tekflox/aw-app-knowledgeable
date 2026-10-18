@@ -172,17 +172,49 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         ),
         r"\1" + _redaction("env-assignment"),
     ),
+    # `DB_PASS=…` — the abbreviated form. A generic `PASS` suffix on the rule
+    # above would also fire on `BYPASS=`/`COMPASS=`/`SURPASS=`, the exact
+    # shape of the bare `-p` trap one level up, so this is a literal match on
+    # the one abbreviation named rather than a widened suffix.
+    (
+        "env-assignment",
+        re.compile(r"(?i)\b(DB_PASS\s*=\s*)[\"']?[^\s\"'&;|]{4,}"),
+        r"\1" + _redaction("env-assignment"),
+    ),
     # A JSON/YAML/kwargs field whose KEY says credential:
     # `"password": "hunter2"`, `service_secret='…'`, `api_key: abc`. Written
     # to keep the key and the quoting so the surrounding JSON stays readable.
+    # `access_key`/`secret_key`/`client_secret_key` are the literal AWS SDK
+    # and OAuth field names, added as whole-word alternatives rather than a
+    # generic `key` suffix — that would also catch `primary_key`/`foreign_key`
+    # column names, which is the corpus-shredding failure mode this family
+    # already avoids for `-p`.
     (
         "credential-field",
         re.compile(
             r"(?i)([\"']?\b(?:password|passwd|secret|service_secret|token|access_token|"
-            r"refresh_token|api_key|apikey|auth_token|client_secret|private_key|"
-            r"credential)\b[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}\]]{4,}"
+            r"refresh_token|api_key|apikey|auth_token|client_secret|client_secret_key|"
+            r"access_key|secret_key|private_key|credential)\b[\"']?\s*[:=]\s*[\"']?)"
+            r"[^\s\"',;}\]]{4,}"
         ),
         r"\1" + _redaction("credential-field"),
+    ),
+    # Slack / Discord webhook URLs. The URL itself IS the credential — anyone
+    # who has it can post as the integration — so stripping userinfo (the
+    # `url-userinfo` family below) does nothing here; the whole match goes.
+    (
+        "webhook-url",
+        re.compile(
+            r"https://hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9/_\-]+"
+        ),
+        _redaction("webhook-url"),
+    ),
+    (
+        "webhook-url",
+        re.compile(
+            r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+"
+        ),
+        _redaction("webhook-url"),
     ),
     # URL userinfo — `https://user:token@host/…`. The host survives (it is
     # the useful half); the credential does not.
@@ -269,6 +301,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"sk-ant-[A-Za-z0-9\-_]{16,}"
             r"|sk-proj-[A-Za-z0-9\-_]{16,}"
             r"|sk-[A-Za-z0-9]{20,}"
+            r"|sk_(?:live|test)_[A-Za-z0-9]{10,}"
             r"|github_pat_[A-Za-z0-9_]{20,}"
             r"|gh[pousr]_[A-Za-z0-9]{20,}"
             r"|glpat-[A-Za-z0-9\-_]{16,}"

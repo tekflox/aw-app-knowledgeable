@@ -301,6 +301,128 @@ def test_cli_credential_flags():
     assert "RETURN 1" in out
 
 
+def test_aws_sdk_access_key_and_secret_key_field_names():
+    """QA run 4c86d34ebf4e4857a6a92086608861ec: the literal AWS SDK field
+    names, in the two separator styles that actually appear — a bare
+    `access_key=` assignment and a JSON-style `"secret_key": …` field. The
+    design's own §6 names S3 as where the nightly dumps go, which is what
+    makes this shape directly relevant rather than generic."""
+    out = _scrubber().scrub(
+        "access_key=AKIAIOSFODNN7INVENTED\n"
+        '{"secret_key": "wJalrXUtnFEMIinventedinventedBPxRfiCYINVENTEDKEY"}'
+    )
+    for leaked in ("AKIAIOSFODNN7INVENTED", "wJalrXUtnFEMIinventedinventedBPxRfiCYINVENTEDKEY"):
+        assert leaked not in out, out
+
+
+def test_oauth_client_secret_key_field_name():
+    """`client_secret_key` — the OAuth field name QA found passing through.
+    `client_secret` already matched; the `_key` suffix defeated the `\\b`
+    word boundary that family relies on."""
+    out = _scrubber().scrub('client_secret_key=invented-oauth-client-secret-key-value')
+    assert "invented-oauth-client-secret-key-value" not in out, out
+
+
+def test_access_key_and_secret_key_field_names_do_not_catch_db_column_names():
+    """The companion trap check for the family above: `primary_key`,
+    `foreign_key` and `cache_key` are column names, not AWS field names, and
+    must survive untouched — these alternatives are literal matches on
+    `access_key`/`secret_key`/`client_secret_key`, not a generic `key`
+    suffix, for exactly this reason."""
+    text = "primary_key: id, foreign_key: user_id, cache_key: abcde12345, api version 1.2"
+    assert _scrubber().scrub(text) == text
+
+
+def test_abbreviated_db_pass_assignment():
+    """`DB_PASS=` — the abbreviated form QA found missing; the existing
+    `PASSWORD`/`PASSWD` suffixes only cover the spelled-out names."""
+    out = _scrubber().scrub(
+        "docker run -d -e DB_PASS=invented-db-pass-value -e DB_HOST=db neo4j:5"
+    )
+    assert "invented-db-pass-value" not in out, out
+    assert "DB_PASS=<REDACTED:env-assignment>" in out
+    assert "DB_HOST=db" in out
+
+
+def test_db_pass_does_not_catch_words_that_merely_end_in_pass():
+    """The companion trap check, and the same shape as the bare `-p` trap one
+    level up: a plain `PASS` suffix would also fire on `BYPASS=`/`COMPASS=`/
+    `SURPASS=`, none of which are credentials. `DB_PASS` is matched as a
+    literal name, not a generic suffix, for exactly this reason."""
+    text = "BYPASS=true SURPASS=1 COMPASS_HEADING=270 ENCOMPASS_ALL=false"
+    assert _scrubber().scrub(text) == text
+
+
+def test_slack_webhook_url():
+    """The URL itself is the credential — anyone holding it can post as the
+    integration — so a pattern that only strips URL userinfo (the
+    `url-userinfo` family) does nothing here; the whole URL must go."""
+    out = _scrubber().scrub(
+        "alerting posts to https://hooks.slack.com/services/T000INVENTED/"
+        "B000INVENTED/invented1234567890ABCDEFinventedXYZ when the sync fails"
+    )
+    assert "T000INVENTED" not in out
+    assert "invented1234567890ABCDEFinventedXYZ" not in out
+    assert "<REDACTED:webhook-url>" in out
+    assert "when the sync fails" in out
+
+
+def test_discord_webhook_url():
+    out = _scrubber().scrub(
+        "mirrored to https://discord.com/api/webhooks/123456789012345678/"
+        "inventedABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890invented for the on-call channel"
+    )
+    assert "123456789012345678" not in out
+    assert "inventedABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890invented" not in out
+    assert "<REDACTED:webhook-url>" in out
+    assert "on-call channel" in out
+
+
+def test_ordinary_urls_are_not_mistaken_for_webhooks():
+    """The companion trap check: an ordinary GitHub/Slack-domain URL with no
+    webhook path must survive — the families above anchor on the specific
+    `/services/|/workflows/|/triggers/` and `/api/webhooks/` paths, not on
+    the bare hostname."""
+    for text in (
+        "see https://github.com/fredericowu/aw-workspace for details",
+        "join the workspace at https://aw-workspace.slack.com/archives/C0123",
+        "https://discord.com/invite/abcdef is the support server",
+    ):
+        assert _scrubber().scrub(text) == text
+
+
+def test_stripe_underscore_style_secret_keys():
+    """`sk_live_`/`sk_test_` — only the hyphenated `sk-` form was covered
+    before this. Pasted bare in prose, the shape an agent actually emits.
+
+    The prefix and suffix are concatenated rather than one literal: a
+    contiguous fixture in this exact shape trips GitHub push protection's
+    Stripe-key scanner on the source text itself, invented value or not —
+    which is the same "don't write anything secret-shaped" discipline this
+    module's own docstring asks for, just enforced one layer up.
+    """
+    for token in (
+        "sk_live_" + "xk2mQpT9Zc4bWnJ8VhRu2Lsa",
+        "sk_test_" + "qN7bYd3FtR8mWx2VhLp9KcZa",
+    ):
+        out = _scrubber().scrub(f"the Stripe key in this env is {token} — rotate it")
+        assert token not in out, out
+        assert "<REDACTED:provider-token>" in out
+        assert "rotate it" in out
+
+
+def test_ordinary_mentions_of_live_and_test_are_not_mistaken_for_stripe_keys():
+    """The companion trap check: `sk_live_`/`sk_test_` must stay anchored to
+    the actual prefix — ordinary prose that merely contains the words `live`
+    and `test`, or a short/incomplete prefix, must survive."""
+    for text in (
+        "this build is live, that other one is just a test run",
+        "sk_test_ on its own is not a key",
+        "desk_testing_fixtures.py failed on CI",
+    ):
+        assert _scrubber().scrub(text) == text
+
+
 def test_a_pem_private_key_block():
     out = _scrubber().scrub(
         "wrote the deploy key:\n"
