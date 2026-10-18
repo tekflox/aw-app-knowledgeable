@@ -361,18 +361,47 @@ def plan_batches(run_rows: list[dict], *, batch_bytes: int = BATCH_BYTES) -> lis
     return batches
 
 
-def _watermark_of(run_rows: list[dict]) -> str | None:
-    """The highest timestamp this pass actually saw, across BOTH columns.
+def _watermark_of(run_rows: list[dict], *, complete: bool) -> str | None:
+    """The new watermark after a pass that landed ``run_rows``.
 
-    Max over `ended_at` as well as `started_at`: a run that started before
-    the old watermark and ended after it advanced the frontier, and a
-    watermark taken from `started_at` alone would re-read it forever.
+    The watermark's contract is a **frontier**: nothing at or below it may be
+    unprocessed. What makes that non-obvious is that the selection is
+    ``ORDER BY started_at LIMIT max_runs`` while the predicate also matches on
+    ``ended_at`` — so the two columns mean different things here.
+
+    * ``complete`` — the pass consumed *everything* the predicate matched (the
+      batch was not truncated by ``max_runs`` and no ingest batch failed).
+      Nothing was left behind, so the max across BOTH columns is sound, and
+      using it is what stops a long-running run from being re-read on every
+      tick forever. This is the steady-state 10-minute tick.
+    * not ``complete`` — rows above the last landed ``started_at`` were left
+      unfetched, so the watermark must not pass that point. Max over
+      ``started_at`` ONLY.
+
+    **Why this distinction is load-bearing** (found in production 2026-10-18,
+    card 3fd5bf3b-9510-81bf-9ea5-ca5e2f3a1282). This function used to take the
+    max across both columns unconditionally. During the backfill every pass is
+    truncated at ``max_runs``, and agent runs in this estate routinely end
+    *days* after they start — a watchdog kill, a host stall (run
+    ``245b745a82004a34a65407f4d4df8d15``: started 2026-09-02 12:40, ended
+    2026-09-06 07:12, status ``error``). One such run inside a batch whose true
+    frontier was 2026-09-02 17:24 pushed the watermark to 2026-09-06 07:12, and
+    every run that both started and ended inside that span dropped below the
+    watermark unread. They are not recoverable by the 48 h re-sweep either: it
+    only looks at non-terminal runs, and these are terminal.
+
+    Measured cost of getting this wrong: the watermark ran ahead of the loaded
+    data by a monotonically growing margin — 2 runs, then 1,716, then 5,806,
+    then 5,966 — i.e. 5,966 of 27,853 runs silently absent from a graph whose
+    sentinel read ``fresh`` and whose every tick reported success.
+
+    Re-reading a run is free (every write behind the ingest route is a MERGE);
+    skipping one is permanent. So when the two options conflict, this errs
+    toward re-reading.
     """
+    keys = ("started_at", "ended_at") if complete else ("started_at",)
     stamps = [
-        value
-        for row in run_rows
-        for value in (row.get("started_at"), row.get("ended_at"))
-        if value
+        value for row in run_rows for key in keys if (value := row.get(key))
     ]
     return max(stamps) if stamps else None
 
@@ -485,9 +514,14 @@ async def _run_tick_locked(
     finally:
         conn.close()
 
-    # Only advance the watermark over the prefix that actually landed.
+    # Only advance the watermark over the prefix that actually landed — and
+    # only treat the pass as `complete` (see `_watermark_of`) when every row
+    # the predicate matched was both fetched AND landed. Either a `max_runs`
+    # truncation or a failed batch leaves rows above the frontier unread, and
+    # a watermark that passes them loses them permanently.
     landed = run_rows[: totals["runs"]]
-    new_watermark = _watermark_of(landed) or watermark
+    complete = len(landed) == len(run_rows) < max_runs
+    new_watermark = _watermark_of(landed, complete=complete) or watermark
     await client.put_exec_sync_state(
         source_tenant=source_tenant,
         watermark=new_watermark,

@@ -496,8 +496,90 @@ def test_a_failed_batch_stops_the_pass_and_the_watermark_only_covers_what_landed
     assert result["runs"] == 1, "counted runs from a batch that failed"
     assert "batch 2 failed" in result["reason"]
     # Only run-1 landed, so the watermark must not pass run-2's timestamps.
-    assert result["watermark"] == "2026-10-18T10:05:00+00:00"
+    # It is run-1's STARTED_AT, not its ended_at: a partial pass left rows
+    # above the frontier unread, and `ended_at` can sit days past `started_at`
+    # on this corpus (see test_the_watermark_never_passes_an_unread_run).
+    assert result["watermark"] == "2026-10-18T10:00:00+00:00"
     assert calls.sync_state[0]["last_error"] and "HTTP 500" in calls.sync_state[0]["last_error"]
+
+
+def test_the_watermark_never_passes_an_unread_run_when_a_pass_is_truncated(
+    calls, monkeypatch
+):
+    """The 2026-10-18 production gap, as a test.
+
+    `max_runs` truncates at run-2, whose `ended_at` is FOUR DAYS after its
+    `started_at` — the real shape of a watchdog-killed or host-stalled agent
+    run (`245b745a82004a34a65407f4d4df8d15`: started 2026-09-02 12:40, ended
+    2026-09-06 07:12, status `error`). run-3 starts inside that span and has
+    already finished, so a watermark taken as the max across both columns puts
+    run-3 permanently below it: never selected again by the watermark arm,
+    never re-swept either, because the re-sweep only looks at non-terminal
+    runs.
+
+    Measured before the fix: the watermark ran ahead of the loaded data by a
+    growing margin — 2 runs, then 1,716, then 5,806, then 5,966 of 27,853.
+    """
+    conn = _FakeConn(
+        runs=[
+            _pg_row("run-1", started="2026-09-02T12:00:00+00:00",
+                    ended="2026-09-02T12:05:00+00:00"),
+            _pg_row("run-2", started="2026-09-02T12:40:00+00:00",
+                    ended="2026-09-06T07:12:00+00:00", status="error"),
+        ],
+    )
+    # Truncated: the fetch returned exactly `max_runs` rows, so rows above
+    # run-2's started_at exist and were not read.
+    result = _tick(conn, monkeypatch, max_runs=2)
+
+    assert result["runs"] == 2
+    assert result["watermark"] == "2026-09-02T12:40:00+00:00", (
+        "the watermark passed runs that were never read"
+    )
+    # Concretely: a run that started inside the long run's span is still due.
+    assert result["watermark"] < "2026-09-06T07:12:00+00:00"
+
+
+def test_a_complete_pass_may_advance_over_ended_at_so_a_long_run_is_not_re_read(
+    calls, monkeypatch
+):
+    """The other side of the trade, and why this is a condition rather than
+    just "always use started_at".
+
+    When a pass consumed everything the predicate matched — the steady-state
+    10-minute tick, where the batch is nowhere near `max_runs` — nothing was
+    left behind, so advancing over `ended_at` is sound and is what stops a
+    long-running run from being re-selected by the `ended_at > watermark` arm
+    on every tick for as long as it runs.
+    """
+    conn = _FakeConn(
+        runs=[
+            _pg_row("run-1", started="2026-10-18T10:00:00+00:00",
+                    ended="2026-10-18T10:05:00+00:00"),
+            _pg_row("run-2", started="2026-10-18T10:01:00+00:00",
+                    ended="2026-10-18T14:30:00+00:00"),
+        ],
+    )
+    result = _tick(conn, monkeypatch, max_runs=500)
+
+    assert result["runs"] == 2
+    assert result["watermark"] == "2026-10-18T14:30:00+00:00"
+
+
+def test_a_still_running_run_does_not_stall_the_watermark(calls, monkeypatch):
+    """`ended_at` is NULL for a run in flight. It must simply be ignored, not
+    treated as a frontier of its own — and the pass must still advance over
+    the runs it did see."""
+    conn = _FakeConn(
+        runs=[
+            _pg_row("run-1", started="2026-10-18T10:00:00+00:00",
+                    ended="2026-10-18T10:05:00+00:00"),
+            _pg_row("run-2", started="2026-10-18T10:10:00+00:00", ended=None,
+                    status="running"),
+        ],
+    )
+    result = _tick(conn, monkeypatch, max_runs=500)
+    assert result["watermark"] == "2026-10-18T10:10:00+00:00"
 
 
 def test_the_first_ever_pass_has_a_null_watermark_and_is_still_bounded(calls, monkeypatch):
