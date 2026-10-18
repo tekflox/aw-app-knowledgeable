@@ -535,22 +535,85 @@ def test_the_same_shapeless_secrets_ARE_caught_when_they_are_in_the_store(secret
 # ---------------------------------------------------------------------------
 
 
-def test_workspace_secret_values_reads_every_namespace(tmp_path, monkeypatch):
-    """The cross-namespace read, proven to actually enumerate rather than
-    returning this app's own two secrets (which is what would quietly make
-    §6 point 1a's "far stronger guarantee than patterns" false)."""
-    from src.apps import paths
-    from src.apps.secret_store import SecretStore
+def _install_fake_secret_store(monkeypatch, tmp_path, store: dict[str, dict[str, str]]):
+    """Inject a fake `src.apps.paths` / `src.apps.secret_store` into
+    `sys.modules`.
+
+    `src` is **aw-workspace core**, which lives OUTSIDE this repo — this app
+    is Tier-1 and imports it at runtime from the server process, but the
+    release workflow checks out only this repo and installs only
+    `pytest jsonschema fastapi httpx uvicorn`. A test that imported `src`
+    for real therefore passed locally and went red in CI on the first push
+    (`ModuleNotFoundError: No module named 'src'`) — the sibling-import trap
+    this estate has hit before.
+
+    Skipping the test in CI was the wrong fix: `workspace_secret_values` is
+    the privileged cross-namespace read, and an untested privileged read is
+    the thing to avoid most here. So the dependency is faked instead, which
+    also tests the part that actually matters — that it ENUMERATES every
+    namespace rather than returning this app's own secrets.
+    """
+    import sys
+    import types
 
     secrets_dir = tmp_path / "secrets"
-    secrets_dir.mkdir()
-    monkeypatch.setattr(paths, "secrets_dir", lambda: str(secrets_dir))
-    monkeypatch.setenv("AW_WORKSPACE_SECRET_KEY", "lQ4u5Y1xqQ8PmKZ2nQ6rF3hT7bV9wX0cD1eG2jL5aM8=")
+    secrets_dir.mkdir(exist_ok=True)
+    for namespace, entries in store.items():
+        (secrets_dir / f"{namespace}.json").write_text("{}")
 
-    store = SecretStore()
-    store.put("knowledgeable", "service_secret", "invented-connector-secret-value")
-    store.put("git", "github_token", "invented-git-token-value-here")
+    paths_mod = types.ModuleType("src.apps.paths")
+    paths_mod.secrets_dir = lambda: str(secrets_dir)
 
+    class _FakeStore:
+        def keys(self, namespace):
+            return list(store.get(namespace, {}))
+
+        def get(self, namespace, key):
+            value = store.get(namespace, {}).get(key)
+            if value == "__undecryptable__":
+                raise ValueError("fernet: invalid token")
+            return value
+
+    store_mod = types.ModuleType("src.apps.secret_store")
+    store_mod.SecretStore = _FakeStore
+
+    src_pkg = types.ModuleType("src")
+    src_pkg.__path__ = []  # a package, so `src.apps` is a legal submodule
+    apps_pkg = types.ModuleType("src.apps")
+    apps_pkg.__path__ = []
+    # Set the submodules as ATTRIBUTES of their parent as well as in
+    # sys.modules. `from src.apps import paths` resolves by getattr on the
+    # parent package first, and a pre-seeded sys.modules entry does NOT get
+    # that attribute set for it (the import machinery returns early from the
+    # cache without touching the parent) — so without these two lines the
+    # fake only works when the REAL `src.apps` happens to be importable too,
+    # which is the exact condition this fake exists to remove.
+    src_pkg.apps = apps_pkg
+    apps_pkg.paths = paths_mod
+    apps_pkg.secret_store = store_mod
+    for name, mod in (
+        ("src", src_pkg),
+        ("src.apps", apps_pkg),
+        ("src.apps.paths", paths_mod),
+        ("src.apps.secret_store", store_mod),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_workspace_secret_values_reads_every_namespace(tmp_path, monkeypatch):
+    """The cross-namespace read, proven to actually enumerate rather than
+    returning this app's own secrets — which is what would quietly make §6
+    point 1a's "far stronger guarantee than patterns" false while still
+    claiming it."""
+    _install_fake_secret_store(
+        monkeypatch,
+        tmp_path,
+        {
+            "knowledgeable": {"service_secret": "invented-connector-secret-value"},
+            "git": {"github_token": "invented-git-token-value-here"},
+            "aws": {"access_key": "invented-aws-value-here"},
+        },
+    )
     values, error = exec_scrub.workspace_secret_values()
     assert error is None
     assert "invented-connector-secret-value" in values
@@ -558,6 +621,46 @@ def test_workspace_secret_values_reads_every_namespace(tmp_path, monkeypatch):
         "the read is scoped to one namespace — the exact-match table would then "
         "hold only this app's own secrets"
     )
+    assert "invented-aws-value-here" in values
+
+
+def test_one_undecryptable_entry_does_not_cost_the_whole_table(tmp_path, monkeypatch):
+    """A key rotation or a hand-edited secrets file leaves one entry that
+    cannot be decrypted. Losing the whole redaction table over it would turn
+    a cosmetic problem into a pattern-only scrub, silently."""
+    _install_fake_secret_store(
+        monkeypatch,
+        tmp_path,
+        {
+            "git": {"broken": "__undecryptable__", "github_token": "invented-still-readable"},
+        },
+    )
+    values, error = exec_scrub.workspace_secret_values()
+    assert error is None
+    assert "invented-still-readable" in values
+
+
+def test_the_real_workspace_secret_store_satisfies_the_contract_this_fake_assumes(tmp_path):
+    """The fake above is only honest if the real class has the shape it
+    imitates. Run against aw-workspace core when it IS importable (a local
+    run in the workspace container) and skipped when it is not (this repo's
+    own CI, which checks out only this repo) — so the fake can never drift
+    from `SecretStore`'s real `keys`/`get` contract without someone noticing
+    in the place where core is actually present.
+    """
+    pytest.importorskip(
+        "src.apps.secret_store",
+        reason="aw-workspace core is not on the path — this app's CI checks out only this repo",
+    )
+    from src.apps import paths  # noqa: PLC0415
+    from src.apps.secret_store import SecretStore  # noqa: PLC0415
+
+    assert callable(paths.secrets_dir)
+    for method in ("keys", "get"):
+        assert callable(getattr(SecretStore, method, None)), (
+            f"SecretStore.{method} is gone — exec_scrub.workspace_secret_values "
+            f"and its test fake both depend on it"
+        )
 
 
 def test_a_broken_secret_store_degrades_visibly_and_never_fatally(monkeypatch):
