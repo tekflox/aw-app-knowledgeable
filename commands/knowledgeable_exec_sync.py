@@ -64,6 +64,30 @@ DESCRIPTION = "execution-history projection sync — run/status/reconcile/retent
 
 _BASE = "/api/apps/knowledgeable/exec-sync"
 
+#: Read timeout for the subcommands that do real work, in seconds.
+#:
+#: `local_client.request`'s own default is 30 s, which is right for a status
+#: read and wrong for every mutating call here. Measured 2026-10-19, during
+#: §13 slice 1's backfill: a 2,000-run tick that also fetches and posts
+#: events takes **longer than 30 s**, so the CLI raised `httpx.ReadTimeout`
+#: while the route went on to finish normally server-side — the watermark
+#: advanced, the events landed, and the caller was told the tick had failed.
+#:
+#: That is the worst available failure shape for this particular command,
+#: twice over: `knowledgeable-exec-sync run` is also the body of the
+#: contributed `KB exec-history sync — tick` scheduled task, whose
+#: `notify_exit_codes: [1]` then dispatches an agent to diagnose a tick that
+#: actually worked; and a backfill loop reading that exit code cannot tell
+#: "drained" from "timed out", which is what made the first slice-1 backfill
+#: attempt unobservable.
+#:
+#: 30 minutes, not a tuned number: the tick is already bounded by
+#: `MAX_RUNS_PER_TICK` and `BATCH_BYTES` on the engine side (§13.12 point
+#: 10), so this only has to be longer than the slowest bounded tick rather
+#: than a budget of its own. `status` deliberately keeps the 30 s default —
+#: a doctor surface that hangs for half an hour is its own failure.
+_WORK_TIMEOUT_S = 1800.0
+
 
 def _usage() -> int:
     print(__doc__.split("Usage:")[1].strip())
@@ -83,7 +107,9 @@ def run(args: list[str] | None = None) -> int:
         payload = {}
         if "--max-runs" in rest:
             payload["max_runs"] = int(rest[rest.index("--max-runs") + 1])
-        status, body = local_client.request("POST", f"{_BASE}/run", payload)
+        status, body = local_client.request(
+            "POST", f"{_BASE}/run", payload, timeout=_WORK_TIMEOUT_S
+        )
         if status != 200:
             print(f"run failed: HTTP {status} {body}", file=sys.stderr)
             return 1
@@ -114,7 +140,9 @@ def run(args: list[str] | None = None) -> int:
         return 0
 
     if sub == "reconcile":
-        status, body = local_client.request("POST", f"{_BASE}/reconcile", {})
+        status, body = local_client.request(
+            "POST", f"{_BASE}/reconcile", {}, timeout=_WORK_TIMEOUT_S
+        )
         if status != 200:
             print(f"reconcile failed: HTTP {status} {body}", file=sys.stderr)
             return 1
@@ -128,7 +156,9 @@ def run(args: list[str] | None = None) -> int:
         payload = {}
         if "--days" in rest:
             payload["days"] = int(rest[rest.index("--days") + 1])
-        status, body = local_client.request("POST", f"{_BASE}/retention", payload)
+        status, body = local_client.request(
+            "POST", f"{_BASE}/retention", payload, timeout=_WORK_TIMEOUT_S
+        )
         if status != 200:
             print(f"retention failed: HTTP {status} {body}", file=sys.stderr)
             return 1
@@ -155,7 +185,9 @@ def run(args: list[str] | None = None) -> int:
         return 0
 
     if sub == "purge-secret-args":
-        status, body = local_client.request("POST", f"{_BASE}/purge-secret-args", {})
+        status, body = local_client.request(
+            "POST", f"{_BASE}/purge-secret-args", {}, timeout=_WORK_TIMEOUT_S
+        )
         if status != 200:
             print(f"purge-secret-args failed: HTTP {status} {body}", file=sys.stderr)
             return 1
