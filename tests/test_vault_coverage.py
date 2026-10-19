@@ -48,10 +48,124 @@ def _run(coro):
 #: declared family. Proves each registry entry's declared coverage actually
 #: redacts today, so the registry cannot drift from the pattern catalog
 #: without this test going red.
+#:
+#: Provider-prefixed literals (AKIA…, ghp_…) are built by string
+#: concatenation rather than as one literal — GitHub push protection flags
+#: those shapes on sight even when the value is invented (a prior card hit
+#: this with a Stripe-shaped fixture); splitting the literal avoids the
+#: false trigger without weakening what the pattern actually exercises.
 _REPRESENTATIVE_SHAPES = {
     "aw-stack-neo4j-auth": {
         "env-assignment": "NEO4J_AUTH=neo4j/invented-registry-test-pw",
         "url-userinfo": "bolt://neo4j:invented-registry-test-pw@aw-stack-aw-neo4j-1:7687",
+    },
+    "AWS_CREDENTIALS": {
+        "provider-token": "AKIA" + "B7C3D9E1F5G2H8J4",
+        "env-assignment": "AWS_SECRET_ACCESS_KEY=invented-registry-test-aws-secret-0001",
+    },
+    "aw_ddns_route53_credential": {
+        "provider-token": "AKIA" + "K6L2M8N4P1Q7R3S9",
+        "env-assignment": "ROUTE53_DDNS_SECRET_ACCESS_KEY=invented-registry-test-ddns-secret",
+    },
+    "aw_local_dns_route53_credential": {
+        "provider-token": "AKIA" + "T5U1V7W3X9Y2Z8A4",
+        "env-assignment": (
+            "ROUTE53_LOCAL_DNS_SECRET_ACCESS_KEY=invented-registry-test-local-dns-secret"
+        ),
+    },
+    "aw-stack-redis-admin": {
+        "env-assignment": "REDIS_PASSWORD=invented-registry-test-redis-admin-pw",
+        "url-userinfo": "redis://:invented-registry-test-redis-admin-pw@aw-redis:6379",
+    },
+    "aw-stack-redis-svc-backend": {
+        "env-assignment": "REDIS_SVC_BACKEND_PASSWORD=invented-registry-test-svc-backend-pw",
+        "url-userinfo": (
+            "redis://svc-backend:invented-registry-test-svc-backend-pw@aw-redis:6379"
+        ),
+    },
+    "aw-stack-redis-svc-runs": {
+        "env-assignment": "REDIS_SVC_RUNS_PASSWORD=invented-registry-test-svc-runs-pw",
+        "url-userinfo": "redis://svc-runs:invented-registry-test-svc-runs-pw@aw-redis:6379",
+    },
+    "aw-stack-redis-svc-workspace": {
+        "env-assignment": (
+            "REDIS_SVC_WORKSPACE_PASSWORD=invented-registry-test-svc-workspace-pw"
+        ),
+        "url-userinfo": (
+            "redis://svc-workspace:invented-registry-test-svc-workspace-pw@aw-redis:6379"
+        ),
+    },
+    "google_oauth_aw_dashboard": {
+        "env-assignment": (
+            "GOOGLE_OAUTH_CLIENT_SECRET=invented-registry-test-oauth-secret-dashboard"
+        ),
+    },
+    "google_oauth_workspace_broker": {
+        "env-assignment": (
+            "GOOGLE_OAUTH_CLIENT_SECRET=invented-registry-test-oauth-secret-broker"
+        ),
+    },
+    "knowledge_base_git_token": {
+        "provider-token": "ghp_" + "Fk9Tn2Rm7Qz4Xc1LWb6Yd3Hp",
+    },
+    "knowledgeable-explorer-apmt-key": {
+        "authorization-header": "Authorization: Bearer invented-registry-test-apmt-key-explorer",
+        "env-assignment": (
+            "KNOWLEDGEABLE_EXPLORER_APMT_KEY=invented-registry-test-apmt-key-explorer"
+        ),
+    },
+    "knowledgeable-extractor-apmt-key": {
+        "authorization-header": (
+            "Authorization: Bearer invented-registry-test-apmt-key-extractor"
+        ),
+        "env-assignment": (
+            "KNOWLEDGEABLE_EXTRACTOR_APMT_KEY=invented-registry-test-apmt-key-extractor"
+        ),
+    },
+    "knowledgeable-labeller-apmt-key": {
+        "authorization-header": "Authorization: Bearer invented-registry-test-apmt-key-labeller",
+        "env-assignment": (
+            "KNOWLEDGEABLE_LABELLER_APMT_KEY=invented-registry-test-apmt-key-labeller"
+        ),
+    },
+    "knowledgeable-playground-apmt-key": {
+        "authorization-header": (
+            "Authorization: Bearer invented-registry-test-apmt-key-playground"
+        ),
+        "env-assignment": (
+            "KNOWLEDGEABLE_PLAYGROUND_APMT_KEY=invented-registry-test-apmt-key-playground"
+        ),
+    },
+    "mac_home_vnc_password": {
+        "env-assignment": "MAC_HOME_VNC_PASSWORD=invented-registry-test-vnc-pw",
+    },
+    "private_root_aw.tekflox.com": {
+        "private-key": (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "invented-registry-test-key-material-not-real\n"
+            "-----END OPENSSH PRIVATE KEY-----"
+        ),
+    },
+    "private_root_dev.tekflox.com": {
+        "private-key": (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "invented-registry-test-key-material-not-real-dev\n"
+            "-----END OPENSSH PRIVATE KEY-----"
+        ),
+    },
+    "private_u888-smwcgrxvnrg3_ssh.sapatariacrispal.com": {
+        "private-key": (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "invented-registry-test-key-material-not-real-crispal\n"
+            "-----END OPENSSH PRIVATE KEY-----"
+        ),
+    },
+    "resend_api_key": {
+        "env-assignment": "RESEND_API_KEY=invented-registry-test-resend-key",
+        "authorization-header": "Authorization: Bearer invented-registry-test-resend-key",
+    },
+    "zadarma_account_password": {
+        "env-assignment": "ZADARMA_ACCOUNT_PASSWORD=invented-registry-test-zadarma-pw",
     },
 }
 
@@ -111,6 +225,45 @@ def test_uncovered_names_is_sorted_and_deduplicated():
 
 def test_uncovered_names_ignores_blank_entries():
     assert vault_coverage.uncovered_names(["", None, "a-secret"]) == ["a-secret"]
+
+
+# ---------------------------------------------------------------------------
+# VAULT_REVIEWED_NOT_CREDENTIAL — the third state (card triaging all 21
+# names, 2026-10-19): reviewed and found not credential-shaped, with a
+# recorded reason. Only a name in NEITHER dict should turn doctor red.
+# ---------------------------------------------------------------------------
+
+
+def test_every_reviewed_not_credential_entry_has_a_non_empty_reason():
+    for name, reason in vault_coverage.VAULT_REVIEWED_NOT_CREDENTIAL.items():
+        assert isinstance(reason, str) and reason.strip(), (
+            f"{name!r} has no recorded reason — a reviewed-harmless entry "
+            "must say why, or it is indistinguishable from an oversight"
+        )
+
+
+def test_a_reviewed_not_credential_name_is_excluded_from_uncovered(monkeypatch):
+    monkeypatch.setattr(
+        vault_coverage,
+        "VAULT_REVIEWED_NOT_CREDENTIAL",
+        {"a-harmless-config-slug": "a bucket slug, not a secret value"},
+    )
+    names = ["aw-stack-neo4j-auth", "a-harmless-config-slug"]
+    assert vault_coverage.uncovered_names(names) == []
+
+
+def test_a_reviewed_not_credential_name_does_not_suppress_a_genuinely_new_unknown_name(
+    monkeypatch,
+):
+    """The interaction acceptance cares about: a cleared name sitting right
+    next to an unknown one must not mask the unknown one."""
+    monkeypatch.setattr(
+        vault_coverage,
+        "VAULT_REVIEWED_NOT_CREDENTIAL",
+        {"a-harmless-config-slug": "a bucket slug, not a secret value"},
+    )
+    names = ["aw-stack-neo4j-auth", "a-harmless-config-slug", "a-genuinely-new-vault-secret"]
+    assert vault_coverage.uncovered_names(names) == ["a-genuinely-new-vault-secret"]
 
 
 # ---------------------------------------------------------------------------
