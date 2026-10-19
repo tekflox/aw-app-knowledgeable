@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -366,7 +367,7 @@ def test_args_text_snippet_centres_on_the_match_not_the_head():
     long blob, so truncating from byte 0 would discard exactly what the
     caller searched for."""
     args_text = ("x" * 1000) + "approve_pending_deletions" + ("y" * 1000)
-    snippet, full_len = client._args_text_snippet(args_text, ["approve_pending_deletions"])
+    snippet, full_len = client._text_snippet(args_text, ["approve_pending_deletions"])
     assert full_len == len(args_text)
     assert "approve_pending_deletions" in snippet
     assert len(snippet) <= client._ARGS_SNIPPET_MAX_CHARS + 2  # +2 for the ellipses
@@ -377,14 +378,14 @@ def test_args_text_snippet_falls_back_to_a_leading_window_with_no_match():
     """A result can match on `name` alone (search_in='both') with nothing in
     args_text at all — there is no match position to centre on."""
     args_text = "no query words appear in this argument payload whatsoever"
-    snippet, full_len = client._args_text_snippet(args_text, ["approve_pending_deletions"])
+    snippet, full_len = client._text_snippet(args_text, ["approve_pending_deletions"])
     assert full_len == len(args_text)
     assert snippet == args_text
 
 
 def test_args_text_snippet_passes_through_none_and_empty():
-    assert client._args_text_snippet(None, ["x"]) == (None, 0)
-    assert client._args_text_snippet("", ["x"]) == ("", 0)
+    assert client._text_snippet(None, ["x"]) == (None, 0)
+    assert client._text_snippet("", ["x"]) == ("", 0)
 
 
 def test_search_execution_graph_requires_q():
@@ -438,6 +439,92 @@ def test_search_execution_graph_tool_calls_carry_the_scope_caveat_and_name_count
     assert "Covers only named MCP tool-call events" in text
     assert '"approve_pending_deletions": 2' in text
     assert '"aw-gateway.aw__aw_knowledgeable__approve_pending_deletions": 1' in text
+
+
+def test_search_execution_graph_both_still_means_runs_plus_tool_calls_only():
+    """§13.3's extend-never-repurpose rule, pinned. Adding the event layer
+    must not widen the DEFAULT: a caller that never opts in has to see
+    byte-identical behaviour to the release before `ExecEvent` existed, so
+    `both` makes exactly two calls and names exactly two result sets."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    text, is_error = _run(client.search_execution_graph({"q": "x"}))
+    assert is_error is False
+    assert len(_FakeAsyncClient._CALLS) == 2
+    assert [c["url"].rsplit("/", 1)[-1] for c in _FakeAsyncClient._CALLS] == [
+        "runs",
+        "tool-calls",
+    ]
+    assert '"events"' not in text
+
+
+def test_search_execution_graph_target_events_hits_the_event_index_literally():
+    """§13 slice 1's arm. Literal Lucene terms, like `runs` and unlike
+    `tool_calls`: event text is prose (an error string, a log line), not an
+    underscore-joined identifier, so the tokenization miss that forced
+    wildcarding on tool-call NAMES does not apply."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(
+            200,
+            {
+                "results": [
+                    {
+                        "event_id": "ev-1",
+                        "run_id": "r1",
+                        "kind": "error",
+                        "ts": "2026-10-19T10:00:00+00:00",
+                        "text": ("x" * 900) + "connection refused" + ("y" * 900),
+                        "text_len": 40_000,
+                        "text_truncated": True,
+                    }
+                ]
+            },
+        )
+    )
+    text, is_error = _run(
+        client.search_execution_graph({"q": "connection refused", "target": "events"})
+    )
+    assert is_error is False
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/exec/search/events"
+    assert call["params"] == {"q": "connection refused", "limit": 10}
+
+    payload = json.loads(text)
+    assert set(payload) == {"query", "target", "search_in", "events"}
+    row = payload["events"]["results"][0]
+    assert row["kind"] == "error"
+    assert row["matched_field"] == "event_text"
+    # Match-centred and capped (§10 point 4) — never the full stored blob,
+    # and never a head truncation that would discard the match itself.
+    assert "connection refused" in row["text_snippet"]
+    assert len(row["text_snippet"]) <= client._ARGS_SNIPPET_MAX_CHARS + 2
+    assert "text" not in row, "the full stored text must not ride a search result"
+    # The backend's own text_len is the TRUE pre-cap length (§13.4) and must
+    # survive — recomputing it from the snippet would understate it by 4x.
+    assert row["text_len"] == 40_000
+    assert row["text_truncated"] is True
+    assert "PARTIAL BY CONSTRUCTION" in payload["events"]["scope_caveat"]
+    assert "node_start" in payload["events"]["scope_caveat"], (
+        "the caveat must NAME the structured kinds that are unreachable by "
+        "search, or an empty result reads as 'the run emitted no events'"
+    )
+
+
+def test_search_execution_graph_events_falls_back_to_the_stored_length():
+    """A backend older than §13.4's `text_len` (or a row whose text was
+    never capped) still gets a length rather than a null."""
+    _FakeAsyncClient._QUEUE.append(
+        _FakeResponse(200, {"results": [{"event_id": "ev-1", "kind": "log", "text": "boom"}]})
+    )
+    text, _ = _run(client.search_execution_graph({"q": "boom", "target": "events"}))
+    assert json.loads(text)["events"]["results"][0]["text_len"] == 4
+
+
+def test_search_execution_graph_surfaces_an_event_backend_error_verbatim():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(500, {"detail": "index missing"}))
+    text, is_error = _run(client.search_execution_graph({"q": "x", "target": "events"}))
+    assert is_error is True
+    assert "search_execution_graph failed (events)" in text
 
 
 def test_search_execution_graph_flags_possible_truncation():
@@ -581,8 +668,23 @@ def test_exec_run_detail_sends_the_secret_header_and_run_id_in_the_path():
 
 def test_exec_run_detail_forwards_optional_limits():
     _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"run": {}, "tool_calls": [], "children": []}))
-    _run(client.exec_run_detail({"run_id": "run-1", "toolcall_limit": "5", "children_limit": "2"}))
-    assert _FakeAsyncClient._CALLS[0]["params"] == {"toolcall_limit": 5, "children_limit": 2}
+    _run(
+        client.exec_run_detail(
+            {
+                "run_id": "run-1",
+                "toolcall_limit": "5",
+                "children_limit": "2",
+                # §13 slice 1 — the timeline's own limit rides the same
+                # pass-through loop, so a new limit cannot be half-wired.
+                "event_limit": "7",
+            }
+        )
+    )
+    assert _FakeAsyncClient._CALLS[0]["params"] == {
+        "toolcall_limit": 5,
+        "children_limit": 2,
+        "event_limit": 7,
+    }
 
 
 def test_exec_run_detail_reports_404_as_a_tool_error_not_a_crash():

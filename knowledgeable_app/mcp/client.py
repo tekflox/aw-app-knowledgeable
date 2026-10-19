@@ -503,7 +503,11 @@ async def get_exec_status() -> tuple[dict | None, str | None]:
 
 
 async def post_exec_ingest(
-    *, runs: list[dict], tool_calls: list[dict], called: list[dict]
+    *,
+    runs: list[dict],
+    tool_calls: list[dict],
+    called: list[dict],
+    events: list[dict] | None = None,
 ) -> tuple[bool, str | None]:
     """POST /api/exec/ingest — one byte-bounded batch.
 
@@ -511,10 +515,22 @@ async def post_exec_ingest(
     call here that writes thousands of nodes, and production is single-worker.
     The 30 s tunnel-edge cut does not apply — this call is container-to-
     container on aw-stack-net, by name, never through the edge (§4).
+
+    `events` is §13 slice 1's timeline, and it is keyword-OPTIONAL rather
+    than required for a reason that bites in exactly one direction: this
+    connector releases independently of aw-knowledgeable, so a connector
+    that already sends events can meet a service that does not yet accept
+    them (the field is simply ignored there), and the reverse — a service
+    ready, connector not yet updated — posts no key at all.
     """
     data, err = await _post_json(
         "/api/exec/ingest",
-        {"runs": runs, "tool_calls": tool_calls, "called": called},
+        {
+            "runs": runs,
+            "tool_calls": tool_calls,
+            "called": called,
+            "events": events or [],
+        },
         timeout=120,
     )
     if err:
@@ -664,7 +680,7 @@ _ARGS_SNIPPET_RADIUS = 160
 _ARGS_SNIPPET_MAX_CHARS = 400
 
 
-def _args_text_snippet(args_text: str | None, words: list[str]) -> tuple[str | None, int]:
+def _text_snippet(args_text: str | None, words: list[str]) -> tuple[str | None, int]:
     """Return `(snippet, full_length)`. The snippet is centred on the first
     case-insensitive occurrence of any query word — deliberately NOT a
     head-truncation: the measured match is usually deep inside a long
@@ -672,6 +688,12 @@ def _args_text_snippet(args_text: str | None, words: list[str]) -> tuple[str | N
     caller searched for. Falls back to a leading window only when no query
     word appears in `args_text` at all (the result matched on `name`
     instead) — there is nothing to centre on in that case.
+
+    Shared by the tool-call arm (`args_text`) and §13 slice 1's event arm
+    (`ExecEvent.text`) rather than copied: §10 point 4's rule — search
+    surfaces return match-centred snippets, full stored text only through
+    `exec_run_detail` — is the same rule for both, and two implementations
+    of it would drift into two different windows.
     """
     if not args_text:
         return args_text, 0
@@ -726,12 +748,48 @@ EXEC_TOOLCALL_SCOPE_CAVEAT = (
 )
 
 
-async def search_execution_graph(args: dict) -> tuple[str, bool]:
-    """GET /api/exec/search/runs and/or /api/exec/search/tool-calls.
+#: Attached to every event search result set (§13 slice 1). The honesty this
+#: one owes is different from the tool-call arm's: the timeline is being
+#: projected in slices, so "no hit" is ambiguous in a way it is not for runs
+#: or tool calls, and a caller who does not know which kinds are text-bearing
+#: would read an empty result as "it never happened".
+EXEC_EVENT_SCOPE_CAVEAT = (
+    "PARTIAL BY CONSTRUCTION, in two separate ways. (1) Only text-BEARING "
+    "event kinds are searchable here at all, because only they have a text "
+    "property: today that is `error` (a run's error string) and `log` (a "
+    "workflow log line). The other eleven projected kinds — node_start, "
+    "finalizing, cli.first_byte, system.init, done, cli.error, "
+    "auto_compact.blind, auto_compact.ineffective, connector.timing, "
+    "container.started, cli.timeout — are STRUCTURED: they carry typed "
+    "properties and no text, so they are read as a run's timeline through "
+    "exec_run_detail, never found by this search. An empty result here does "
+    "NOT mean the run emitted no events. (2) `thinking` and `node_end` (the "
+    "node's final output text) are designed and verdicted but NOT YET "
+    "projected — slice 2 — and `tool_result` lands on the tool call rather "
+    "than here (slice 3). `llm_token` never will be: it is excluded from the "
+    "timeline's own upstream definition. "
+    "An event's `text` is scrubbed and capped at 16,384 chars; `text_len` is "
+    "the TRUE pre-cap length and `text_truncated` says whether the cap fired "
+    "— call exec_run_detail for the full stored text. "
+    "possibly_truncated is true when the result count hit `limit`: a count "
+    "is only trustworthy when this is false."
+)
 
-    `target` picks which half of the exec subgraph's fulltext layer to hit:
-    'runs' (free text over Run input/output text), 'tool_calls' (tool-call
-    name + arguments), or 'both' (default).
+
+async def search_execution_graph(args: dict) -> tuple[str, bool]:
+    """GET /api/exec/search/runs, /tool-calls and/or /events.
+
+    `target` picks which layer of the exec subgraph's fulltext surface to
+    hit: 'runs' (free text over Run input/output text), 'tool_calls'
+    (tool-call name + arguments), 'events' (§13 slice 1 — `ExecEvent.text`),
+    or 'both' (default).
+
+    **'both' deliberately still means runs + tool_calls, not all three.**
+    §13.3's rule for this surface is extend, never repurpose: a caller that
+    never opts in must see byte-identical behaviour to the release before
+    the event layer existed, and silently widening the default would change
+    every existing caller's result shape. `target='events'` is explicit
+    opt-in, like `search_in` was.
 
     Run-text queries are sent as literal Lucene terms, unwildcarded — the
     measurement's text-bearing pass (RESULTS.md v2) scored 10/10 on semantic
@@ -769,8 +827,8 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
     if not q:
         return "q is required", True
     target = (args.get("target") or "both").strip().lower()
-    if target not in ("runs", "tool_calls", "both"):
-        return "target must be one of: runs, tool_calls, both", True
+    if target not in ("runs", "tool_calls", "events", "both"):
+        return "target must be one of: runs, tool_calls, events, both", True
     search_in = (args.get("search_in") or "both").strip().lower()
     if search_in not in ("name", "args", "both"):
         return "search_in must be one of: name, args, both", True
@@ -812,7 +870,7 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
         words = [w for w in q.split() if w]
         for r in results:
             r["matched_field"] = _matched_field(r, words)
-            snippet, full_len = _args_text_snippet(r.pop("args_text", None), words)
+            snippet, full_len = _text_snippet(r.pop("args_text", None), words)
             r["args_text_snippet"] = snippet
             r["args_text_len"] = full_len
         # Stable sort: name hits first, original (score DESC) order
@@ -830,13 +888,47 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
             "scope_caveat": EXEC_TOOLCALL_SCOPE_CAVEAT,
         }
 
+    if target == "events":
+        # Literal Lucene terms, unwildcarded — the same choice `runs` makes
+        # and for the same measured reason: event text is natural-language
+        # prose (an error string, a workflow log line), not an
+        # underscore-joined identifier, so the tokenization miss that forced
+        # wildcarding on tool-call NAMES does not apply here.
+        data, err = await _get(
+            "/api/exec/search/events", {"q": _lucene_escape(q), "limit": limit}
+        )
+        if err:
+            return f"search_execution_graph failed (events): {err}", True
+        results = data.get("results", [])
+        words = [w for w in q.split() if w]
+        for r in results:
+            # One `matched_field` value, not a guess between several: an
+            # `ExecEvent` has exactly one free-text property, so unlike the
+            # tool-call arm there is no name-vs-args ambiguity to resolve —
+            # and the field is still stated on every row so a caller can
+            # treat all three arms uniformly.
+            r["matched_field"] = "event_text"
+            snippet, stored_len = _text_snippet(r.pop("text", None), words)
+            r["text_snippet"] = snippet
+            # The backend's own `text_len` is the TRUE pre-cap length (§13.4);
+            # only fall back to the stored length when it is absent.
+            if r.get("text_len") is None:
+                r["text_len"] = stored_len
+        payload["events"] = {
+            "results": results,
+            "count": len(results),
+            "possibly_truncated": len(results) >= limit,
+            "scope_caveat": EXEC_EVENT_SCOPE_CAVEAT,
+        }
+
     return _as_text(payload), False
 
 
 async def exec_run_detail(args: dict) -> tuple[str, bool]:
     """GET /api/exec/runs/{run_id} — one run's metadata and scrubbed text,
-    its tool calls, and its structural joins: direct CHILD_OF children,
-    plus parent/qa/session/card pointers on the run itself.
+    its tool calls, its event timeline (§13 slice 1) and its structural
+    joins: direct CHILD_OF children, plus parent/qa/session/card pointers on
+    the run itself.
 
     Passed through verbatim rather than re-formatted, which matters for one
     field in particular: the backend's own `caveat` — `CHILD_OF understates
@@ -849,7 +941,7 @@ async def exec_run_detail(args: dict) -> tuple[str, bool]:
     if not run_id:
         return "run_id is required", True
     params: dict = {}
-    for key in ("toolcall_limit", "children_limit"):
+    for key in ("toolcall_limit", "children_limit", "event_limit"):
         if args.get(key) is not None:
             try:
                 params[key] = int(args[key])
@@ -1471,7 +1563,21 @@ TOOLS_SCHEMA = [
             "is one indexed token that a bare term query would miss entirely — this "
             "cannot recover a query spanning a HYPHEN boundary, so search by the "
             "hyphen-free segment of a tool name, not the full prefixed name. "
-            "target='both' (default) runs both. "
+            "target='events' searches ExecEvent.text — the Event timeline's "
+            "free-text kinds (`error` strings and workflow `log` lines today; "
+            "`thinking` and `node_end` output text are designed but not yet "
+            "projected). Prose, so plain fulltext like 'runs'. The other "
+            "eleven projected kinds are STRUCTURED (typed properties, no "
+            "text) and are read as a run's chronological timeline through "
+            "exec_run_detail's `events`, never found by this search — an "
+            "empty result does not mean the run emitted no events. Each row "
+            "carries kind, matched_field='event_text', text_snippet (a "
+            "match-centred window) and text_len/text_truncated, plus a "
+            "scope_caveat stating exactly which kinds are and are not "
+            "reachable. "
+            "target='both' (default) runs runs+tool_calls — NOT events: the "
+            "default is byte-identical to the release before the event layer "
+            "existed, so ask for target='events' explicitly. "
             "For tool_calls, `search_in` picks WHICH field counts as a hit: "
             "'name' returns ONLY genuine named calls of that tool — use this to "
             "answer 'did run X actually call tool Y'. 'args' returns ONLY matches "
@@ -1505,8 +1611,12 @@ TOOLS_SCHEMA = [
                 "q": {"type": "string", "description": "Query text. For tool_calls, use the bare tool name (no gateway prefix, no hyphens) for the most reliable match."},
                 "target": {
                     "type": "string",
-                    "enum": ["runs", "tool_calls", "both"],
-                    "description": "Which half of the exec subgraph to search. Default 'both'.",
+                    "enum": ["runs", "tool_calls", "events", "both"],
+                    "description": (
+                        "Which layer of the exec subgraph to search. Default "
+                        "'both' = runs + tool_calls (unchanged); 'events' is "
+                        "explicit opt-in and is NOT included in 'both'."
+                    ),
                 },
                 "search_in": {
                     "type": "string",
@@ -1529,9 +1639,22 @@ TOOLS_SCHEMA = [
         "name": "exec_run_detail",
         "description": (
             "One agent run from the execution-history subgraph: metadata, scrubbed "
-            "input/output text, its tool calls, and its structural joins — direct "
+            "input/output text, its tool calls, its EVENT TIMELINE, and its "
+            "structural joins — direct "
             "CHILD_OF children plus parent_run_id/qa_of_run_id/session_id/card_page_id "
             "on the run itself. 404 if run_id does not exist in this tenant. "
+            "`events` is the run's own timeline, chronological (ORDER BY ts), one "
+            "row per projected run_events row with that kind's typed properties "
+            "(node_start -> agent/label/provider/model_slug; finalizing -> "
+            "tokens_in/tokens_out/cost_usd; system.init -> model/cwd/"
+            "permission_mode/session_id/tools_count; cli.error -> subtype/is_error; "
+            "error and log -> scrubbed `text`; and so on). Interleave it with "
+            "`tool_calls` by ts to reconstruct the full Event timeline. "
+            "INCOMPLETE BY SLICE, state this rather than implying a gap means "
+            "nothing happened: `thinking` and `node_end` (a workflow node's final "
+            "output text) are not projected yet, `tool_result` lands on the tool "
+            "call rather than in `events`, and `llm_token` is excluded by the "
+            "timeline's own definition. "
             "The response always carries `caveat`: CHILD_OF understates lineage "
             "across wakeups (a wakeup-resumed run's causal parent is recorded as "
             "prose inside its input, not a foreign key) — measured: a chain whose "
@@ -1544,6 +1667,7 @@ TOOLS_SCHEMA = [
                 "run_id": {"type": "string", "description": "The run id to look up."},
                 "toolcall_limit": {"type": "integer", "description": "Max tool calls to return. Range 0-2000. Default 200."},
                 "children_limit": {"type": "integer", "description": "Max direct children to return. Range 0-1000. Default 100."},
+                "event_limit": {"type": "integer", "description": "Max timeline events to return. Range 0-5000. Default 500."},
             },
             "required": ["run_id"],
         },

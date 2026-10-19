@@ -54,7 +54,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import exec_scrub, vault_coverage
+from . import event_kinds, exec_scrub, vault_coverage
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.exec_sync")
@@ -96,6 +96,7 @@ def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
         "reason": reason,
         "runs": 0,
         "tool_calls": 0,
+        "events": 0,
         "batches": 0,
         "watermark": None,
         **extra,
@@ -176,6 +177,53 @@ SQL_TOOL_CALLS = """
     ORDER BY e.run_id, e.ts, e.id
 """
 
+#: §13 slice 1 — the Event timeline, for the same batch of run ids, in
+#: `SQL_TOOL_CALLS`' shape and for the same hard-won reasons (§13.12 point 5):
+#:
+#: * **`payload` is selected RAW.** `run_events.payload` is `json`, NOT
+#:   `jsonb` — a text-backed type — so EVERY server-side extraction has to
+#:   parse the whole document to reach any part of it, and a literal
+#:   `\\u0000` anywhere inside fails the conversion. That includes `->>` over
+#:   a single key: the `rollup_called` crash (2026-10-18, ~21.4k runs in,
+#:   `UntranslatableCharacter`) is the precedent, and the first nine ticks
+#:   had passed only because no payload in those windows happened to carry a
+#:   NUL. psycopg parses it client-side, where the escape is legal, and
+#:   `_clean` strips the NULs before anything leaves this process.
+#: * **`kind = ANY(%(kinds)s)` with the shipped kinds bound as a parameter.**
+#:   `kind` is a plain varchar column, so filtering on it server-side is
+#:   safe — only `payload` is radioactive. The kind list comes from
+#:   `event_kinds.shipped_kinds()`, never from a literal here, so the SQL
+#:   cannot select a kind the registry has not verdicted.
+#: * **`e.id` is selected and used verbatim** as `ExecEvent.id`: the table
+#:   has its own varchar PK, so unlike `ExecToolCall` there is no synthetic
+#:   `run_id + ':' + seq` to mint, and no `row_number()` window either —
+#:   which also means event identity does not shift if a row is ever
+#:   backfilled out of ts order.
+SQL_EVENTS = """
+    SELECT e.id, e.run_id, e.kind, e.ts, e.node_id, e.payload
+    FROM run_events e
+    WHERE e.kind = ANY(%(kinds)s) AND e.run_id = ANY(%(run_ids)s)
+    ORDER BY e.run_id, e.ts, e.id
+"""
+
+#: §13.6's open-set alarm: every DISTINCT kind this tenant has ever emitted.
+#: `kind` only — no `payload` in the projection, so the NUL trap above cannot
+#: bite this one at all.
+#:
+#: Tenant-wide rather than restricted to the runs of this tick, deliberately:
+#: a new kind must be visible the tick after it first appears ANYWHERE, not
+#: only if it happens to land on a run the watermark selected, and a tick
+#: that found no runs still has to answer the question. Measured against
+#: production 2026-10-19: 253 ms over 1.34M rows (a sequential scan — there
+#: is no index on `kind`), once per 10-minute tick. That is the whole reason
+#: this is its own query instead of being derived from the fetched rows:
+#: deriving it would make the alarm silent exactly when the sync is quiet.
+SQL_EVENT_KINDS = """
+    SELECT DISTINCT e.kind
+    FROM run_events e
+    WHERE e.tenant_id = %(tenant)s
+"""
+
 #: §5's `CALLED {n}` rollup, kept alongside `MADE_CALL` exactly as the
 #: measurement's graph had it — computed CLIENT-SIDE, with no SQL of its own.
 #:
@@ -242,6 +290,24 @@ SQL_RECONCILE = {
     "ExecToolCall": (
         "SELECT count(*) FROM run_events e JOIN runs r ON r.id = e.run_id "
         "WHERE e.kind = 'tool_call' AND r.tenant_id = %(tenant)s"
+    ),
+    # §13 slice 1. `kind = ANY(...)` bound from the registry, exactly like
+    # `SQL_EVENTS` — if the two used different kind lists the reconcile would
+    # report drift every time a slice shipped, which is how a reconcile stops
+    # being read. Parameterised at call time (`reconcile` below) rather than
+    # interpolated here, so the predicate is a real bind and not a literal
+    # this dict has to keep in sync with the registry by hand.
+    "ExecEvent": (
+        "SELECT count(*) FROM run_events e JOIN runs r ON r.id = e.run_id "
+        "WHERE e.kind = ANY(%(kinds)s) AND r.tenant_id = %(tenant)s"
+    ),
+    # Every ExecEvent hangs off exactly one run, and the ingest route refuses
+    # an event whose run is absent — so EMITTED must equal ExecEvent. A
+    # mismatch here means events landed with no edge, which would make them
+    # invisible to the timeline while still counting as present.
+    "EMITTED": (
+        "SELECT count(*) FROM run_events e JOIN runs r ON r.id = e.run_id "
+        "WHERE e.kind = ANY(%(kinds)s) AND r.tenant_id = %(tenant)s"
     ),
     "IN_SESSION": (
         "SELECT count(*) FROM runs r "
@@ -333,6 +399,98 @@ def build_toolcall_row(record, scrubber: exec_scrub.Scrubber) -> dict:
     }
 
 
+def build_event_row(record, scrubber: exec_scrub.Scrubber) -> tuple[dict, int]:
+    """One `run_events` row -> one ingest event row, per its registry
+    verdict (§13 slice 1). Returns ``(row, fields_dropped)``.
+
+    What this function is, in one line: the §13.6 registry applied. Nothing
+    about a kind is decided here — the field allowlist, the text field and
+    the cap all come from `event_kinds`, so a reader asking "what of
+    `system.init` reaches the graph" reads one table rather than this
+    control flow.
+
+    Three orderings matter, and each one is a recorded scar:
+
+    * **Scrub, THEN cap** (§13.12 point 6). `cap_text` is called on the
+      output of `scrubber.scrub`, never the reverse: a cap applied first can
+      cut a secret in half, which hides it from the exact-match pass AND
+      from every pattern while leaving the surviving half greppable in the
+      graph forever.
+    * **`_clean` every string, always** (§13.12 point 5). The NUL is legal
+      in the client-side-parsed payload and illegal as a Neo4j property, and
+      it arrives when it arrives — the first N ticks passing proves nothing.
+      So it is applied to the text AND to every allowlisted string
+      property, not just to the one field that looked risky.
+    * **An uncoercible field is DROPPED, not raised.** `event_kinds.coerce`
+      returns `None` and the count comes back to the caller for
+      `event_fields_dropped` on the sync status. Raising would 400 the whole
+      batch server-side and park the watermark behind it on every
+      subsequent tick — a silent stall traded for a visible gap in one
+      property, which is the wrong way round.
+
+    The `kind` is trusted to be shipped: `SQL_EVENTS` binds
+    `event_kinds.shipped_kinds()`, so an unshipped kind cannot be in the
+    result set. aw-knowledgeable refuses one anyway (`SHIPPED_EVENT_KINDS`),
+    which is what makes that trust checkable rather than assumed.
+    """
+    event_id, run_id, kind, ts, node_id, payload = record
+    payload = payload if isinstance(payload, dict) else {}
+    spec = event_kinds.EVENT_KIND_REGISTRY.get(kind)
+    row: dict = {
+        "id": event_id,
+        "run_id": run_id,
+        "kind": kind,
+        "ts": _iso(ts),
+        "node_id": _clean(node_id),
+    }
+    if spec is None or not spec.shipped or spec.verdict == "excluded":
+        # Unreachable through `SQL_EVENTS`, which binds the registry's own
+        # shipped set — this is the defensive branch for a hand-built or
+        # replayed row, and it projects NOTHING derived from the payload
+        # rather than guessing a shape.
+        #
+        # `not spec.shipped` is in the condition, not just `spec is None`,
+        # and that is the point: a reviewed-but-unshipped row has a real
+        # verdict and a real `text_field`, so honouring it here would make
+        # the SQL's `kind = ANY(...)` the ONLY thing standing between
+        # `node_end`'s final output text and the graph — one predicate, one
+        # slice early, for exactly the kind §13.12 point 3 names as the trap.
+        # The server refuses the kind too (`SHIPPED_EVENT_KINDS`); this is
+        # the third line, and it is the cheap one.
+        return row, 0
+
+    dropped = 0
+    if spec.text_field:
+        text, text_len, truncated = event_kinds.cap_text(
+            scrubber.scrub(_clean(payload.get(spec.text_field)))
+        )
+        row["text"] = text
+        row["text_len"] = text_len
+        row["text_truncated"] = truncated
+    for prop, payload_key in spec.fields.items():
+        raw = payload.get(payload_key)
+        if raw is None:
+            continue
+        value = event_kinds.coerce(prop, raw)
+        if value is None:
+            dropped += 1
+            log.warning(
+                "exec sync: event %s (kind=%s) field %r could not be coerced to %s "
+                "— dropped, not projected",
+                event_id,
+                kind,
+                prop,
+                event_kinds.EVENT_FIELD_TYPES.get(prop),
+            )
+            continue
+        row[prop] = _clean(value)
+    for prop, payload_key in spec.count_fields.items():
+        raw = payload.get(payload_key)
+        if isinstance(raw, (list, tuple, dict, str)):
+            row[prop] = len(raw)
+    return row, dropped
+
+
 def _batch_bytes(rows) -> int:
     return len(json.dumps(rows, ensure_ascii=False, default=str))
 
@@ -359,6 +517,71 @@ def plan_batches(run_rows: list[dict], *, batch_bytes: int = BATCH_BYTES) -> lis
     if current:
         batches.append(current)
     return batches
+
+
+def plan_posts(
+    run_rows: list[dict],
+    toolcall_rows: list[dict],
+    event_rows: list[dict],
+    called_rows: list[dict],
+    *,
+    batch_bytes: int = BATCH_BYTES,
+) -> list[tuple[list[dict], list[dict], list[dict], list[dict]]]:
+    """Split one fetched batch into byte-bounded POSTs, each carrying its own
+    runs WITH their tool calls, events and CALLED rollup.
+
+    **Why this exists now and did not before** (§12 risk 4, extended by §13).
+    `plan_batches` bounds the RUN rows of a batch, and until this slice the
+    tool calls fetched for those runs rode along unmeasured. Events make that
+    under-count material: a workflow run carries a
+    node_start/node_end/finalizing triple per node, so the event rows of a
+    2 MB run batch can exceed the run rows themselves — and an over-large
+    POST does not fail loudly here, it starves live search on a single-worker
+    service and then gets cut by the tunnel edge at 30 s.
+
+    So the bound is applied to what is actually POSTED: runs plus their own
+    calls, events and rollup. The grouping keeps run order (the watermark's
+    `landed` prefix depends on it) and gives a single over-large run its own
+    POST rather than dropping it — a run whose text is 5 MB is exactly the
+    one worth having in the graph, and a node cannot be split.
+
+    The ingest route refuses a tool call or event whose run is not in the
+    same request, which is why the split is by RUN and never by row: every
+    POST is self-consistent by construction.
+    """
+    by_run_calls: dict[str, list[dict]] = {}
+    for row in toolcall_rows:
+        by_run_calls.setdefault(row["run_id"], []).append(row)
+    by_run_events: dict[str, list[dict]] = {}
+    for row in event_rows:
+        by_run_events.setdefault(row["run_id"], []).append(row)
+    by_run_called: dict[str, list[dict]] = {}
+    for row in called_rows:
+        by_run_called.setdefault(row["run_id"], []).append(row)
+
+    posts: list[tuple[list[dict], list[dict], list[dict], list[dict]]] = []
+    runs: list[dict] = []
+    calls: list[dict] = []
+    events: list[dict] = []
+    called: list[dict] = []
+    size = 0
+    for run in run_rows:
+        run_id = run["id"]
+        own_calls = by_run_calls.get(run_id, [])
+        own_events = by_run_events.get(run_id, [])
+        own_called = by_run_called.get(run_id, [])
+        own_size = _batch_bytes([run]) + _batch_bytes(own_calls) + _batch_bytes(own_events)
+        if runs and size + own_size > batch_bytes:
+            posts.append((runs, calls, events, called))
+            runs, calls, events, called, size = [], [], [], [], 0
+        runs.append(run)
+        calls.extend(own_calls)
+        events.extend(own_events)
+        called.extend(own_called)
+        size += own_size
+    if runs:
+        posts.append((runs, calls, events, called))
+    return posts
 
 
 def _watermark_of(run_rows: list[dict], *, complete: bool) -> str | None:
@@ -417,6 +640,28 @@ async def scrub_status(scrubber: exec_scrub.Scrubber | None = None) -> dict:
     that needs no actual redaction pass."""
     scrubber = scrubber or exec_scrub.Scrubber.from_workspace()
     return {**scrubber.status, **(await vault_coverage.coverage_status())}
+
+
+def event_kinds_unreviewed(graph_status: dict | None) -> list[str]:
+    """The §13.6 alarm, read back off the freshness sentinel.
+
+    The tick computes it (a 253 ms scan is too expensive for a doctor poll)
+    and posts it inside the sentinel's `counts`, so this is where the status
+    and doctor surfaces read it from — exactly as they read `reported_counts`
+    for every other number the tick observed.
+
+    An absent key is an empty list, NOT a degradation: it is the normal shape
+    of a sentinel stamped by a connector older than this release, and a
+    doctor that went red for that would be red on every deployment before the
+    one that fixes it. The companion signal for "the check could not run at
+    all" already exists and is not this one — an unreachable sentinel is
+    `degraded` by itself in `_exec_sync_status_payload`.
+    """
+    reported = (graph_status or {}).get("reported_counts") or {}
+    value = reported.get("event_kinds_unreviewed")
+    if not isinstance(value, list):
+        return []
+    return [str(k) for k in value]
 
 
 def scrub_degraded(status: dict) -> bool:
@@ -503,6 +748,20 @@ async def _run_tick_locked(
 
     conn = connect(dsn)
     try:
+        # §13.6's open-set alarm, computed BEFORE the "no runs due" early
+        # return: a kind that appeared upstream must degrade the doctor check
+        # on the next tick whether or not that tick had any runs to project.
+        # Computing it from the fetched rows instead would make the alarm go
+        # quiet exactly when the sync is quiet.
+        unreviewed = event_kinds.unreviewed_kinds(_fetch_event_kinds(conn, source_tenant))
+        if unreviewed:
+            log.warning(
+                "exec sync: %d run_events kind(s) have no EVENT_KIND_REGISTRY row "
+                "and are NOT projected: %s",
+                len(unreviewed),
+                unreviewed,
+            )
+
         run_rows = _fetch_runs(conn, params, scrubber)
         if not run_rows:
             # A tick that found nothing still stamps the sentinel: freshness
@@ -512,34 +771,62 @@ async def _run_tick_locked(
             await client.put_exec_sync_state(
                 source_tenant=source_tenant,
                 watermark=watermark,
-                counts={},
+                counts={"event_kinds_unreviewed": unreviewed},
                 last_error=None,
             )
             return _empty_result(
-                False, "no runs due", watermark=watermark, scrub=scrub_status_
+                False,
+                "no runs due",
+                watermark=watermark,
+                scrub=scrub_status_,
+                event_kinds_unreviewed=unreviewed,
             )
 
-        totals = {"runs": 0, "tool_calls": 0, "called": 0, "batches": 0}
+        totals = {
+            "runs": 0,
+            "tool_calls": 0,
+            "events": 0,
+            "called": 0,
+            "batches": 0,
+            "event_fields_dropped": 0,
+        }
         last_error = None
+        aborted = False
         for batch in plan_batches(run_rows, batch_bytes=batch_bytes):
             run_ids = [r["id"] for r in batch]
             toolcalls = _fetch_tool_calls(conn, run_ids, scrubber)
+            events, dropped = _fetch_events(conn, run_ids, scrubber)
+            totals["event_fields_dropped"] += dropped
             called = rollup_called(toolcalls)
-            ok, err = await client.post_exec_ingest(
-                runs=batch, tool_calls=toolcalls, called=called
-            )
-            totals["batches"] += 1
-            if not ok:
-                # Stop at the first failed batch rather than pressing on: the
-                # watermark must not advance past a gap, and a partial pass
-                # that keeps going produces a graph missing an arbitrary
-                # middle slice that no count-reconcile can localise.
-                last_error = f"ingest batch {totals['batches']} failed: {err}"
-                log.warning("exec sync: %s", last_error)
+            # One fetched batch can be several POSTs now: the byte bound is
+            # applied to runs + calls + events together (`plan_posts`), not
+            # to the run rows alone.
+            for post_runs, post_calls, post_events, post_called in plan_posts(
+                batch, toolcalls, events, called, batch_bytes=batch_bytes
+            ):
+                ok, err = await client.post_exec_ingest(
+                    runs=post_runs,
+                    tool_calls=post_calls,
+                    called=post_called,
+                    events=post_events,
+                )
+                totals["batches"] += 1
+                if not ok:
+                    # Stop at the first failed batch rather than pressing on:
+                    # the watermark must not advance past a gap, and a partial
+                    # pass that keeps going produces a graph missing an
+                    # arbitrary middle slice that no count-reconcile can
+                    # localise.
+                    last_error = f"ingest batch {totals['batches']} failed: {err}"
+                    log.warning("exec sync: %s", last_error)
+                    aborted = True
+                    break
+                totals["runs"] += len(post_runs)
+                totals["tool_calls"] += len(post_calls)
+                totals["events"] += len(post_events)
+                totals["called"] += len(post_called)
+            if aborted:
                 break
-            totals["runs"] += len(batch)
-            totals["tool_calls"] += len(toolcalls)
-            totals["called"] += len(called)
     finally:
         conn.close()
 
@@ -551,10 +838,17 @@ async def _run_tick_locked(
     landed = run_rows[: totals["runs"]]
     complete = len(landed) == len(run_rows) < max_runs
     new_watermark = _watermark_of(landed, complete=complete) or watermark
+    counts = {k: v for k, v in totals.items() if k != "batches"}
+    # Rides the sentinel's `counts` rather than being recomputed by the
+    # status route: the sweep is a 253 ms sequential scan over 1.3M rows, and
+    # the doctor check polls far more often than every 10 minutes. The
+    # sentinel therefore carries this tick's observation, which is what
+    # "freshness" already means for every other number on it.
+    counts["event_kinds_unreviewed"] = unreviewed
     await client.put_exec_sync_state(
         source_tenant=source_tenant,
         watermark=new_watermark,
-        counts={k: v for k, v in totals.items() if k != "batches"},
+        counts=counts,
         last_error=last_error,
     )
     return {
@@ -562,6 +856,7 @@ async def _run_tick_locked(
         "reason": last_error,
         "watermark": new_watermark,
         "scrub": scrub_status_,
+        "event_kinds_unreviewed": unreviewed,
         **totals,
     }
 
@@ -584,6 +879,46 @@ def _fetch_tool_calls(conn, run_ids: list[str], scrubber: exec_scrub.Scrubber) -
     try:
         cur.execute(SQL_TOOL_CALLS, {"run_ids": run_ids})
         return [build_toolcall_row(record, scrubber) for record in cur]
+    finally:
+        cur.close()
+
+
+def _fetch_events(
+    conn, run_ids: list[str], scrubber: exec_scrub.Scrubber
+) -> tuple[list[dict], int]:
+    """§13 slice 1's events for one batch of runs. Returns
+    ``(rows, fields_dropped)`` — the drop count is reported on the sync
+    status rather than swallowed, and `kinds` is bound from the registry so
+    this query can never select an unverdicted kind."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            SQL_EVENTS,
+            {"kinds": list(event_kinds.shipped_kinds()), "run_ids": run_ids},
+        )
+        rows: list[dict] = []
+        dropped = 0
+        for record in cur:
+            row, n = build_event_row(record, scrubber)
+            rows.append(row)
+            dropped += n
+        return rows, dropped
+    finally:
+        cur.close()
+
+
+def _fetch_event_kinds(conn, source_tenant: str) -> list[str]:
+    """Every DISTINCT `run_events.kind` this tenant has emitted (§13.6).
+
+    Selects the `kind` column and nothing else: `kind` is a plain varchar,
+    so it is safe server-side, and keeping `payload` out of the projection
+    means the NUL trap that governs every other query in this file cannot
+    reach this one at all.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_EVENT_KINDS, {"tenant": source_tenant})
+        return [row[0] for row in cur if row[0]]
     finally:
         cur.close()
 
@@ -611,7 +946,13 @@ async def reconcile(*, dsn: str, source_tenant: str) -> dict:
         for label, sql in SQL_RECONCILE.items():
             cur = conn.cursor()
             try:
-                cur.execute(sql, {"tenant": source_tenant})
+                cur.execute(
+                    sql,
+                    {
+                        "tenant": source_tenant,
+                        "kinds": list(event_kinds.shipped_kinds()),
+                    },
+                )
                 sql_n = cur.fetchone()[0]
             finally:
                 cur.close()

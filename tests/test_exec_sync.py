@@ -66,6 +66,20 @@ class _FakeCursor:
         elif "row_number()" in sql:
             ids = set((params or {}).get("run_ids") or [])
             self._rows = [r for r in self._conn.tool_calls if r[0] in ids]
+        elif "SELECT DISTINCT e.kind" in sql:
+            # §13.6's open-set sweep. Returns whatever kinds this fake tenant
+            # has "emitted", including ones the registry has never seen — that
+            # is the whole point of the alarm.
+            self._rows = [(k,) for k in self._conn.event_kinds]
+        elif "e.kind = ANY" in sql and "count(" not in sql:
+            ids = set((params or {}).get("run_ids") or [])
+            kinds = set((params or {}).get("kinds") or [])
+            # The fake enforces what the SQL claims: an unshipped kind must
+            # never come back from this query, because the query binds the
+            # registry's own shipped set.
+            self._rows = [
+                r for r in self._conn.events if r[1] in ids and r[2] in kinds
+            ]
         elif "payload->>" in sql or "payload::text" in sql:
             # The fake refuses what production refuses. `run_events.payload` is
             # `json` (text-backed) and holds literal `\u0000`, so ANY
@@ -92,10 +106,19 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, runs=(), tool_calls=(), counts=()):
+    def __init__(self, runs=(), tool_calls=(), counts=(), events=(), event_kinds=None):
         self.runs = list(runs)
         self.tool_calls = list(tool_calls)
         self.counts = list(counts)
+        self.events = list(events)
+        # Default: exactly the registry's own shipped set, so an ordinary
+        # tick reports no unreviewed kind. A test that wants the alarm passes
+        # its own list including something unregistered.
+        self.event_kinds = (
+            list(event_kinds)
+            if event_kinds is not None
+            else list(exec_sync.event_kinds.shipped_kinds())
+        )
         self.executed: list = []
         self.closed = False
 
@@ -167,8 +190,15 @@ def calls(monkeypatch):
     async def _get_status():
         return rec.status_result
 
-    async def _post_ingest(*, runs, tool_calls, called):
-        rec.ingest.append({"runs": runs, "tool_calls": tool_calls, "called": called})
+    async def _post_ingest(*, runs, tool_calls, called, events=None):
+        rec.ingest.append(
+            {
+                "runs": runs,
+                "tool_calls": tool_calls,
+                "called": called,
+                "events": events or [],
+            }
+        )
         return rec.ingest_result
 
     async def _put_state(*, source_tenant, watermark, counts=None, last_error=None):
@@ -459,6 +489,149 @@ def test_one_oversized_row_gets_its_own_batch_rather_than_being_dropped():
     )
 
 
+def _pg_event(run_id="run-1", *, event_id="ev-1", kind="finalizing", payload=None, ts=None):
+    """One row in `SQL_EVENTS`' column order — positional, like the real
+    cursor, because that order is the contract with `build_event_row`."""
+    return (
+        event_id,
+        run_id,
+        kind,
+        ts or datetime(2026, 10, 18, 10, 9, tzinfo=timezone.utc),
+        None,
+        payload if payload is not None else {"tokens_in": 1, "tokens_out": 2, "cost_usd": 0.5},
+    )
+
+
+def test_a_tick_posts_events_alongside_runs_and_tool_calls(calls, monkeypatch):
+    """§13 slice 1's happy path, end to end through the tick: the event rows
+    are fetched for the batch's own runs, built per their registry rows, and
+    posted in the SAME request as those runs (the ingest route refuses an
+    event whose run is absent)."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        events=[
+            _pg_event("run-1", event_id="ev-1", kind="node_start",
+                      payload={"label": "Coder", "agent": "coder-opus",
+                               "provider": "runner", "model": "m", "model_slug": "m"}),
+            _pg_event("run-1", event_id="ev-2", kind="finalizing"),
+        ],
+    )
+    result = _tick(conn, monkeypatch)
+    assert result["events"] == 2
+    assert len(calls.ingest) == 1
+    posted = calls.ingest[0]["events"]
+    assert [e["id"] for e in posted] == ["ev-1", "ev-2"]
+    assert [e["run_id"] for e in posted] == ["run-1", "run-1"]
+    assert posted[0]["agent"] == "coder-opus"
+    assert posted[1]["cost_usd"] == 0.5
+    # The sentinel carries the event count, so the weekly reconcile has both
+    # sides of the comparison without a second round trip.
+    assert calls.sync_state[0]["counts"]["events"] == 2
+
+
+def test_the_event_query_never_touches_the_payload_server_side(calls, monkeypatch):
+    """§13.12 point 5 / the `rollup_called` precedent. `run_events.payload`
+    is `json`, not `jsonb`, and holds literal NULs — so the event SQL may
+    filter on `kind` (a varchar column) and must select `payload` RAW. The
+    fake raises on any server-side payload extraction, so this test is the
+    guard; what is asserted here is the positive half: the kind list that
+    crossed into the query is the registry's own shipped set, not a literal."""
+    conn = _FakeConn(runs=[_pg_row("run-1")], events=[_pg_event("run-1")])
+    _tick(conn, monkeypatch)
+    event_queries = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "e.kind = ANY" in sql and "count(" not in sql
+    ]
+    assert event_queries, "the tick never queried for events"
+    sql, params = event_queries[0]
+    assert "payload" in sql and "payload->>" not in sql and "payload::text" not in sql
+    assert params["kinds"] == list(exec_sync.event_kinds.shipped_kinds())
+
+
+def test_a_nul_bearing_event_payload_syncs_instead_of_crashing_the_pass(calls, monkeypatch):
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        events=[_pg_event("run-1", kind="log", payload={"msg": "boom\x00 here"})],
+    )
+    result = _tick(conn, monkeypatch)
+    assert result["blocked"] is False
+    assert result["reason"] is None
+    assert "\x00" not in calls.ingest[0]["events"][0]["text"]
+
+
+def test_an_unregistered_kind_is_reported_on_the_tick_and_the_sentinel(calls, monkeypatch):
+    """§13.6's open-set alarm, through the tick. The kind is NOT projected
+    (the SQL binds the shipped set), and the tick says so on its own result
+    and on the sentinel's counts, which is where the doctor check reads it
+    from."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        events=[_pg_event("run-1")],
+        event_kinds=list(exec_sync.event_kinds.shipped_kinds())
+        + ["llm_token", "brand.new.kind", "another.new.kind"],
+    )
+    result = _tick(conn, monkeypatch)
+    # DISTINCT kinds, sorted; `llm_token` has a registry row (verdict
+    # `excluded`) so it is a decision, not a gap.
+    assert result["event_kinds_unreviewed"] == ["another.new.kind", "brand.new.kind"]
+    assert calls.sync_state[0]["counts"]["event_kinds_unreviewed"] == [
+        "another.new.kind",
+        "brand.new.kind",
+    ]
+    assert exec_sync.event_kinds_unreviewed(
+        {"reported_counts": calls.sync_state[0]["counts"]}
+    ) == ["another.new.kind", "brand.new.kind"]
+
+
+def test_a_quiet_tick_still_reports_an_unregistered_kind(calls, monkeypatch):
+    """The sweep runs BEFORE the "no runs due" early return, deliberately: a
+    new kind must degrade the doctor check on the next tick whether or not
+    that tick had runs to project. Deriving the kind set from the fetched
+    rows instead would make the alarm go quiet exactly when the sync is
+    quiet."""
+    conn = _FakeConn(runs=[], event_kinds=["done", "brand.new.kind"])
+    result = _tick(conn, monkeypatch)
+    assert result["reason"] == "no runs due"
+    assert result["event_kinds_unreviewed"] == ["brand.new.kind"]
+    assert calls.sync_state[0]["counts"]["event_kinds_unreviewed"] == ["brand.new.kind"]
+
+
+def test_the_byte_bound_covers_events_not_only_the_run_rows(calls, monkeypatch):
+    """§12 risk 4, extended by §13. Two small runs whose EVENTS are large:
+    the old bound measured run rows only, so both would have ridden one POST
+    and the request would have been several times the stated ceiling. A
+    workflow run carries a node_start/node_end/finalizing triple per node,
+    so this is the normal case, not a pathological one.
+
+    MUTATION: bound on `_batch_bytes([run])` alone -> one POST here, and the
+    assertion below goes red."""
+    big = {"msg": "m" * 4000}
+    conn = _FakeConn(
+        runs=[
+            _pg_row("run-1"),
+            _pg_row("run-2", started="2026-10-18T11:00:00+00:00",
+                    ended="2026-10-18T11:05:00+00:00"),
+        ],
+        events=[
+            _pg_event("run-1", event_id="ev-1", kind="log", payload=big),
+            _pg_event("run-2", event_id="ev-2", kind="log", payload=big),
+        ],
+    )
+    _tick(conn, monkeypatch, batch_bytes=5000)
+    assert len(calls.ingest) == 2, (
+        "the byte bound ignored the event rows — both runs rode one oversized POST"
+    )
+    for post in calls.ingest:
+        run_ids = {r["id"] for r in post["runs"]}
+        for event in post["events"]:
+            assert event["run_id"] in run_ids, (
+                "an event was posted in a request that does not carry its run — the "
+                "ingest route refuses that, and the template would silently write "
+                "nothing"
+            )
+
+
 def test_each_batch_carries_its_own_tool_calls(calls, monkeypatch):
     """The ingest route refuses a tool call whose run is not in the same
     request (the template MATCHes the run and would otherwise silently write
@@ -520,11 +693,13 @@ def test_a_failed_batch_stops_the_pass_and_the_watermark_only_covers_what_landed
     posted = {"n": 0}
     original = client.post_exec_ingest
 
-    async def _flaky(*, runs, tool_calls, called):
+    async def _flaky(*, runs, tool_calls, called, events=None):
         posted["n"] += 1
         if posted["n"] == 2:
             return False, "HTTP 500"
-        return await original(runs=runs, tool_calls=tool_calls, called=called)
+        return await original(
+            runs=runs, tool_calls=tool_calls, called=called, events=events
+        )
 
     monkeypatch.setattr(client, "post_exec_ingest", _flaky)
     result = _tick(conn, monkeypatch, batch_bytes=2500)
@@ -677,12 +852,16 @@ def test_reconcile_reports_every_row_not_just_a_verdict(calls, monkeypatch):
         {
             "graph_counts": {
                 "ExecRun": 10, "ExecSession": 3, "ExecCard": 2, "ExecToolCall": 40,
+                "ExecEvent": 55, "EMITTED": 55,
                 "IN_SESSION": 10, "ON_CARD": 2, "CHILD_OF": 4, "QA_OF": 1,
             }
         },
         None,
     )
-    conn = _FakeConn(counts=[10, 3, 2, 40, 10, 2, 4, 1])
+    conn = _FakeConn(counts=[10, 3, 2, 40, 55, 55, 10, 2, 4, 1])
+    # Positional, in SQL_RECONCILE dict order — ExecEvent and EMITTED sit
+    # right after ExecToolCall (§13 slice 1) and carry the same number, since
+    # every event hangs off exactly one run.
     monkeypatch.setattr(exec_sync, "connect", lambda dsn: conn)
     result = _run(exec_sync.reconcile(dsn=DSN, source_tenant=SOURCE_TENANT))
     assert result["ok"] is True
@@ -696,12 +875,16 @@ def test_reconcile_names_the_layer_that_drifted(calls, monkeypatch):
         {
             "graph_counts": {
                 "ExecRun": 10, "ExecSession": 3, "ExecCard": 2, "ExecToolCall": 37,
+                "ExecEvent": 55, "EMITTED": 55,
                 "IN_SESSION": 10, "ON_CARD": 2, "CHILD_OF": 4, "QA_OF": 1,
             }
         },
         None,
     )
-    conn = _FakeConn(counts=[10, 3, 2, 40, 10, 2, 4, 1])
+    conn = _FakeConn(counts=[10, 3, 2, 40, 55, 55, 10, 2, 4, 1])
+    # Positional, in SQL_RECONCILE dict order — ExecEvent and EMITTED sit
+    # right after ExecToolCall (§13 slice 1) and carry the same number, since
+    # every event hangs off exactly one run.
     monkeypatch.setattr(exec_sync, "connect", lambda dsn: conn)
     result = _run(exec_sync.reconcile(dsn=DSN, source_tenant=SOURCE_TENANT))
     assert result["ok"] is False

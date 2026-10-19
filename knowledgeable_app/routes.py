@@ -430,6 +430,11 @@ def build_routes(ctx) -> FastAPI:
         payload["error"] = err
         scrub = await exec_sync.scrub_status()
         payload["scrub"] = scrub
+        # §13.6's open-set alarm, read off the sentinel this tick stamped.
+        # DISTINCT kinds, so a burst of one new kind reads as one decision
+        # owed (§13.12 point 8) — the `vault_names_uncovered` mechanism, for
+        # event kinds instead of vault secrets.
+        payload["event_kinds_unreviewed"] = exec_sync.event_kinds_unreviewed(remote)
         # Degraded is computed on THIS side too, not only read off the
         # sentinel: a sentinel we cannot reach is itself degraded, and a
         # status surface that reports `None` for that reads as healthy.
@@ -444,6 +449,7 @@ def build_routes(ctx) -> FastAPI:
             cfg["enabled"] and (
                 err or not remote or staleness.get("degraded")
                 or exec_sync.scrub_degraded(scrub)
+                or payload["event_kinds_unreviewed"]
             )
         )
         return payload
