@@ -13,6 +13,7 @@ Usage:
     aw-workspace-cli knowledgeable-exec-sync reconcile            # SQL vs graph count table
     aw-workspace-cli knowledgeable-exec-sync retention [--days N] # the args_text valve
     aw-workspace-cli knowledgeable-exec-sync purge-secret-args    # §13.2 secret-tool purge
+    aw-workspace-cli knowledgeable-exec-sync reset-watermark      # §13.8 backfill: re-read every run
 
 Exit codes for `run`: 0 progressed or nothing to do, 1 the tick was blocked —
 the flag is off, no DSN, no source tenant, no service secret, another tick in
@@ -33,6 +34,16 @@ outside the loaded window creates no edge by design), whereas a missing
 `ExecToolCall.args_text` older than 180 days. The text is rebuildable from
 Postgres at any time (Postgres is the system of record), so this is a cache
 eviction — but it is also irreversible in the graph until a re-backfill.
+
+`reset-watermark` is §13.8's per-slice backfill trigger: it clears the
+freshness watermark so the next bounded ticks re-read every run from the
+beginning, which is the only way a projection added by a new slice reaches
+runs that were already synced. Nothing is deleted and nothing can be lost —
+every statement behind the ingest route is a MERGE, so a re-read is free
+while a skip is permanent. What it costs is TICKS: ~14 bounded passes over
+~28k runs, sharing the single production worker with live search, so run it
+off-hours and never from a scheduled task. After it, call `run` repeatedly
+until `runs` comes back 0 / "no runs due".
 
 `purge-secret-args` is §13.2's remediation: it nulls `args_text` on every
 `ExecToolCall` whose name's terminal segment is a secret-store tool, however
@@ -125,6 +136,22 @@ def run(args: list[str] | None = None) -> int:
         if not body.get("ok"):
             print(f"retention: {body.get('error')}", file=sys.stderr)
             return 1
+        return 0
+
+    if sub == "reset-watermark":
+        status, body = local_client.request("POST", f"{_BASE}/reset-watermark", {})
+        if status != 200:
+            print(f"reset-watermark failed: HTTP {status} {body}", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2))
+        if not body.get("ok"):
+            print(f"reset-watermark: {body.get('error')}", file=sys.stderr)
+            return 1
+        print(
+            "watermark cleared — now run `knowledgeable-exec-sync run` repeatedly "
+            "until it reports 0 runs",
+            file=sys.stderr,
+        )
         return 0
 
     if sub == "purge-secret-args":

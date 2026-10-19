@@ -476,6 +476,50 @@ def build_routes(ctx) -> FastAPI:
         payload = await _exec_sync_status_payload()
         return {"ok": not payload["degraded"], "detail": payload}
 
+    @app.post("/exec-sync/reset-watermark", dependencies=[Depends(_require_identity)])
+    async def exec_sync_reset_watermark() -> dict:
+        """§13.8's per-slice backfill trigger: clear the freshness watermark
+        so the next bounded ticks re-read every run from the beginning.
+
+        **Why this is wired rather than a one-off.** Each slice of the §13
+        timeline adds a projection to runs that were already synced, and the
+        only way to reach them is from a null watermark — the design calls
+        for exactly one watermark-reset backfill per slice (§13.8), so slices
+        2 and 3 need this button too. Leaving it unwired means the next coder
+        hand-rolls an HTTP call to a service-authed route with the internal
+        secret, which is the shape this app exists to avoid.
+
+        Cheap to get wrong in only one direction, and it is the harmless one:
+        re-reading a run is free (every statement behind the ingest route is
+        a MERGE, so a re-read is a no-op on identity and a re-SET on the
+        mutable fields), while skipping one is permanent. What it DOES cost
+        is ticks — ~14 bounded passes over ~28k runs, sharing the single
+        production worker with live search — which is why it is a deliberate
+        operator action and the scheduled task never calls it.
+
+        Nothing is deleted. `counts` is cleared because the previous tick's
+        numbers would otherwise describe a pass that no longer corresponds to
+        the watermark, and `last_error` records WHY the sentinel looks like a
+        first-ever pass, so an operator reading a null watermark can tell a
+        deliberate reset from a lost sentinel.
+        """
+        cfg = _exec_sync_kwargs()
+        if not cfg["source_tenant"]:
+            return {
+                "ok": False,
+                "error": (
+                    "exec_sync_source_tenant is not set — the sentinel is per "
+                    "source tenant and this route will not guess it"
+                ),
+            }
+        ok, err = await client.put_exec_sync_state(
+            source_tenant=cfg["source_tenant"],
+            watermark=None,
+            counts={},
+            last_error="watermark reset for a §13.8 backfill",
+        )
+        return {"ok": ok, "error": err, "watermark": None}
+
     @app.post("/exec-sync/reconcile", dependencies=[Depends(_require_identity)])
     async def exec_sync_reconcile() -> dict:
         cfg = _exec_sync_kwargs()
