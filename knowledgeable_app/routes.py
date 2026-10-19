@@ -571,6 +571,32 @@ def build_routes(ctx) -> FastAPI:
         result, err = await client.post_exec_purge_secret_args()
         return {"ok": err is None, "error": err, "result": result}
 
+    @app.post("/exec-sync/purge-tool-text", dependencies=[Depends(_require_identity)])
+    async def exec_sync_purge_tool_text(data: dict = Body(default={})) -> dict:
+        """exec-index-per-tool-policy.md §9 slice 4's retro-purge, per row —
+        the route §7's policy UI calls from a row's "purge existing rows"
+        action once slice 3 builds it.
+
+        Policy stops the NEXT tick's rows; existing rows are unchanged until
+        something nulls them, and this is that something. One bare name at a
+        time, with the axes named explicitly: there is no sweep and no
+        pattern form on purpose.
+
+        The name and the axes are passed through rather than validated here
+        — the server owns the predicate and therefore owns its validation
+        (`graph.validate_bare_tool_name`), and a second copy of that rule in
+        the connector is how the two drift and one of them re-learns
+        `endswith`."""
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return {"ok": False, "error": "name is required (a bare tool name)"}
+        result, err = await client.post_exec_purge_tool_text(
+            name=name,
+            args=bool(data.get("args")),
+            result=bool(data.get("result")),
+        )
+        return {"ok": err is None, "error": err, "result": result}
+
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.
     # ------------------------------------------------------------------

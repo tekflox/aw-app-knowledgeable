@@ -1430,3 +1430,285 @@ def test_free_disk_bytes_measures_the_host_mounted_workspace_tree():
     free, err = exec_sync.free_disk_bytes()
     assert err is None, err
     assert isinstance(free, int) and free > 0
+
+
+# ---------------------------------------------------------------------------
+# exec-index-per-tool-policy.md §9 slice 4 — the OUTPUT axis, where the
+# `result_text` §13 slice 3 projects meets per-tool policy.
+#
+# What these tests are actually defending, since the floor already covers the
+# four secret-store tools: the MIDDLE GROUND. A tool that is not a
+# secret-store tool but whose OUTPUT carries a credential anyway —
+# `remote_host_read_file` on a `.env`, a bash tool with a token in stdout, a
+# config route echoing a key. Before this slice those were governed by the
+# pattern scrubber alone, which is the weakest tier in this system and is the
+# designed FALLBACK for vault-only credentials rather than a policy. So every
+# test below drives the FULL tick, not `attach_results` in isolation: a gate
+# the tick does not call is the same as no gate, which is the standard this
+# file already holds the run and tool-call paths to.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+from knowledgeable_app import exec_policy  # noqa: E402
+
+
+def _policy_tree(tmp_path, monkeypatch, indexing):
+    """Point the tick's own `PolicyTable.from_workspace()` at a fake installed
+    tree. Patched at `_apps_root` rather than by passing a table in, so the
+    test exercises the real build-per-tick path (§5) — no app manifest ships
+    `contributes.mcp.indexing` yet, so a declaration cannot come from the
+    real tree.
+
+    The server key is the REAL one (`aw-app-remote-host-cli`, slug
+    `remote-host-cli` — a key != slug join), because a fixture that invented
+    it would pass against itself and resolve nothing in production.
+    """
+    root = tmp_path / "apps"
+    (root / "remote-host-cli").mkdir(parents=True)
+    (root / "remote-host-cli" / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"aw-app-remote-host-cli": {"type": "http"}}}),
+        encoding="utf-8",
+    )
+    (root / "remote-host-cli" / "aw-app.json").write_text(
+        json.dumps({"id": "remote-host-cli", "contributes": {"mcp": {"indexing": indexing}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exec_policy, "_apps_root", lambda: str(root))
+    return root
+
+
+_RHC = "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+
+
+def test_a_declared_output_false_empties_the_result_the_floor_would_have_kept(
+    calls, monkeypatch, tmp_path
+):
+    """The gap slice 4 closes, as one test. `remote_host_read_file` is NOT in
+    `SECRET_TOOL_NAMES`, so `scrub_tool_result` keeps its result; the planted
+    value has no recognisable shape and is not in the secret store, so the
+    pattern pass keeps it too. Only the output axis stops it.
+
+    MUTATION: delete the `apply_output_axis` call in `attach_results` and this
+    goes red with the planted value in the ingest payload — which is exactly
+    the state the connector shipped in between §13 slice 3 and this slice.
+    """
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        [{"tool": "remote_host_read_file", "call": True, "output": False,
+          "reason": "the result is the file"}],
+    )
+    planted = "invented-env-file-value-with-no-recognisable-shape"
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_r", name=_RHC,
+                             args={"path": "/srv/app/.env"})],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_r", content=planted)],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["orphan_results"] == 0, "the row paired — this is not a pairing miss"
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None
+    assert posted["result_dropped"] is True, (
+        "the drop has to be RECORDED — `result_dropped` already exists for "
+        "exactly this and a parallel signal would need its own server half"
+    )
+    assert planted not in str(calls.ingest), "the planted value reached the ingest payload"
+    # The CALL axis is untouched: the path argument was never the problem, and
+    # an output opt-out that also emptied the arguments would make the two
+    # booleans pointless.
+    assert posted["args_text"] is not None and "/srv/app/.env" in posted["args_text"]
+    assert result["policy_denied_results"] == 1
+    assert result["policy_denied_calls"] == 0
+
+
+def test_a_declared_output_true_keeps_the_result(calls, monkeypatch, tmp_path):
+    """The other half of the signal. If `output: true` emptied results too,
+    the slice would be a blanket ban with extra steps."""
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        [{"tool": "remote_host_read_file", "call": True, "output": True}],
+    )
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_r", name=_RHC)],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_r", content="file contents")],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] == "file contents"
+    assert posted["result_dropped"] is None
+    assert result["policy_denied_results"] == 0
+
+
+def test_a_never_declared_tools_result_still_lands(calls, monkeypatch):
+    """The blacklist on the output axis, through the REAL installed tree (no
+    `_apps_root` patch): `add_kanban_comment` is a real tool of a real
+    installed app that declares nothing, and its result must still project.
+    The opposite default would empty ~1 GB of legitimately searchable text,
+    which is how a security layer gets switched off."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[
+            _pg_call(
+                "run-1",
+                tool_use_id="toolu_k",
+                name="mcp__aw-gateway__aw__aw_kanban__add_kanban_comment",
+            )
+        ],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_k", content="comment posted")],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] == "comment posted"
+    assert posted["result_dropped"] is None
+    assert result["policy_denied_results"] == 0
+    assert result["policy_unresolved_results"] == 0
+
+
+def test_an_unresolvable_name_loses_its_result_as_well_as_its_arguments(
+    calls, monkeypatch
+):
+    """§3.5 on both axes. An unresolvable name is the one case where the
+    output axis could plausibly have been left permissive, and it must not
+    be: the output is the more dangerous of the two channels, so "nothing
+    could attribute it, therefore index the result" would make the output
+    axis strictly weaker than the call axis for no reason."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[
+            _pg_call("run-1", tool_use_id="toolu_g",
+                     name="mcp__aw-gateway__aw__uninstalled_app__some_tool")
+        ],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_g", content="whatever came back")],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None
+    assert posted["args_text"] == exec_policy.UNRESOLVED_DROP_MARKER
+    assert posted["name"] == "mcp__aw-gateway__aw__uninstalled_app__some_tool", (
+        "name and timestamp are KEPT — the floor's own treatment"
+    )
+    assert posted["ts"] is not None
+    # Counted apart from the policy denials, which is what keeps
+    # `policy_denied_results` a readable signal.
+    assert result["policy_unresolved_results"] == 1
+    assert result["policy_denied_results"] == 0
+
+
+def test_a_standing_unresolvable_upstream_does_not_drown_the_new_counter(
+    calls, monkeypatch
+):
+    """The slice-2 measurement, as a tick. `fredericowu_browser` is a
+    linked-workspace BYOD federation with no `apps/<slug>/mcp.json`: it fails
+    closed permanently and no manifest anyone can write will ever attribute
+    it. Its denials must not land in `policy_denied_results`, or the first
+    real `output: false` opt-out to fire is indistinguishable from
+    background — the same defect class as a doctor line that is always red.
+
+    It is still denied, still counted, and still in `policy_unresolved`: the
+    registry changes counting, never behaviour, and the acknowledge path on
+    the doctor is slice 3's."""
+    name = "mcp__aw-gateway__aw__fredericowu_browser__fredericowu__playwright__browser_snapshot"
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_f", name=name)],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_f", content="page snapshot")],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None, "still denied — this is not an exemption"
+    assert result["policy_denied_results"] == 0
+    assert result["policy_unresolved_results"] == 1
+    assert result["policy_unresolved_actionable"] == 0, (
+        "nothing here is actionable — no manifest can ever attribute it"
+    )
+    assert result["policy_unresolved_known"] == [name]
+    assert name in result["policy_unresolved"], (
+        "slice 2's shipped key is unchanged, known names included"
+    )
+
+
+def test_the_floor_and_policy_are_independent_gates_on_the_result(calls, monkeypatch, tmp_path):
+    """A secret tool's result is dropped even when policy would have allowed
+    it — a manifest that LIES. §2's invariant must hold at each gate
+    independently, so that removing either one cannot remove the guarantee of
+    the other."""
+    root = tmp_path / "apps"
+    (root / "secrets").mkdir(parents=True)
+    (root / "secrets" / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"aw-secrets": {"type": "http"}}}), encoding="utf-8"
+    )
+    (root / "secrets" / "aw-app.json").write_text(
+        json.dumps({"id": "secrets", "contributes": {"mcp": {"indexing": [
+            {"tool": "read_secret", "call": True, "output": True}
+        ]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exec_policy, "_apps_root", lambda: str(root))
+    planted = "invented-vault-value-a-lying-manifest-must-not-release"
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_s",
+                             name="mcp__aw-gateway__aw__aw_secrets__read_secret")],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_s", content=planted)],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None
+    assert posted["result_dropped"] is True
+    assert planted not in str(calls.ingest)
+    # The floor's drops are NOT this layer's counter: it exists to say what
+    # policy changed, and the floor predates it.
+    assert result["policy_denied_results"] == 0
+
+
+def test_an_output_denial_on_a_call_that_returned_nothing_claims_no_drop(
+    calls, monkeypatch, tmp_path
+):
+    """Same honesty rule the call axis keeps for an argument-less call: a
+    paired result with no content stays absent rather than being reported as
+    dropped. `result_dropped` must mean something, and a row that claims a
+    drop that never happened is how it stops meaning anything."""
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        [{"tool": "remote_host_read_file", "call": True, "output": False, "reason": "x"}],
+    )
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_r", name=_RHC)],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_r", content=None)],
+    )
+    result = _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None
+    assert posted["result_dropped"] is None, "nothing was dropped, so nothing claims to be"
+    # The DECISION is still counted — the row was governed by policy even
+    # though there was nothing to remove. Same as `policy_denied_calls`.
+    assert result["policy_denied_results"] == 1
+
+
+def test_the_output_counters_ride_the_sentinel(calls, monkeypatch, tmp_path):
+    """The `event_kinds_unreviewed` mechanism (§8), for the slice-4 numbers.
+    The tick is the only thing that sees them, so a counter it does not post
+    onto the sentinel is a counter no status or doctor surface can read."""
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        [{"tool": "remote_host_read_file", "call": True, "output": False, "reason": "x"}],
+    )
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_r", name=_RHC)],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_r", content="secretish")],
+    )
+    _tick(conn, monkeypatch)
+    posted = calls.sync_state[-1]["counts"]
+    assert posted["policy_denied_results"] == 1
+    assert posted["policy_unresolved_results"] == 0
+    assert posted["policy_unresolved_actionable"] == 0
+    assert posted["policy_unresolved_known"] == []

@@ -923,3 +923,82 @@ def test_the_exec_sync_routes_require_identity(app_client):
     ):
         resp = getattr(tc, method)(path, json={}) if method == "post" else tc.get(path)
         assert resp.status_code == 401, f"{method.upper()} {path} -> {resp.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# exec-index-per-tool-policy.md §9 slice 4 — the retro-purge door.
+#
+# Worth testing at the ROUTE level because this is the one route in the
+# feature that takes a caller-supplied TOOL NAME, which §13.2's own purge
+# deliberately refuses to do. The relaxation is argued (it shares ingest
+# auth, and an ingest-secret holder can already overwrite both text
+# properties through the MERGE upsert), but the shape of it is load-bearing:
+# name-at-a-time, never a pattern, never a list. The server owns the
+# predicate and therefore its validation; what these pin is that the door
+# does not widen on the way through.
+# ---------------------------------------------------------------------------
+
+
+def test_the_retro_purge_passes_one_name_and_both_axis_flags_through(
+    exec_app_client, monkeypatch
+):
+    """The wiring, and that neither axis is invented by the connector. An
+    `output: false` opt-out must be able to purge results WITHOUT nulling
+    arguments that were never the problem."""
+    seen = {}
+
+    async def _fake(*, name, args, result):
+        seen.update(name=name, args=args, result=result)
+        return {"ok": True, "dropped": {"result_text": 341}, "total": 341}, None
+
+    monkeypatch.setattr(client, "post_exec_purge_tool_text", _fake)
+    tc, _ = exec_app_client
+    body = tc.post(
+        "/exec-sync/purge-tool-text",
+        json={"name": "remote_host_read_file", "result": True},
+    ).json()
+    assert body["ok"] is True
+    assert seen == {"name": "remote_host_read_file", "args": False, "result": True}
+    assert body["result"]["dropped"] == {"result_text": 341}
+
+
+def test_the_retro_purge_refuses_a_missing_name_without_calling_the_service(
+    exec_app_client, monkeypatch
+):
+    """A nameless purge must never reach the service. The failure mode this
+    guards is not a crash — it is a request that the service might interpret
+    as "everything", which is the one thing this route must never be able to
+    express."""
+
+    async def _never(**_kw):
+        pytest.fail("called the purge with no name")
+
+    monkeypatch.setattr(client, "post_exec_purge_tool_text", _never)
+    tc, _ = exec_app_client
+    for payload in ({}, {"name": ""}, {"name": "   "}, {"name": None}, {"result": True}):
+        body = tc.post("/exec-sync/purge-tool-text", json=payload).json()
+        assert body["ok"] is False, payload
+        assert "name is required" in body["error"], payload
+
+
+def test_the_retro_purge_does_not_validate_the_name_itself(exec_app_client, monkeypatch):
+    """§12 risk 6's lesson on the write side: the SERVER owns the predicate,
+    so the server owns its validation. A prefixed spelling is forwarded and
+    400s there rather than being silently re-segmented here — a second copy
+    of that rule in the connector is how the two drift and one of them
+    re-learns `endswith`."""
+    forwarded = []
+
+    async def _fake(*, name, args, result):
+        forwarded.append(name)
+        return None, "HTTP 400: name must be a BARE tool name (one segment, no '__')"
+
+    monkeypatch.setattr(client, "post_exec_purge_tool_text", _fake)
+    tc, _ = exec_app_client
+    body = tc.post(
+        "/exec-sync/purge-tool-text",
+        json={"name": "aw__aw_secrets__write_secret", "args": True},
+    ).json()
+    assert forwarded == ["aw__aw_secrets__write_secret"]
+    assert body["ok"] is False
+    assert "BARE tool name" in body["error"]

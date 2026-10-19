@@ -59,11 +59,21 @@ module-level cache on purpose: core runs multi-worker and a worker-local
 policy table is the WORKERS=N silent-divergence bug this estate has already
 catalogued (§12 risk 5).
 
-**This slice enforces the CALL axis only.** ``Decision.allow_output`` is
-resolved and carried because the precedence rules (§6) govern both axes and
-slice 3's maintenance UI shows both, but **nothing in this release reads
-it** — the connector has no ``result_text`` path yet, and slice 4 is its
-named consumer. It is stored policy, not half-wired enforcement.
+**Both axes are enforced since slice 4.** The CALL axis lands in
+``build_toolcall_row`` (slice 2); the OUTPUT axis lands in
+``attach_results`` (slice 4), against the ``result_text`` §13 slice 3
+projects. The output axis is the more dangerous of the two and it is NOT
+weaker: the four secret-store tools' results are already dropped wholesale
+by the floor, so what the output axis actually governs is the middle ground
+the floor cannot see — a tool that is not a secret-store tool but whose
+OUTPUT carries a credential anyway (``remote_host_read_file`` on a
+``.env``, a bash tool with a token in stdout, a config route echoing a
+key). Those are otherwise governed by the pattern scrubber alone, which is
+the weakest tier in this system and is explicitly the *fallback* for
+vault-only credentials rather than a policy. ``output: false`` is how such a
+tool says "not my output", and an unresolvable name denies it just as hard
+as it denies the call axis (§3.5) — "unattributable, therefore index the
+result" would make the output axis weaker than the call axis for no reason.
 
 **``contributes.mcp.provides`` is never read here** (§12 risk 3). It is a
 hand-maintained marketplace list, display-only, and exactly the stale
@@ -121,6 +131,58 @@ UNRESOLVED_NAMES_CAP = 50
 #: row the sync could not attribute AT ALL is visible rather than rendering
 #: as a blank line nobody can act on.
 EMPTY_NAME_LABEL = "<empty>"
+
+#: Upstream segments that are unresolvable BY CONSTRUCTION, each with the
+#: reason — ``vault_coverage.VAULT_REVIEWED_NOT_CREDENTIAL``'s shape, and for
+#: the same reason that dict exists rather than an empty tuple in the first
+#: one: "never looked at" and "looked at, nothing to do" must stay
+#: distinguishable at a glance, or the next person re-triages what someone
+#: already cleared.
+#:
+#: **Why this registry is not an exemption.** Nothing here lifts a denial.
+#: Every name routed through one of these upstreams still fails closed —
+#: arguments and result dropped, name and timestamp kept — exactly as §3.5
+#: says. What it changes is only the *counting*: a standing, permanent
+#: condition must not be added to a number whose whole job is to say
+#: "something new happened".
+#:
+#: **The defect this exists to prevent, measured on slice 2.** The doctor
+#: goes red the first time a tick observes one of these and stays red
+#: forever, because there is no manifest anyone could write that would ever
+#: attribute them. An always-red check detects nothing — the same defect
+#: class as ``vault_names_uncovered`` over ~20 pre-existing names, and as a
+#: test that fails every day until nobody reads it. So
+#: ``policy_denied_results`` excludes the unresolved path entirely (see
+#: :attr:`PolicyTable.counters`) and the unresolved side itself reports an
+#: *actionable* count that these do not enter.
+#:
+#: **What this registry is NOT, and what slice 3 still owes.** It does not
+#: touch ``policy_unresolved`` or the doctor check that reads it — those are
+#: slice 2's shipped surface and the acknowledge path is slice 3's to build
+#: (§9: "give the UI a way to acknowledge a row as attributable to nothing,
+#: on purpose", or have core expose the gateway's non-app upstreams so they
+#: can be attributed properly). Until then the doctor still degrades
+#: permanently on these two names. This registry is the data slice 3's UI
+#: needs and the guard that keeps slice 4's own counters readable; it is
+#: deliberately not a silent fix to somebody else's surface.
+#:
+#: Entries are upstream SEGMENTS as the gateway spells them (already
+#: sanitised — dash→underscore), not app slugs: there is no app.
+UNRESOLVABLE_UPSTREAMS: dict[str, str] = {
+    # Linked-workspace BYOD federations (`/link`): registered into the
+    # gateway's OWN config, not into any `apps/<slug>/mcp.json`, so the
+    # manifest-join this module is built on has nothing to join against.
+    # Measured 2026-10-19 (slice 2): 38 of the gateway's 40 live upstream
+    # segments resolve to the right app; these are the 2 that never will.
+    # Their observed names nest the workspace name rather than a second
+    # `aw__` marker — `…aw__fredericowu__fredericowu__google_workspace__…`,
+    # `…aw__fredericowu_browser__fredericowu__playwright__…` — which is why
+    # they are not the federated case `kali` is (§12 risk 7).
+    "fredericowu": "linked-workspace federation — no apps/<slug>/mcp.json exists to attribute it",
+    "fredericowu_browser": (
+        "linked-workspace federation — no apps/<slug>/mcp.json exists to attribute it"
+    ),
+}
 
 _DEFAULT_APPS_ROOT = "/opt/aw-workspace/apps"
 
@@ -242,6 +304,30 @@ def apply_call_axis(decision: Decision, args_text: Any) -> Any:
     return decision.call_drop_marker
 
 
+def apply_output_axis(decision: Decision, result_text: Any) -> Any:
+    """Enforce the output axis on one row's already-scrubbed result — slice 4.
+
+    **``None``, not a marker, and that asymmetry with the call axis is
+    deliberate.** The call axis stamps ``<DROPPED:exec-policy>`` because
+    §12 risk 4 needs §13.2's purge queries to tell a *remediated credential
+    exposure* (``args_text`` nulled by the purge) from *routine policy* on
+    the same property. The result axis has no such history to disambiguate:
+    §13.2's purge never touched ``result_text``, and the floor's own result
+    drop is already a plain ``None`` + ``result_dropped``. So this reuses
+    that existing signal rather than inventing a parallel one — the caller
+    records ``result_dropped`` on the row exactly as it already does for the
+    floor, and what distinguishes an ingest-time drop from a retro-purge is
+    ``result_dropped_at``, which only the purge ever writes.
+
+    Same "do not claim a drop that did not happen" rule as the call axis: a
+    call whose result was absent or empty stays ``None`` without being
+    reported as dropped. The counter carries the denial in that case.
+    """
+    if decision.allow_output:
+        return result_text
+    return None
+
+
 def _apps_root() -> str:
     """Where core installed the apps.
 
@@ -348,6 +434,8 @@ class PolicyTable:
         "_cache",
         "_unresolved",
         "_denied_calls",
+        "_denied_results",
+        "_unresolved_results",
     )
 
     def __init__(
@@ -372,6 +460,8 @@ class PolicyTable:
         self._cache: dict[str, Decision] = {}
         self._unresolved: dict[str, None] = {}
         self._denied_calls = 0
+        self._denied_results = 0
+        self._unresolved_results = 0
         # §3 step 6's bare-name intersection set: every declaration AND
         # override that names this bare tool, whichever app it came from.
         self._by_tool: dict[str, list[tuple[bool, bool]]] = {}
@@ -424,15 +514,15 @@ class PolicyTable:
             scan_error=scan_error,
         )
 
-    def decide(self, name: str | None) -> Decision:
-        """The resolved decision for one observed name, and this tick's
-        tally of it.
+    def _cached(self, name: str | None) -> Decision:
+        """Resolve once per distinct name (§9e), and record an unresolved
+        name the first time it is seen.
 
-        Resolution runs ONCE per distinct name (§9e): a 300k-row backfill
-        over a few hundred distinct names does a few hundred resolutions and
-        300k dict hits. The counters, by contrast, tally per CALL — they
-        describe rows, which is what an operator reading
-        ``policy_denied_calls`` means by it.
+        A 300k-row backfill over a few hundred distinct names does a few
+        hundred resolutions and 300k dict hits. The *counters*, by contrast,
+        tally per ROW — which is what an operator reading
+        ``policy_denied_calls`` or ``policy_denied_results`` means by it —
+        so they live in the two public ``decide*`` methods rather than here.
         """
         key = name or ""
         decision = self._cache.get(key)
@@ -441,9 +531,57 @@ class PolicyTable:
             self._cache[key] = decision
             if decision.state == STATE_UNRESOLVED:
                 self._unresolved[key or EMPTY_NAME_LABEL] = None
+        return decision
+
+    def decide(self, name: str | None) -> Decision:
+        """The resolved decision for one observed name, tallying the CALL
+        axis — one call per ``ExecToolCall`` row built (slice 2)."""
+        decision = self._cached(name)
         if not decision.allow_call and decision.state != STATE_FLOOR:
             self._denied_calls += 1
         return decision
+
+    def decide_output(self, name: str | None) -> Decision:
+        """The same decision, tallying the OUTPUT axis — one call per
+        ``tool_result`` row paired onto a call (slice 4).
+
+        A separate entry point rather than a flag on :meth:`decide` because
+        the two axes are counted over DIFFERENT row populations: every
+        tool_call gets a call-axis decision, and only the ~99 % of them that
+        actually paired with a result get an output-axis one. One method
+        tallying both would attribute a result denial to every call that
+        never returned.
+
+        **The unresolved denials are tallied apart from the policy ones**,
+        and that split is the whole reason this is not one counter. See
+        :attr:`counters` and :data:`UNRESOLVABLE_UPSTREAMS`.
+        """
+        decision = self._cached(name)
+        if not decision.allow_output and decision.state != STATE_FLOOR:
+            if decision.state == STATE_UNRESOLVED:
+                self._unresolved_results += 1
+            else:
+                self._denied_results += 1
+        return decision
+
+    def unresolved_split(self) -> tuple[list[str], list[str]]:
+        """``(actionable, known)`` — this tick's distinct unresolved names,
+        split on :data:`UNRESOLVABLE_UPSTREAMS`.
+
+        ``known`` is the standing condition: a name routed through an
+        upstream that is unresolvable by construction, which no manifest can
+        ever attribute. ``actionable`` is everything else — an uninstalled
+        app, a fourth gateway spelling, a third-party ``mcp__`` server, a
+        row with no name at all. That second list is the one where a NEW
+        entry means something changed and somebody should look.
+        """
+        actionable: list[str] = []
+        known: list[str] = []
+        for name in sorted(self._unresolved):
+            decision = self._cache.get(name if name != EMPTY_NAME_LABEL else "")
+            upstream = decision.upstream if decision else None
+            (known if upstream in UNRESOLVABLE_UPSTREAMS else actionable).append(name)
+        return actionable, known
 
     def _resolve(self, name: str) -> Decision:
         """§3's resolution order, in order. The ordering IS the contract."""
@@ -513,11 +651,38 @@ class PolicyTable:
         counts rows whose arguments policy dropped. The floor's own drops are
         NOT in that number: it exists to say what this layer changed, and the
         floor's drops are the scrubber's and predate it.
+
+        **Slice 4's four additions, and why the output axis is counted in
+        three numbers rather than one.** ``policy_denied_results`` is the
+        signal the slice adds: rows whose RESULT a declaration or an
+        override denied. It deliberately excludes both the floor (whose
+        result drops are `scrub_tool_result`'s and predate this layer) and
+        the fail-closed unresolved path — which is counted separately as
+        ``policy_unresolved_results``. That exclusion is not tidiness: two
+        of the gateway's live upstreams are unresolvable by construction
+        (:data:`UNRESOLVABLE_UPSTREAMS`), so folding their denials into
+        ``policy_denied_results`` would give it a permanent non-zero floor
+        and the first REAL ``output: false`` opt-out to fire would be
+        indistinguishable from background. A counter that is always on
+        measures nothing, the same way an always-red doctor detects nothing.
+
+        ``policy_unresolved_actionable`` is then the number slice 3's
+        acknowledge path should read in place of ``len(policy_unresolved)``,
+        and ``policy_unresolved_known`` names the standing ones so the split
+        is auditable rather than asserted. ``policy_unresolved`` itself is
+        left exactly as slice 2 shipped it, known names included: the doctor
+        check reads that key, and quietly narrowing it here would change a
+        shipped surface from inside a counter property.
         """
         unresolved = sorted(self._unresolved)
+        actionable, known = self.unresolved_split()
         return {
             "policy_unresolved": unresolved[:UNRESOLVED_NAMES_CAP],
             "policy_unresolved_total": len(unresolved),
+            "policy_unresolved_actionable": len(actionable),
+            "policy_unresolved_known": known[:UNRESOLVED_NAMES_CAP],
             "policy_denied_calls": self._denied_calls,
+            "policy_denied_results": self._denied_results,
+            "policy_unresolved_results": self._unresolved_results,
             "policy_scan_error": self._scan_error,
         }

@@ -13,6 +13,7 @@ Usage:
     aw-workspace-cli knowledgeable-exec-sync reconcile            # SQL vs graph count table
     aw-workspace-cli knowledgeable-exec-sync retention [--days N] # the args_text valve
     aw-workspace-cli knowledgeable-exec-sync purge-secret-args    # §13.2 secret-tool purge
+    aw-workspace-cli knowledgeable-exec-sync purge-tool <name> [--args] [--result]
     aw-workspace-cli knowledgeable-exec-sync reset-watermark      # §13.8 backfill: re-read every run
 
 Exit codes for `run`: 0 progressed or nothing to do, 1 the tick was blocked —
@@ -69,6 +70,26 @@ MCP-routed call, so prefixed `write_secret` arguments — vault-only values,
 which are both unmatchable by the exact pass and shapeless to the pattern
 pass — landed in the graph. Idempotent, and all zeroes once it has run; run
 it again after adding a name to `SECRET_TOOL_NAMES`.
+
+`purge-tool` is exec-index-per-tool-policy.md §9 slice 4's retro-purge, and
+it answers a different question: per-tool POLICY can change at any time (an
+app ships `call: false` / `output: false` in a manifest update, a human sets
+an override), and from that moment the connector stops projecting — but the
+rows already in the graph are unchanged. This nulls them, for ONE bare tool
+name, on the axes you name explicitly:
+
+    knowledgeable-exec-sync purge-tool remote_host_read_file --result
+
+Neither axis defaults to on, and there is no pattern or list form on
+purpose: opting in per axis is the safe direction for a destructive call,
+and a purge that took a pattern would be one typo from this repo's own
+cautionary tale (`scripts/load_exec_retrieval_neo4j.py` wiping its target).
+A prefixed spelling is rejected by the server rather than matching nothing
+and reporting a cheerful zero. Idempotent.
+
+It is also not a write-protect: the ingest upsert SETs both text properties
+unconditionally, so a later backfill re-projects whatever the connector
+sends. Purge AFTER the opt-out is declared, or the next backfill undoes it.
 """
 from __future__ import annotations
 
@@ -210,6 +231,35 @@ def run(args: list[str] | None = None) -> int:
         print(json.dumps(body, indent=2))
         if not body.get("ok"):
             print(f"purge-secret-args: {body.get('error')}", file=sys.stderr)
+            return 1
+        return 0
+
+    if sub == "purge-tool":
+        # Positional name, explicit axis flags. Neither axis defaults to on:
+        # a bare `purge-tool foo` that silently nulled both would be the
+        # wrong default for a destructive call, so it is a usage error.
+        name = next((a for a in rest if not a.startswith("--")), None)
+        want_args = "--args" in rest
+        want_result = "--result" in rest
+        if not name or not (want_args or want_result):
+            print(
+                "usage: purge-tool <bare-tool-name> [--args] [--result] "
+                "(at least one axis required)",
+                file=sys.stderr,
+            )
+            return 2
+        status, body = local_client.request(
+            "POST",
+            f"{_BASE}/purge-tool-text",
+            {"name": name, "args": want_args, "result": want_result},
+            timeout=_WORK_TIMEOUT_S,
+        )
+        if status != 200:
+            print(f"purge-tool failed: HTTP {status} {body}", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2))
+        if not body.get("ok"):
+            print(f"purge-tool: {body.get('error')}", file=sys.stderr)
             return 1
         return 0
 

@@ -587,6 +587,28 @@ async def post_exec_purge_secret_args() -> tuple[dict | None, str | None]:
     return await _post_json("/api/exec/purge-secret-args", {})
 
 
+async def post_exec_purge_tool_text(
+    *, name: str, args: bool = False, result: bool = False
+) -> tuple[dict | None, str | None]:
+    """POST /api/exec/purge-tool-text — exec-index-per-tool-policy.md §9
+    slice 4's retro-purge, for ONE bare tool name.
+
+    What it is for: a new opt-out (an app shipped `output: false`, or a
+    human set an override) stops the next tick's rows and leaves the rows
+    already in the graph untouched. This is what changes them, per row, from
+    the policy UI.
+
+    Deliberately NOT a list parameter and deliberately not defaulting either
+    axis to true. The name-at-a-time shape is the guard — this repo's own
+    scar is a script that wiped its target, and a purge taking a pattern is
+    one typo from being that. The server validates the name is a single bare
+    segment and 400s otherwise rather than matching nothing and reporting a
+    cheerful zero."""
+    return await _post_json(
+        "/api/exec/purge-tool-text", {"name": name, "args": args, "result": result}
+    )
+
+
 # ---------------------------------------------------------------------------
 # §9 step 4 — the two agent-facing MCP tools named in the design doc
 # (`search_execution_graph`, `exec_run_detail`), over the search/detail

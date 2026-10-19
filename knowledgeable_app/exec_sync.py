@@ -578,6 +578,7 @@ def attach_results(
     index: dict[tuple[str, str], dict],
     result_records,
     scrubber: exec_scrub.Scrubber,
+    policy: exec_policy.PolicyTable,
 ) -> int:
     """Join `tool_result` rows onto the `ExecToolCall` rows they belong to,
     in place. Returns the count of UNPAIRED results (§13.3's
@@ -588,6 +589,27 @@ def attach_results(
     across runs and a collision would attach one run's output to another
     run's call. Pure apart from the mutation of `index`'s own row dicts, so
     the pairing is testable with no database.
+
+    **Two independent gates on the result, in this order** — the output-axis
+    mirror of `build_toolcall_row`'s pair, and `policy` is a required
+    parameter for the same reason it is there: a default would mean "no
+    policy table, therefore index the result", the exact fail-open shape
+    this card exists to delete.
+
+    1. **The floor**, via `scrubber.scrub_tool_result` — the four
+       secret-store tools' results become `None`, as they have since §13
+       slice 3, with no policy consulted at all.
+    2. **Per-tool policy's OUTPUT axis**, via `exec_policy` — slice 4. What
+       this gate actually adds over the floor is the middle ground the floor
+       cannot see: a tool that is NOT a secret-store tool but whose output
+       carries a credential anyway. Those are otherwise governed by the
+       pattern scrubber alone — the weakest tier here, and the designed
+       *fallback* for vault-only credentials rather than a policy.
+
+    Both gates run on a denied row even though either alone would empty it.
+    That is deliberate and matches `build_toolcall_row`: neither gate may
+    depend on the other being present, or removing one silently removes the
+    guarantee of the other.
 
     The orderings here are the same two scars `build_event_row` records, and
     both are properties of THIS function now as well:
@@ -620,11 +642,13 @@ def attach_results(
         if row is None:
             orphans += 1
             continue
+        name = row.get("name")
+        scrubbed = scrubber.scrub_tool_result(
+            name=name, result_text=_as_text(payload.get(payload_key))
+        )
+        projected = exec_policy.apply_output_axis(policy.decide_output(name), scrubbed)
         text, length, truncated = event_kinds.cap_text(
-            scrubber.scrub_tool_result(
-                name=row.get("name"), result_text=_as_text(payload.get(payload_key))
-            ),
-            limit=event_kinds.RESULT_TEXT_MAX,
+            projected, limit=event_kinds.RESULT_TEXT_MAX
         )
         row["result_text"] = _clean(text)
         row["result_len"] = length
@@ -634,7 +658,20 @@ def attach_results(
         # server-side: "dropped because this tool handles secrets" and "this
         # call returned nothing we projected" are different facts, and the
         # drop is the one somebody will eventually want to verify fired.
-        row["result_dropped"] = exec_scrub.is_secret_tool(row.get("name")) or None
+        #
+        # Slice 4 reuses this same signal for a policy drop rather than
+        # adding a parallel one (`apply_output_axis` records why): the fact
+        # the row carries is "the result was deliberately not projected",
+        # and it is equally true of both gates. `scrubbed is not None and
+        # projected is None` is the policy half — it claims a drop only when
+        # there was text to drop, the same honesty `apply_call_axis` keeps
+        # for an argument-less call. What distinguishes either ingest-time
+        # drop from a slice-4 retro-purge is `result_dropped_at`, which only
+        # the purge ever writes.
+        row["result_dropped"] = (
+            exec_scrub.is_secret_tool(name)
+            or (scrubbed is not None and projected is None)
+        ) or None
     return orphans
 
 
@@ -1084,7 +1121,7 @@ async def _run_tick_locked(
             # the call rows, so the byte bound has to be computed with them
             # already on there or a batch's real POST size is understated by
             # exactly the thing that doubled it.
-            orphans = _fetch_tool_results(conn, run_ids, call_index, scrubber)
+            orphans = _fetch_tool_results(conn, run_ids, call_index, scrubber, policy)
             totals["orphan_results"] += orphans
             totals["tool_results"] += sum(
                 1 for r in toolcalls if r.get("result_ts") is not None
@@ -1149,8 +1186,9 @@ async def _run_tick_locked(
     # Same mechanism, for tool identities instead of event kinds
     # (exec-index-per-tool-policy.md §8): the distinct unattributable
     # spellings this tick fail-closed on, and how many rows lost their
-    # arguments to policy. The tick is the only thing that sees them, so the
-    # sentinel is where the status and doctor surfaces read them from.
+    # arguments or their RESULT to policy (slice 4). The tick is the only
+    # thing that sees them, so the sentinel is where the status and doctor
+    # surfaces read them from.
     counts.update(policy.counters)
     await client.put_exec_sync_state(
         source_tenant=source_tenant,
@@ -1219,6 +1257,7 @@ def _fetch_tool_results(
     run_ids: list[str],
     index: dict[tuple[str, str], dict],
     scrubber: exec_scrub.Scrubber,
+    policy: exec_policy.PolicyTable,
 ) -> int:
     """§13 slice 3's results for one batch of runs, attached onto the calls
     in `index`. Returns the unpaired count.
@@ -1234,7 +1273,7 @@ def _fetch_tool_results(
             SQL_TOOL_RESULTS,
             {"kind": event_kinds.RESULT_KIND, "run_ids": run_ids},
         )
-        return attach_results(index, cur, scrubber)
+        return attach_results(index, cur, scrubber, policy)
     finally:
         cur.close()
 

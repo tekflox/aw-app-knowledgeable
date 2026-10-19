@@ -102,6 +102,26 @@ def _estate(tmp_path: Path) -> Path:
             }
         ],
     )
+    # Real: server key `aw-app-remote-host-cli`, slug `remote-host-cli` —
+    # another key != slug join, and slice 4's reason for existing. This is
+    # the MIDDLE GROUND the floor cannot see: not a secret-store tool, so
+    # `scrub_tool_result` never drops it, but its OUTPUT is whatever file it
+    # was pointed at — a `.env` included. Its arguments are a path and are
+    # fine; only the output axis opts out, which is the asymmetric shape
+    # `output: false` exists for and the one no fixture had before slice 4.
+    _install(
+        root,
+        "remote-host-cli",
+        servers=["aw-app-remote-host-cli"],
+        indexing=[
+            {
+                "tool": "remote_host_read_file",
+                "call": True,
+                "output": False,
+                "reason": "the result is the file — a .env included",
+            }
+        ],
+    )
     return root
 
 
@@ -491,7 +511,7 @@ def test_no_per_row_filesystem_read(tmp_path):
     after the build and asking it 1,000 more questions."""
     root = _estate(tmp_path)
     table = exec_policy.PolicyTable.from_workspace(str(root))
-    assert table.status["apps_scanned"] == 4
+    assert table.status["apps_scanned"] == 5
     for app_dir in sorted(root.iterdir()):
         for leaf in sorted(app_dir.iterdir()):
             leaf.unlink()
@@ -597,3 +617,245 @@ def test_policy_unresolved_is_read_off_the_sentinel():
     # Shape garbage degrades to "nothing to report", exactly as
     # `event_kinds_unreviewed` does.
     assert exec_sync.policy_unresolved({"reported_counts": {"policy_unresolved": 3}}) == []
+
+
+# ---------------------------------------------------------------------------
+# §9 slice 4 — the OUTPUT axis.
+#
+# The standard for this block, which is different from the call axis's. The
+# four secret-store tools' results are ALREADY dropped wholesale by the floor
+# (`scrub_tool_result`), so nothing here is about them. What the output axis
+# governs is the middle ground the floor cannot see: a tool that is not a
+# secret-store tool but whose OUTPUT carries a credential anyway. Today those
+# are governed by the pattern scrubber alone — the weakest tier in this
+# system, and the designed FALLBACK for vault-only credentials rather than a
+# policy. So the tests that matter are: does `output: false` actually empty
+# the result, and is the output axis never weaker than the call axis.
+# ---------------------------------------------------------------------------
+
+
+def test_a_declared_output_false_denies_the_output_axis_and_not_the_call_axis(tmp_path):
+    """The asymmetric declaration, which is the whole point of two booleans:
+    `remote_host_read_file`'s ARGUMENTS are a path (fine) and its RESULT is
+    the file (not fine). A single `indexed: false` could not express this,
+    and an output axis that moved with the call axis would be useless for
+    exactly the tool class slice 4 exists for."""
+    table = _table(tmp_path)
+    d = table.decide_output(
+        "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+    )
+    assert (d.app, d.tool) == ("remote-host-cli", "remote_host_read_file")
+    assert d.allow_call is True, "the path argument was never the problem"
+    assert d.allow_output is False
+    assert d.state == exec_policy.STATE_DECLARED_RESTRICTED
+    assert exec_policy.apply_output_axis(d, "AW_TOKEN=invented-value") is None
+
+
+def test_a_never_declared_tool_keeps_its_result(tmp_path):
+    """The blacklist, on the output axis: absence of a declaration is
+    permission. If this went the other way the slice would empty ~1 GB of
+    legitimately searchable results, which is how a security layer gets
+    turned off."""
+    table = _table(tmp_path)
+    d = table.decide_output("mcp__aw-gateway__aw__aw_kanban__add_kanban_comment")
+    assert (d.app, d.state) == ("notion", exec_policy.STATE_NEVER_DECLARED)
+    assert d.allow_output is True
+    assert exec_policy.apply_output_axis(d, "comment posted") == "comment posted"
+
+
+def test_an_unresolvable_name_denies_the_OUTPUT_axis_too(tmp_path):
+    """§3.5 applies to both axes, and this is the test that keeps the output
+    axis from being the weaker one. "Nothing could attribute it, therefore
+    index the result" would be strictly worse than the call axis's own
+    default for the MORE dangerous of the two channels."""
+    table = _table(tmp_path)
+    d = table.decide_output("mcp__aw-gateway__aw__gone__some_tool")
+    assert d.state == exec_policy.STATE_UNRESOLVED
+    assert (d.allow_call, d.allow_output) == (False, False)
+    assert exec_policy.apply_output_axis(d, "whatever came back") is None
+
+
+def test_a_floor_tools_result_is_denied_on_the_output_axis(tmp_path):
+    """Redundant with `scrub_tool_result` on purpose: §2's invariant must
+    hold at every gate independently, so removing either one cannot remove
+    the guarantee. Over all three measured spellings plus the bare name."""
+    table = _table(tmp_path)
+    for name in (
+        "read_secret",
+        "mcp__aw-gateway__aw__aw_secrets__read_secret",
+        "aw-gateway.aw__aw_secrets__collect_secret",
+        "mcp__workspace-gateway__aw__aw_secrets__write_secret",
+    ):
+        d = table.decide_output(name)
+        assert d.state == exec_policy.STATE_FLOOR, name
+        assert d.allow_output is False, name
+        assert exec_policy.apply_output_axis(d, "invented-vault-value") is None, name
+
+
+def test_an_override_can_deny_the_output_axis_alone(tmp_path):
+    """§6's precedence on the axis slice 2 could not exercise: a human
+    override is the thing that exists because the manifest can be wrong, and
+    it must be able to restrict ONE axis without the other."""
+    table = _table(tmp_path, overrides={("kb", "search_knowledge_base"): (True, False)})
+    d = table.decide_output("mcp__aw-gateway__aw__kb__search_knowledge_base")
+    assert d.state == exec_policy.STATE_OVERRIDE
+    assert (d.allow_call, d.allow_output) == (True, False)
+
+
+def test_an_output_denial_does_not_claim_a_drop_that_did_not_happen(tmp_path):
+    """Same honesty rule `apply_call_axis` keeps: a call whose result was
+    absent stays absent rather than being reported as dropped. The counter
+    is what carries the denial."""
+    table = _table(tmp_path)
+    d = table.decide_output("mcp__aw-gateway__aw__gone__some_tool")
+    assert exec_policy.apply_output_axis(d, None) is None
+
+
+# ---------------------------------------------------------------------------
+# §9 slice 4 — the counters, and the standing-unresolvable problem.
+#
+# Why this block is as long as it is. Slice 2 measured that 2 of the
+# gateway's 40 live upstreams (`fredericowu`, `fredericowu_browser`) are
+# linked-workspace federations with no `apps/<slug>/mcp.json`, so they fail
+# closed PERMANENTLY — correct behaviour, and already a standing doctor row.
+# A counter that is always non-zero measures nothing, the same way an
+# always-red check detects nothing. So `policy_denied_results` must be
+# structurally incapable of being inflated by them.
+# ---------------------------------------------------------------------------
+
+
+def test_policy_denied_results_counts_policy_denials_and_nothing_else(tmp_path):
+    """The signal, isolated. Three populations hit the output axis — a
+    declared opt-out, the floor, and a fail-closed unresolved name — and
+    only the first is what `policy_denied_results` is for."""
+    table = _table(tmp_path)
+    table.decide_output(
+        "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+    )
+    table.decide_output("mcp__aw-gateway__aw__aw_secrets__read_secret")
+    table.decide_output("mcp__aw-gateway__aw__fredericowu__fredericowu__gw__list_calendars")
+    counters = table.counters
+    assert counters["policy_denied_results"] == 1, (
+        "the floor's drops predate this layer and the unresolved path is "
+        "counted apart — only the declared opt-out is this counter's business"
+    )
+    assert counters["policy_unresolved_results"] == 1
+
+
+def test_a_permanently_unresolvable_upstream_cannot_inflate_policy_denied_results(tmp_path):
+    """The defect this guard exists for, stated as a test: ten thousand calls
+    through a linked-workspace federation must leave the new signal at zero.
+    Otherwise the first real `output: false` opt-out to fire is
+    indistinguishable from background noise, and the number stops being
+    readable the moment it ships."""
+    table = _table(tmp_path)
+    for i in range(50):
+        table.decide_output(
+            f"mcp__aw-gateway__aw__fredericowu_browser__fredericowu__playwright__t{i}"
+        )
+    counters = table.counters
+    assert counters["policy_denied_results"] == 0
+    assert counters["policy_unresolved_results"] == 50
+
+
+def test_the_unresolved_names_split_into_actionable_and_known(tmp_path):
+    """`vault_coverage`'s three-states lesson, applied to tool identities:
+    "never looked at" and "looked at, nothing to do" must stay
+    distinguishable, or the next person re-triages what someone cleared.
+
+    `policy_unresolved_actionable` is the number slice 3's acknowledge path
+    should read; `policy_unresolved_known` names the standing two so the
+    split is auditable rather than asserted in a comment."""
+    table = _table(tmp_path)
+    table.decide("mcp__aw-gateway__aw__fredericowu__fredericowu__gw__list_calendars")
+    table.decide("mcp__aw-gateway__aw__fredericowu_browser__fredericowu__pw__browser_click")
+    table.decide("mcp__aw-gateway__aw__gone__some_tool")
+    counters = table.counters
+    assert counters["policy_unresolved_total"] == 3
+    assert counters["policy_unresolved_actionable"] == 1, (
+        "only the uninstalled app is something anyone can act on"
+    )
+    assert counters["policy_unresolved_known"] == [
+        "mcp__aw-gateway__aw__fredericowu__fredericowu__gw__list_calendars",
+        "mcp__aw-gateway__aw__fredericowu_browser__fredericowu__pw__browser_click",
+    ]
+
+
+def test_the_registry_does_not_lift_a_single_denial(tmp_path):
+    """The registry changes COUNTING and nothing else. A known-unresolvable
+    name still fails closed on both axes and still appears in
+    `policy_unresolved` — slice 2's shipped surface and the key the doctor
+    check reads. Narrowing that from inside a counter property would be a
+    silent change to somebody else's check, and the acknowledge path is
+    slice 3's to build."""
+    table = _table(tmp_path)
+    name = "mcp__aw-gateway__aw__fredericowu__fredericowu__google_workspace__list_calendars"
+    d = table.decide_output(name)
+    assert (d.allow_call, d.allow_output) == (False, False)
+    assert d.state == exec_policy.STATE_UNRESOLVED
+    assert exec_policy.apply_output_axis(d, "calendar contents") is None
+    assert name in table.counters["policy_unresolved"]
+
+
+def test_every_registry_entry_records_why_it_can_never_resolve(tmp_path):
+    """The `VAULT_COVERAGE_REGISTRY` standard: an entry with no recorded
+    reason is an exemption nobody can audit. Also pins that entries are
+    SANITISED upstream segments (dash->underscore already applied), because a
+    dashed entry would never match an observed name and would silently stop
+    suppressing anything."""
+    assert exec_policy.UNRESOLVABLE_UPSTREAMS
+    for segment, reason in exec_policy.UNRESOLVABLE_UPSTREAMS.items():
+        assert segment == exec_policy.sanitise_server_key(segment), segment
+        assert len(reason) > 20, f"{segment} has no usable reason recorded"
+    # And it cannot shadow a real app: a segment in here that an installed
+    # app actually declares would suppress a REAL unresolved row.
+    table = _table(tmp_path)
+    for segment in exec_policy.UNRESOLVABLE_UPSTREAMS:
+        d = table.decide(f"mcp__aw-gateway__aw__{segment}__anything")
+        assert d.state == exec_policy.STATE_UNRESOLVED, segment
+
+
+def test_the_two_axes_are_counted_over_different_row_populations(tmp_path):
+    """Why `decide_output` is its own entry point rather than a flag. Every
+    tool_call gets a call-axis decision; only the ones that actually paired
+    with a result get an output-axis one. One method tallying both would
+    attribute a result denial to every call that never returned."""
+    table = _table(tmp_path)
+    name = "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+    table.decide(name)
+    table.decide(name)
+    table.decide_output(name)
+    counters = table.counters
+    assert counters["policy_denied_calls"] == 0, "its CALL axis is permitted"
+    assert counters["policy_denied_results"] == 1, "one of the two calls returned"
+
+
+def test_the_output_axis_resolves_through_the_same_cache(tmp_path):
+    """§9e and §12 risk 5: ONE resolver and one memo for both axes — not a
+    second resolver for the output side, which is how the two would drift and
+    one of them would re-learn `endswith`.
+
+    Proven on the memo itself rather than by counting calls, because
+    `PolicyTable` is `__slots__` and its methods cannot be patched: one
+    distinct name asked 1,000 questions on both axes leaves exactly one
+    cache entry, and both axes return the SAME object.
+
+    Also the no-per-row-I/O property on the output axis — the tree is deleted
+    before the loop, so a second resolver that re-read the manifest would
+    raise rather than quietly resolve."""
+    root = _estate(tmp_path)
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+    name = "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+    first = table.decide(name)
+    for app_dir in sorted(root.iterdir()):
+        for leaf in sorted(app_dir.iterdir()):
+            leaf.unlink()
+        app_dir.rmdir()
+    root.rmdir()
+    for _ in range(1000):
+        assert table.decide_output(name) is first
+        assert table.decide(name) is first
+    assert list(table._cache) == [name], "one memo entry, not one per axis"
+    # And the per-ROW counters are not deduplicated by the memo (slice 2's
+    # own property, re-asserted for the axis this slice adds).
+    assert table.counters["policy_denied_results"] == 1000
