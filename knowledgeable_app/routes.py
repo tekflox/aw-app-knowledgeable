@@ -407,12 +407,17 @@ def build_routes(ctx) -> FastAPI:
             kwargs["max_runs"] = int(data["max_runs"])
         return await exec_sync.run_tick(ctx.state.lease, **kwargs)
 
-    @app.get("/exec-sync/status", dependencies=[Depends(_require_identity)])
-    async def exec_sync_status() -> dict:
+    async def _exec_sync_status_payload() -> dict:
         """The §8 doctor surface: the sentinel, its staleness verdict, the
-        live graph counts — and this side's own config, so "the sync is not
-        running" and "the sync is running against nothing" are
-        distinguishable without reading two places."""
+        live graph counts, the §6 point 1 / §12 risk 8 scrub-coverage dict —
+        and this side's own config, so "the sync is not running" and "the
+        sync is running against nothing" are distinguishable without reading
+        two places.
+
+        Shared by `GET /exec-sync/status` (identity-gated, what the CLI
+        reads) and `GET /exec-sync/doctor` (the unauthenticated
+        `contributes.doctor` check below) so the two can never disagree on
+        what `degraded` means."""
         cfg = _exec_sync_kwargs()
         payload: dict = {
             "enabled": cfg["enabled"],
@@ -423,14 +428,47 @@ def build_routes(ctx) -> FastAPI:
         remote, err = await client.get_exec_status()
         payload["graph"] = remote
         payload["error"] = err
+        scrub = await exec_sync.scrub_status()
+        payload["scrub"] = scrub
         # Degraded is computed on THIS side too, not only read off the
         # sentinel: a sentinel we cannot reach is itself degraded, and a
         # status surface that reports `None` for that reads as healthy.
+        # The scrub-coverage signal (vault_names_uncovered non-empty,
+        # vault_coverage_unknown, exact_match_unavailable — §6 point 1
+        # correction, §12 risk 8) is folded into the SAME `enabled` gate as
+        # the staleness checks: a coverage gap only matters while the sync it
+        # protects is actually running, same as "a disabled sync is not
+        # degraded" already meant here.
         staleness = ((remote or {}).get("staleness") or {})
         payload["degraded"] = bool(
-            cfg["enabled"] and (err or not remote or staleness.get("degraded"))
+            cfg["enabled"] and (
+                err or not remote or staleness.get("degraded")
+                or exec_sync.scrub_degraded(scrub)
+            )
         )
         return payload
+
+    @app.get("/exec-sync/status", dependencies=[Depends(_require_identity)])
+    async def exec_sync_status() -> dict:
+        return await _exec_sync_status_payload()
+
+    @app.get("/exec-sync/doctor")
+    async def exec_sync_doctor() -> dict:
+        """``contributes.doctor``'s check for exec-sync (§8, §11 trigger #3).
+
+        Deliberately carries no `_require_identity`: `_app_doctor_checks`
+        dials this in-process over `httpx.ASGITransport` with no headers at
+        all, bypassing the outer `IdentityGuard` the same way the module
+        docstring already describes for `auth_required: false` — a gated
+        route here would 401 on every poll regardless of real health, same
+        trap `_require_identity`'s own docstring warns about. Precedent:
+        aw-app-architecture's `/provision/check` and aw-app-call-agent's
+        `/credentials/check` are unauthenticated for the identical reason.
+        Nothing in `detail` is a secret value — `scrub` carries vault secret
+        NAMES and counts only, never a value (§12 risk 8's list-never-read
+        contract)."""
+        payload = await _exec_sync_status_payload()
+        return {"ok": not payload["degraded"], "detail": payload}
 
     @app.post("/exec-sync/reconcile", dependencies=[Depends(_require_identity)])
     async def exec_sync_reconcile() -> dict:

@@ -406,6 +406,31 @@ def _watermark_of(run_rows: list[dict], *, complete: bool) -> str | None:
     return max(stamps) if stamps else None
 
 
+async def scrub_status(scrubber: exec_scrub.Scrubber | None = None) -> dict:
+    """The §6 point 1 / §12 risk 8 monitoring dict — ``exact_values``,
+    ``exact_match_unavailable``, ``pattern_families``, ``vault_coverage_unknown``
+    and ``vault_names_uncovered``. Shared by the sync tick (``_run_tick_locked``)
+    and ``GET /exec-sync/status`` so the two never compute this differently.
+
+    Pass the tick's own already-built ``scrubber`` to avoid re-reading the
+    workspace secret store a second time; omit it for a status-only check
+    that needs no actual redaction pass."""
+    scrubber = scrubber or exec_scrub.Scrubber.from_workspace()
+    return {**scrubber.status, **(await vault_coverage.coverage_status())}
+
+
+def scrub_degraded(status: dict) -> bool:
+    """Whether a `scrub_status()` dict represents a degraded coverage
+    guarantee — a vault secret with no argued pattern coverage, the coverage
+    check itself unreachable, or the exact-match pass unavailable. Any one of
+    these means §6 point 1's replacement guarantee is not currently holding."""
+    return bool(
+        status.get("exact_match_unavailable")
+        or status.get("vault_coverage_unknown")
+        or status.get("vault_names_uncovered")
+    )
+
+
 async def run_tick(
     lease,
     *,
@@ -467,7 +492,7 @@ async def _run_tick_locked(
     # §6 point 1 correction / §12 risk 8 — checked every tick, alongside
     # `exact_match_unavailable`: a vault secret with no argued pattern
     # coverage must degrade the status visibly, not pass unnoticed.
-    scrub_status = {**scrubber.status, **(await vault_coverage.coverage_status())}
+    scrub_status_ = await scrub_status(scrubber)
     params = {
         "tenant": source_tenant,
         "watermark": watermark,
@@ -491,7 +516,7 @@ async def _run_tick_locked(
                 last_error=None,
             )
             return _empty_result(
-                False, "no runs due", watermark=watermark, scrub=scrub_status
+                False, "no runs due", watermark=watermark, scrub=scrub_status_
             )
 
         totals = {"runs": 0, "tool_calls": 0, "called": 0, "batches": 0}
@@ -536,7 +561,7 @@ async def _run_tick_locked(
         "blocked": False,
         "reason": last_error,
         "watermark": new_watermark,
-        "scrub": scrub_status,
+        "scrub": scrub_status_,
         **totals,
     }
 

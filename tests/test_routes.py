@@ -15,8 +15,29 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import forwarding, pending_deletions, routes as routes_mod  # noqa: E402
+from knowledgeable_app import (  # noqa: E402
+    exec_scrub,
+    forwarding,
+    pending_deletions,
+    routes as routes_mod,
+    vault_coverage,
+)
 from knowledgeable_app.mcp import client  # noqa: E402
+
+
+async def _default_coverage_status():
+    return {"vault_coverage_unknown": None, "vault_names_uncovered": []}
+
+
+@pytest.fixture(autouse=True)
+def _wire_scrub_fakes(monkeypatch):
+    """Same reasoning as `test_exec_sync.py`'s own `_wire_fakes`: keep this
+    file's exec-sync route tests off the real workspace secret store and off
+    whatever `AW_WORKSPACE_API_URL`/`KEY` happen to be set in the ambient
+    environment, now that `GET /exec-sync/status` and `/exec-sync/doctor`
+    compute `exec_sync.scrub_status()` on every call."""
+    monkeypatch.setattr(exec_scrub, "workspace_secret_values", lambda: (["invented-secret"], None))
+    monkeypatch.setattr(vault_coverage, "coverage_status", _default_coverage_status)
 
 
 @pytest.fixture(autouse=True)
@@ -585,6 +606,141 @@ def test_exec_sync_status_is_degraded_when_the_sentinel_says_stale(
 
     monkeypatch.setattr(client, "get_exec_status", _fresh)
     assert tc.get("/exec-sync/status").json()["degraded"] is False
+
+
+async def _fresh_sentinel():
+    return {"staleness": {"state": "fresh", "degraded": False, "age_seconds": 30}}, None
+
+
+def _enable_exec_sync(ctx, monkeypatch):
+    ctx.config["exec_sync_enabled"] = True
+    ctx.config["exec_sync_source_tenant"] = "tenant-bootstrap"
+    ctx.secrets.write(routes_mod.APMT_DSN_KEY, "postgresql://u:p@h/db")
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+
+
+def test_exec_sync_status_folds_the_scrub_dict_in(exec_app_client, monkeypatch):
+    """routes.py's own docstring calls this `/exec-sync/status` endpoint the
+    §8 doctor surface, and the CLI's `knowledgeable-exec-sync status` reads
+    it — before this card it omitted `scrub` entirely."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+    scrub = tc.get("/exec-sync/status").json()["scrub"]
+    assert scrub == {
+        "exact_values": 1,
+        "exact_match_unavailable": None,
+        "pattern_families": len(exec_scrub._PATTERNS),
+        "vault_coverage_unknown": None,
+        "vault_names_uncovered": [],
+    }
+
+
+def test_exec_sync_status_is_degraded_by_an_uncovered_vault_secret(exec_app_client, monkeypatch):
+    """§6 point 1 / §12 risk 8: a vault secret with no argued pattern
+    coverage must degrade this endpoint visibly. Verified in BOTH
+    directions — registering the gap degrades it, clearing the gap clears
+    it — because the whole finding behind this card is that a clean-looking
+    report hid an absent check."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _one_uncovered():
+        return {"vault_coverage_unknown": None, "vault_names_uncovered": ["some-new-vault-secret"]}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _one_uncovered)
+    body = tc.get("/exec-sync/status").json()
+    assert body["degraded"] is True
+    assert body["scrub"]["vault_names_uncovered"] == ["some-new-vault-secret"]
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _default_coverage_status)
+    assert tc.get("/exec-sync/status").json()["degraded"] is False
+
+
+def test_exec_sync_status_is_degraded_when_vault_coverage_is_unknown(exec_app_client, monkeypatch):
+    """The unreachable-secrets-app case must surface as degraded, never as
+    a clean pass — the same property `test_vault_coverage.py`'s
+    `test_coverage_status_degrades_visibly_when_the_secrets_app_is_unreachable`
+    already pins at the function level, now pinned at this endpoint too."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _unreachable_secrets_app():
+        return {"vault_coverage_unknown": "could not reach the secrets app: boom",
+                "vault_names_uncovered": None}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _unreachable_secrets_app)
+    body = tc.get("/exec-sync/status").json()
+    assert body["degraded"] is True
+    assert body["scrub"]["vault_coverage_unknown"] == "could not reach the secrets app: boom"
+
+
+def test_exec_sync_status_is_degraded_when_exact_match_is_unavailable(exec_app_client, monkeypatch):
+    """`exact_match_unavailable` has had this exact hole since it was added
+    — never once surfaced to a human. Same fix, same pass, same test shape
+    as the vault-coverage cases above."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+    monkeypatch.setattr(
+        exec_scrub, "workspace_secret_values", lambda: ([], "secret store read failed: OSError")
+    )
+    body = tc.get("/exec-sync/status").json()
+    assert body["degraded"] is True
+    assert body["scrub"]["exact_match_unavailable"] == "secret store read failed: OSError"
+
+
+def test_exec_sync_status_scrub_degradation_is_gated_on_enabled(exec_app_client, monkeypatch):
+    """Mirrors what `degraded` already meant here before this card: "off is
+    not degraded". A coverage gap only matters while the sync it protects is
+    actually running."""
+    tc, ctx = exec_app_client
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+
+    async def _one_uncovered():
+        return {"vault_coverage_unknown": None, "vault_names_uncovered": ["some-new-vault-secret"]}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _one_uncovered)
+    body = tc.get("/exec-sync/status").json()
+    assert body["enabled"] is False
+    assert body["degraded"] is False
+
+
+def test_exec_sync_doctor_is_ok_when_nothing_is_degraded(exec_app_client, monkeypatch):
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+    resp = tc.get("/exec-sync/doctor")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["detail"]["degraded"] is False
+
+
+def test_exec_sync_doctor_is_not_ok_when_a_vault_secret_is_uncovered(exec_app_client, monkeypatch):
+    """The sharper half of this card: §11 reopen trigger #3 is "the
+    coverage registry rotting in doctor output" — this is the test that
+    proves that trigger can now actually fire. Verified in both directions:
+    registering the gap trips it, clearing the gap clears it."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _one_uncovered():
+        return {"vault_coverage_unknown": None, "vault_names_uncovered": ["some-new-vault-secret"]}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _one_uncovered)
+    body = tc.get("/exec-sync/doctor").json()
+    assert body["ok"] is False
+    assert body["detail"]["scrub"]["vault_names_uncovered"] == ["some-new-vault-secret"]
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _default_coverage_status)
+    assert tc.get("/exec-sync/doctor").json()["ok"] is True
+
+
+def test_exec_sync_doctor_needs_no_identity_at_all(ungated_app_client, monkeypatch):
+    """`contributes.doctor` dials this in-process with no headers at all
+    (`_app_doctor_checks` in aw-workspace core) — a `_require_identity` gate
+    here would 401 on every poll regardless of real health."""
+    tc, ctx = ungated_app_client
+    ctx.state.lease = _FakeLease()
+    assert tc.get("/exec-sync/doctor").status_code == 200
 
 
 def test_the_exec_sync_routes_require_identity(app_client):

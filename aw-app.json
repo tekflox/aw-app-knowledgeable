@@ -143,7 +143,13 @@
     ],
     "knowledge": {
       "path": "docs"
-    }
+    },
+    "doctor": [
+      {
+        "label": "Exec-sync scrub/vault coverage",
+        "route": "/exec-sync/doctor"
+      }
+    ]
   },
   "config_schema": {
     "type": "object",
