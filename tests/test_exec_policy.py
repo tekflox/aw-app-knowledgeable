@@ -36,6 +36,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from knowledgeable_app import exec_policy, exec_scrub, exec_sync  # noqa: E402
@@ -911,3 +913,225 @@ def test_the_known_bucket_still_works_when_the_scan_SUCCEEDED(tmp_path):
     counters = table.counters
     assert counters["policy_unresolved_known"] == [federation]
     assert counters["policy_unresolved_actionable"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A manifest that cannot be READ is not a manifest that declared NOTHING.
+#
+# QA's slice-2 finding (run ee833426cc074f1ea716d7001497160e), filed
+# non-blocking and reclassified as blocking by Frederico. Under a BLACKLIST,
+# `{}` means "opted out of nothing", i.e. every tool of that app is indexable
+# on BOTH axes — so an unreadable or malformed `aw-app.json` used to convert
+# every declared opt-out in that app into permission to index, silently, in
+# the one direction this card exists because of.
+#
+# The sharper half of the finding is the INCONSISTENCY: `from_workspace`
+# losing the apps ROOT fails closed, and `_server_keys` losing an `mcp.json`
+# fails closed (the app's upstreams vanish, so its routed names are
+# unattributable). Only this path failed open. Either direction is arguable;
+# two read paths over one tree disagreeing is not.
+#
+# Every fixture below builds its own tree. None reads /opt/aw-workspace/apps
+# — that is the lesson the CI failure taught (conftest.py, §12 risk 10).
+# ---------------------------------------------------------------------------
+
+#: A real server key -> real slug join, so these fixtures resolve the way
+#: production does rather than passing against themselves (§12 risk 1).
+_BROKEN_NAME = "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
+
+
+def _app_with_broken_manifest(tmp_path, how: str) -> Path:
+    """An installed app with a valid `mcp.json` and an `aw-app.json` that
+    cannot be read, by one of three real mechanisms."""
+    root = tmp_path / "apps"
+    app = root / "remote-host-cli"
+    app.mkdir(parents=True)
+    (app / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"aw-app-remote-host-cli": {"type": "http"}}}),
+        encoding="utf-8",
+    )
+    manifest = app / "aw-app.json"
+    if how == "malformed":
+        # Syntactically broken JSON — a truncated write, a merge conflict
+        # marker, an editor crash mid-save.
+        manifest.write_text('{"id": "remote-host-cli", "contributes": {', encoding="utf-8")
+    elif how == "unreadable":
+        # A DIRECTORY where a file belongs: `open()` raises IsADirectoryError,
+        # an OSError. Preferred over chmod 000 because this suite can run as
+        # root, where chmod does not actually deny a read.
+        manifest.mkdir()
+    elif how == "missing":
+        pass  # no manifest at all -> FileNotFoundError
+    elif how == "not_an_object":
+        # Parses as valid JSON but is not an object. `_read_json` used to
+        # coerce this to `{}`, which is the same flattening one shape in.
+        manifest.write_text('["not", "an", "object"]', encoding="utf-8")
+    else:  # pragma: no cover - fixture misuse
+        raise AssertionError(how)
+    return root
+
+
+@pytest.mark.parametrize(
+    ("how", "expected_error"),
+    [
+        ("malformed", "JSONDecodeError"),
+        ("unreadable", "IsADirectoryError"),
+        ("missing", "FileNotFoundError"),
+        ("not_an_object", exec_policy.MANIFEST_NOT_AN_OBJECT),
+    ],
+)
+def test_an_unreadable_manifest_denies_both_axes_instead_of_permitting_them(
+    tmp_path, how, expected_error
+):
+    """The fix, over every way a manifest can fail to be read.
+
+    MUTATION: restore `except (OSError, ValueError): return {}` and every
+    case here goes green on `allow_call`/`allow_output` — which is exactly
+    the bug, and exactly why it was invisible.
+    """
+    root = _app_with_broken_manifest(tmp_path, how)
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+
+    assert table.status["manifest_errors"] == 1
+    assert table.counters["policy_manifest_unreadable"] == {
+        "remote-host-cli": expected_error
+    }, "the operator needs to know WHICH app and roughly how"
+
+    d = table.decide_output(_BROKEN_NAME)
+    assert (d.allow_call, d.allow_output) == (False, False), (
+        "a manifest nobody could read must not grant permission on either axis"
+    )
+    assert d.state == exec_policy.STATE_UNRESOLVED
+    assert d.app == "remote-host-cli", "still attributed — the app is installed"
+    assert exec_policy.apply_output_axis(d, "AW_TOKEN=invented-value") is None
+    assert (
+        exec_policy.apply_call_axis(d, '{"path": "/srv/.env"}')
+        == exec_policy.UNRESOLVED_DROP_MARKER
+    ), "the diagnosis marker, not the floor's plain None (§12 risk 4)"
+
+
+@pytest.mark.parametrize(
+    "how", ["malformed", "unreadable", "missing", "not_an_object"]
+)
+def test_a_broken_manifest_lands_in_the_ACTIONABLE_bucket(tmp_path, how):
+    """A corrupt manifest is a file somebody has to go and fix — as
+    actionable as an unreadable apps root, and it must not land anywhere near
+    `UNRESOLVABLE_UPSTREAMS`, whose whole claim is "no manifest could ever
+    attribute this"."""
+    root = _app_with_broken_manifest(tmp_path, how)
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+    table.decide_output(_BROKEN_NAME)
+    counters = table.counters
+    assert counters["policy_unresolved_actionable"] == 1
+    assert counters["policy_unresolved_known"] == []
+    assert _BROKEN_NAME in counters["policy_unresolved"]
+    # Counted as a fail-closed drop, not as a declared policy denial — the
+    # split slice 4 built, applied to this case too.
+    assert counters["policy_unresolved_results"] == 1
+    assert counters["policy_denied_results"] == 0
+
+
+def test_a_readable_manifest_with_no_indexing_key_is_still_never_declared(tmp_path):
+    """The other half of the signal, and the one that stops this fix from
+    becoming a denial of everything: ~36 installed apps ship no `indexing`
+    key, that is valid forever (§12 risk 9), and it must stay distinguishable
+    from a manifest that could not be read."""
+    root = tmp_path / "apps"
+    app = root / "remote-host-cli"
+    app.mkdir(parents=True)
+    (app / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"aw-app-remote-host-cli": {"type": "http"}}}),
+        encoding="utf-8",
+    )
+    (app / "aw-app.json").write_text(
+        json.dumps({"id": "remote-host-cli", "contributes": {}}), encoding="utf-8"
+    )
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+    assert table.status["manifest_errors"] == 0
+    assert table.counters["policy_manifest_unreadable"] == {}
+    d = table.decide_output(_BROKEN_NAME)
+    assert d.state == exec_policy.STATE_NEVER_DECLARED
+    assert (d.allow_call, d.allow_output) == (True, True)
+
+
+def test_the_floor_still_beats_a_broken_manifest(tmp_path):
+    """§2's invariant is checked before any of this. A secret tool in an app
+    with a corrupt manifest gets the FLOOR's treatment — `None`, not the
+    unresolved marker — because the floor's drop must stay byte-identical to
+    what §13.2's purge leaves behind."""
+    root = tmp_path / "apps"
+    app = root / "secrets"
+    app.mkdir(parents=True)
+    (app / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"aw-secrets": {"type": "http"}}}), encoding="utf-8"
+    )
+    (app / "aw-app.json").write_text("{invalid", encoding="utf-8")
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+    d = table.decide_output("mcp__aw-gateway__aw__aw_secrets__write_secret")
+    assert d.state == exec_policy.STATE_FLOOR
+    assert exec_policy.apply_call_axis(d, '{"value": "x"}') is None
+
+
+def test_a_human_override_still_beats_a_broken_manifest(tmp_path):
+    """§6's precedence is floor > override > manifest > default. A corrupt
+    manifest does not invalidate what a human explicitly said about one tool
+    — the override exists precisely because the manifest can be wrong, and
+    "unreadable" is the strongest form of wrong."""
+    root = _app_with_broken_manifest(tmp_path, "malformed")
+    table = exec_policy.PolicyTable.from_workspace(
+        str(root), overrides={("remote-host-cli", "remote_host_read_file"): (True, False)}
+    )
+    d = table.decide_output(_BROKEN_NAME)
+    assert d.state == exec_policy.STATE_OVERRIDE
+    assert (d.allow_call, d.allow_output) == (True, False)
+    # The app is still reported as broken — the override rescued one tool,
+    # not the manifest.
+    assert table.counters["policy_manifest_unreadable"] == {
+        "remote-host-cli": "JSONDecodeError"
+    }
+
+
+def test_an_app_serving_no_tools_is_not_reported_as_broken(tmp_path):
+    """Scoping, and it is the always-on-counter lesson applied again. An app
+    with no readable `mcp.json` serves nothing through the gateway, so its
+    manifest can neither grant nor deny anything; listing it would put
+    permanent dead entries in the actionable bucket.
+
+    Measured on the real tree: `apps/` holds 7 `.<app>.fetch-*`
+    download-staging directories with no manifest AND no `mcp.json`. Before
+    this scoping they would have been 7 standing entries — the exact defect
+    `UNRESOLVABLE_UPSTREAMS` exists to keep out of that number."""
+    root = tmp_path / "apps"
+    for name in (".browser.fetch-8r2xupxy", ".devctl.fetch-pfors7rk"):
+        (root / name).mkdir(parents=True)  # no mcp.json, no aw-app.json
+    table = exec_policy.PolicyTable.from_workspace(str(root))
+    assert table.status["apps_scanned"] == 2, "they ARE scanned"
+    assert table.status["manifest_errors"] == 0, "but they contribute no tools"
+    assert table.counters["policy_manifest_unreadable"] == {}
+    assert table.counters["policy_unresolved_actionable"] == 0
+
+
+def test_the_three_read_paths_over_the_tree_now_agree_on_direction(tmp_path):
+    """The inconsistency that was the real finding, pinned as one test.
+
+    Three reads happen over the installed tree, and before this fix they did
+    not agree: the apps ROOT failing closed, an `mcp.json` failing closed,
+    and an `aw-app.json` failing OPEN. All three now deny."""
+    name = _BROKEN_NAME
+
+    # 1. apps root unreadable.
+    root_gone = exec_policy.PolicyTable.from_workspace(str(tmp_path / "absent"))
+    assert root_gone.decide_output(name).allow_output is False
+
+    # 2. mcp.json unreadable -> the upstream vanishes, name unattributable.
+    no_mcp = tmp_path / "no-mcp" / "apps" / "remote-host-cli"
+    no_mcp.mkdir(parents=True)
+    (no_mcp / "aw-app.json").write_text(json.dumps({"id": "remote-host-cli"}), encoding="utf-8")
+    t2 = exec_policy.PolicyTable.from_workspace(str(tmp_path / "no-mcp" / "apps"))
+    assert t2.decide_output(name).allow_output is False
+
+    # 3. aw-app.json unreadable -> THIS is the one that used to permit.
+    t3 = exec_policy.PolicyTable.from_workspace(
+        str(_app_with_broken_manifest(tmp_path / "broken", "malformed"))
+    )
+    assert t3.decide_output(name).allow_output is False

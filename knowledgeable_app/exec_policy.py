@@ -371,15 +371,54 @@ def _server_keys(app_dir: str) -> list[str]:
     return [sanitise_server_key(k) for k in servers if isinstance(k, str) and k]
 
 
-def _declared_entries(app_dir: str) -> dict[str, tuple[bool, bool]]:
-    """``contributes.mcp.indexing`` of one app, as ``{tool: (call, output)}``.
+#: What :func:`_declared_entries` reports when the manifest parsed as valid
+#: JSON but is not an object (a top-level list, string or number). Not an
+#: exception, so it needs a label of its own — and it is the same failure in
+#: the same direction as a parse error, so it must not be the one shape that
+#: still silently reads as "declared nothing".
+MANIFEST_NOT_AN_OBJECT = "NotAnObject"
+
+
+def _declared_entries(app_dir: str) -> tuple[dict[str, tuple[bool, bool]], str | None]:
+    """``contributes.mcp.indexing`` of one app -> ``({tool: (call, output)},
+    read_error)``.
 
     Reads the installed manifest copy, which §5 names as the
     install-time-generated artifact — there is nothing else to generate.
 
-    Every coercion here tightens rather than widens, because this is a
-    *security* default and the shapes are already rejected upstream by core's
-    validator (slice 1) and the marketplace's:
+    **"Could not read" is returned, never flattened into "declared
+    nothing".** This is the whole reason the function has a second return
+    value, and it is a fix for a real fail-open found by QA on slice 2 (run
+    ``ee833426cc074f1ea716d7001497160e``) and reclassified as blocking:
+    under a BLACKLIST, an empty declaration map does not mean "unknown", it
+    means *this app opted out of nothing*, i.e. every tool of that app is
+    indexable on BOTH axes. So an unreadable or malformed ``aw-app.json``
+    used to convert every declared opt-out in that app into permission to
+    index — silently, in the one direction this card exists because of (138
+    secret-tool calls landed with their arguments intact because a policy
+    failed open). The floor still covers four tools; ``indexing`` is the only
+    thing between the other ~658 and the index, and a declared
+    ``output: false`` that evaporates on an ``IOError`` is exactly the
+    middle-tier protection slice 4 was dispatched to build.
+
+    It also fixes an inconsistency that was the sharper half of the finding:
+    :meth:`PolicyTable.from_workspace` catching ``OSError`` on the apps ROOT
+    fails closed (everything unresolved, therefore denied), and
+    :func:`_server_keys` losing an ``mcp.json`` also fails closed (the app's
+    upstreams vanish from the map, so its routed names are unattributable).
+    Only this path failed open. Either direction can be argued; two read
+    paths over the same tree disagreeing cannot.
+
+    The error is the exception's type NAME (``FileNotFoundError``,
+    ``PermissionError``, ``JSONDecodeError``, …) rather than a single
+    boolean: a missing manifest, an unreadable one and a corrupt one are
+    different operational problems and the distinction costs one
+    ``type().__name__``. It is never the exception's *message*, which can
+    carry a path.
+
+    Every coercion in the loop below tightens rather than widens, because
+    this is a *security* default and the shapes are already rejected upstream
+    by core's validator (slice 1) and the marketplace's:
 
     * an axis is permitted only when it is literally ``True``, so a
       malformed ``"false"`` (or a missing key) denies rather than coercing to
@@ -390,15 +429,29 @@ def _declared_entries(app_dir: str) -> dict[str, tuple[bool, bool]]:
     * duplicate entries for one tool are intersected rather than
       last-wins — ambiguity tightens (§3), and the validator rejects
       duplicates anyway.
+
+    A manifest that reads fine and simply has no ``indexing`` key returns
+    ``({}, None)`` — the genuine "never declared" state ~36 installed apps
+    are in, which is valid forever (§12 risk 9) and must stay
+    distinguishable from the two above.
     """
     try:
-        contributes = _read_json(os.path.join(app_dir, "aw-app.json")).get("contributes")
-    except (OSError, ValueError):
-        return {}
+        with open(os.path.join(app_dir, "aw-app.json"), "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except (OSError, ValueError) as exc:
+        # `OSError` and `ValueError` deliberately share this branch, which
+        # `type(exc).__name__` then tells apart — the caller needs to know
+        # WHICH file is broken and roughly how, not to branch on it.
+        return {}, type(exc).__name__
+    # NOT via `_read_json`: its non-dict coercion to `{}` is precisely the
+    # flattening this function exists to stop, one shape further in.
+    if not isinstance(loaded, dict):
+        return {}, MANIFEST_NOT_AN_OBJECT
+    contributes = loaded.get("contributes")
     mcp = contributes.get("mcp") if isinstance(contributes, dict) else None
     entries = mcp.get("indexing") if isinstance(mcp, dict) else None
     if not isinstance(entries, list):
-        return {}
+        return {}, None
     out: dict[str, tuple[bool, bool]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -413,7 +466,7 @@ def _declared_entries(app_dir: str) -> dict[str, tuple[bool, bool]]:
             call = call and out[tool][0]
             output = output and out[tool][1]
         out[tool] = (call, output)
-    return out
+    return out, None
 
 
 class PolicyTable:
@@ -431,6 +484,7 @@ class PolicyTable:
         "_by_tool",
         "_apps",
         "_scan_error",
+        "_manifest_errors",
         "_cache",
         "_unresolved",
         "_denied_calls",
@@ -446,9 +500,25 @@ class PolicyTable:
         overrides: Mapping[tuple[str, str], tuple[bool, bool]] | None = None,
         apps: Iterable[str] = (),
         scan_error: str | None = None,
+        manifest_errors: Mapping[str, str] | None = None,
     ) -> None:
         self._upstreams = dict(upstreams or {})
         self._declared = dict(declared or {})
+        #: ``{slug: error_name}`` for apps whose ``aw-app.json`` could not be
+        #: read or parsed. A routed name attributed to one of these fails
+        #: CLOSED rather than falling through to the blacklist default,
+        #: because "I could not read this app's declarations" is not "this
+        #: app declared nothing" — see :func:`_declared_entries`.
+        #:
+        #: Only ever populated for apps that contribute upstreams. An app
+        #: with no readable ``mcp.json`` serves no tools through the gateway,
+        #: so its manifest can neither grant nor deny anything, and listing
+        #: it would put permanent dead entries in the actionable bucket —
+        #: the same always-on-counter defect `UNRESOLVABLE_UPSTREAMS` exists
+        #: to keep out of it. Measured: this workspace's `apps/` holds 7
+        #: `.<app>.fetch-*` download-staging directories with no manifest
+        #: and no `mcp.json`.
+        self._manifest_errors = dict(manifest_errors or {})
         #: Slice 3 fills this from the connector's state facade, keyed
         #: ``(slug, tool)`` (§6) — never from the app-config blob the
         #: settings form rewrites wholesale. Slice 2 carries the parameter so
@@ -482,10 +552,22 @@ class PolicyTable:
         and fills ``policy_unresolved`` rather than quietly reverting to
         "index". That is the correct direction and it is deliberately the
         loud one.
+
+        **The same rule now holds one level down, per app.** A single app's
+        unreadable or malformed ``aw-app.json`` is recorded in
+        ``manifest_errors`` instead of being flattened into "this app
+        declared nothing", which under a blacklist would have granted every
+        tool of that app permission on both axes
+        (:func:`_declared_entries`). Recorded only for apps that actually
+        contribute upstreams — an app serving no tools cannot have its
+        policy widened, and a permanent dead entry in the actionable bucket
+        is the defect :data:`UNRESOLVABLE_UPSTREAMS` exists to keep out of
+        it.
         """
         root = root or _apps_root()
         upstreams: dict[str, str] = {}
         declared: dict[tuple[str, str], tuple[bool, bool]] = {}
+        manifest_errors: dict[str, str] = {}
         apps: list[str] = []
         scan_error = None
         try:
@@ -502,16 +584,28 @@ class PolicyTable:
             if not os.path.isdir(app_dir):
                 continue
             apps.append(slug)
-            for key in _server_keys(app_dir):
+            keys = _server_keys(app_dir)
+            for key in keys:
                 upstreams[key] = slug
-            for tool, axes in _declared_entries(app_dir).items():
+            entries, read_error = _declared_entries(app_dir)
+            for tool, axes in entries.items():
                 declared[(slug, tool)] = axes
+            if read_error and keys:
+                manifest_errors[slug] = read_error
+                log.warning(
+                    "exec policy: %s/aw-app.json unreadable (%s) — every routed "
+                    "tool of that app now FAILS CLOSED rather than defaulting to "
+                    "indexable; fix the manifest",
+                    slug,
+                    read_error,
+                )
         return cls(
             upstreams=upstreams,
             declared=declared,
             overrides=overrides,
             apps=apps,
             scan_error=scan_error,
+            manifest_errors=manifest_errors,
         )
 
     def _cached(self, name: str | None) -> Decision:
@@ -589,6 +683,13 @@ class PolicyTable:
         be classified as expected. ``policy_scan_error`` is reported
         alongside, but a reader who only watches the counters must not be
         told the quiet version.
+
+        A per-app MANIFEST read failure is actionable for the same reason and
+        is pinned separately: that denial is attributed to a real installed
+        app, so its upstream would never match the registry anyway — but a
+        corrupt manifest is a file somebody has to go and fix, and it must
+        not be able to drift into "known and unactionable" if an app ever
+        declares a server key that collides with a federation's name.
         """
         actionable: list[str] = []
         known: list[str] = []
@@ -596,7 +697,12 @@ class PolicyTable:
         for name in sorted(self._unresolved):
             decision = self._cache.get(name if name != EMPTY_NAME_LABEL else "")
             upstream = decision.upstream if decision else None
-            is_known = not degraded and upstream in UNRESOLVABLE_UPSTREAMS
+            broken_manifest = bool(decision and decision.app in self._manifest_errors)
+            is_known = (
+                not degraded
+                and not broken_manifest
+                and upstream in UNRESOLVABLE_UPSTREAMS
+            )
             (known if is_known else actionable).append(name)
         return actionable, known
 
@@ -621,6 +727,15 @@ class PolicyTable:
             axes = self._overrides.get((slug, tool))
             if axes is not None:
                 return Decision(axes[0], axes[1], STATE_OVERRIDE, slug, tool, upstream)
+            # 4b. The app is installed and attributable, but its manifest
+            #     could not be read — so its declarations are UNKNOWN, not
+            #     absent, and falling through to the blacklist default would
+            #     turn a declared `output: false` into permission to index.
+            #     Checked AFTER the override lookup on purpose: §6 puts a
+            #     human override above the manifest, and a corrupt manifest
+            #     does not invalidate what a human said about this tool.
+            if slug in self._manifest_errors:
+                return Decision(False, False, STATE_UNRESOLVED, slug, tool, upstream)
             axes = self._declared.get((slug, tool))
             if axes is not None:
                 return Decision(axes[0], axes[1], self._declared_state(axes), slug, tool, upstream)
@@ -656,6 +771,7 @@ class PolicyTable:
             "declarations": len(self._declared),
             "overrides": len(self._overrides),
             "scan_error": self._scan_error,
+            "manifest_errors": len(self._manifest_errors),
         }
 
     @property
@@ -690,6 +806,14 @@ class PolicyTable:
         left exactly as slice 2 shipped it, known names included: the doctor
         check reads that key, and quietly narrowing it here would change a
         shipped surface from inside a counter property.
+
+        ``policy_manifest_unreadable`` is ``{slug: error_name}`` for apps
+        whose ``aw-app.json`` could not be read, and it is the actionable
+        detail the bare counts cannot carry: without it an operator sees
+        tools denied and an actionable count going up with no pointer to the
+        file to fix. Error NAME only (``FileNotFoundError``,
+        ``JSONDecodeError``, ``NotAnObject``) — never the exception message,
+        which can carry a path.
         """
         unresolved = sorted(self._unresolved)
         actionable, known = self.unresolved_split()
@@ -702,4 +826,5 @@ class PolicyTable:
             "policy_denied_results": self._denied_results,
             "policy_unresolved_results": self._unresolved_results,
             "policy_scan_error": self._scan_error,
+            "policy_manifest_unreadable": dict(sorted(self._manifest_errors.items())),
         }
