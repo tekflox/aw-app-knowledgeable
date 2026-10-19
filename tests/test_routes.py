@@ -704,6 +704,111 @@ def test_exec_sync_status_scrub_degradation_is_gated_on_enabled(exec_app_client,
     assert body["degraded"] is False
 
 
+def test_exec_sync_status_is_degraded_by_an_unreviewed_event_kind(
+    exec_app_client, monkeypatch
+):
+    """§13.6's open-set alarm, at the endpoint the CLI and the doctor check
+    both read. Same mechanism as `vault_names_uncovered` above, and verified
+    in BOTH directions for the same reason: the finding behind that card was
+    a clean-looking report hiding an absent check.
+
+    The list rides the sentinel's `reported_counts` because the sweep itself
+    is a 253 ms scan over 1.3M rows and this endpoint is polled far more
+    often than the 10-minute tick."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _with_new_kind():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": {"event_kinds_unreviewed": ["brand.new.kind"]},
+            },
+            None,
+        )
+
+    monkeypatch.setattr(client, "get_exec_status", _with_new_kind)
+    body = tc.get("/exec-sync/status").json()
+    assert body["degraded"] is True
+    assert body["event_kinds_unreviewed"] == ["brand.new.kind"]
+    assert tc.get("/exec-sync/doctor").json()["ok"] is False
+
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+    cleared = tc.get("/exec-sync/status").json()
+    assert cleared["degraded"] is False
+    assert cleared["event_kinds_unreviewed"] == []
+
+
+def test_a_sentinel_without_the_key_is_not_degraded(exec_app_client, monkeypatch):
+    """A sentinel stamped by a connector older than §13 slice 1 has no
+    `event_kinds_unreviewed` key at all. That must read as "nothing owed",
+    not as a gap — otherwise the doctor check goes red on every deployment
+    up to the one that fixes it, and a permanently red check detects
+    nothing."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _old_sentinel():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": {"runs": 8, "tool_calls": 137},
+            },
+            None,
+        )
+
+    monkeypatch.setattr(client, "get_exec_status", _old_sentinel)
+    body = tc.get("/exec-sync/status").json()
+    assert body["event_kinds_unreviewed"] == []
+    assert body["degraded"] is False
+
+
+def test_reset_watermark_clears_the_frontier_and_refuses_without_a_source_tenant(
+    exec_app_client, monkeypatch
+):
+    """§13.8's per-slice backfill trigger. Wired rather than left as a
+    one-off, because slices 2 and 3 need the same button and the
+    alternative is hand-rolling an HTTP call to a service-authed route with
+    the internal secret.
+
+    It refuses without `exec_sync_source_tenant` for the same reason
+    `run_tick` does: the sentinel is per source tenant, and guessing it
+    would stamp the wrong one — which reads as a clean reset and syncs
+    nothing."""
+    tc, ctx = exec_app_client
+    posted: list[dict] = []
+
+    async def _put_state(*, source_tenant, watermark, counts=None, last_error=None):
+        posted.append(
+            {
+                "source_tenant": source_tenant,
+                "watermark": watermark,
+                "counts": counts,
+                "last_error": last_error,
+            }
+        )
+        return True, None
+
+    monkeypatch.setattr(client, "put_exec_sync_state", _put_state)
+
+    refused = tc.post("/exec-sync/reset-watermark", json={}).json()
+    assert refused["ok"] is False
+    assert "exec_sync_source_tenant" in refused["error"]
+    assert posted == [], "it stamped a sentinel without knowing whose it was"
+
+    _enable_exec_sync(ctx, monkeypatch)
+    monkeypatch.setattr(client, "put_exec_sync_state", _put_state)
+    body = tc.post("/exec-sync/reset-watermark", json={}).json()
+    assert body["ok"] is True
+    assert body["watermark"] is None
+    assert posted[0]["source_tenant"] == "tenant-bootstrap"
+    assert posted[0]["watermark"] is None
+    assert posted[0]["counts"] == {}
+    # The reason is recorded on the sentinel so an operator reading a null
+    # watermark can tell a deliberate reset from a lost sentinel.
+    assert "backfill" in posted[0]["last_error"]
+
+
 def test_exec_sync_doctor_is_ok_when_nothing_is_degraded(exec_app_client, monkeypatch):
     tc, ctx = exec_app_client
     _enable_exec_sync(ctx, monkeypatch)
