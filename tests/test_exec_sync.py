@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import exec_scrub, exec_sync  # noqa: E402
+from knowledgeable_app import exec_scrub, exec_sync, vault_coverage  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -132,16 +132,24 @@ def _pg_row(
     )
 
 
+async def _default_coverage_status():
+    return {"vault_coverage_unknown": None, "vault_names_uncovered": []}
+
+
 @pytest.fixture(autouse=True)
 def _wire_fakes(monkeypatch):
     """Point the engine at fakes for Postgres, the HTTP client and the
     secret store. The secret-store fake is what keeps a real credential out
-    of this test entirely."""
+    of this test entirely. The vault-coverage fake keeps this suite from
+    depending on whatever AW_WORKSPACE_API_URL/KEY happen to be set in the
+    ambient environment — the real check is exercised in
+    test_vault_coverage.py."""
     monkeypatch.setattr(
         exec_scrub, "workspace_secret_values", lambda: ([STORE_SECRET], None)
     )
     monkeypatch.setattr(client, "configured", lambda: True)
     monkeypatch.setattr(client, "_secret_resolver", lambda: "fake-secret")
+    monkeypatch.setattr(vault_coverage, "coverage_status", _default_coverage_status)
 
 
 class _Calls:
@@ -341,6 +349,35 @@ def test_a_degraded_scrub_is_reported_on_the_tick_result(calls, monkeypatch):
     conn = _FakeConn(runs=[_pg_row("run-1")])
     result = _tick(conn, monkeypatch)
     assert result["scrub"]["exact_match_unavailable"] == "secret store read failed: OSError"
+
+
+def test_vault_names_uncovered_is_reported_alongside_exact_match_unavailable(calls, monkeypatch):
+    """§6 point 1 correction / §12 risk 8 — the monitored replacement for the
+    vault's lost exact-match guarantee lives in the same status dict as
+    `exact_match_unavailable`, checked on every tick."""
+    async def _one_uncovered():
+        return {"vault_coverage_unknown": None, "vault_names_uncovered": ["some-new-vault-secret"]}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _one_uncovered)
+    conn = _FakeConn(runs=[_pg_row("run-1")])
+    result = _tick(conn, monkeypatch)
+    assert result["scrub"]["vault_names_uncovered"] == ["some-new-vault-secret"]
+    assert result["scrub"]["vault_coverage_unknown"] is None
+    # Unrelated to and does not displace the exact-match status it sits beside.
+    assert result["scrub"]["exact_match_unavailable"] is None
+
+
+def test_vault_coverage_unknown_is_reported_when_the_secrets_app_is_unreachable(calls, monkeypatch):
+    """Degrade visibly, never silently (§12 risk 8): a tick that could not
+    even ask `list_secrets` must not look like a clean, fully-covered pass."""
+    async def _unreachable():
+        return {"vault_coverage_unknown": "could not reach the secrets app: boom", "vault_names_uncovered": None}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _unreachable)
+    conn = _FakeConn(runs=[_pg_row("run-1")])
+    result = _tick(conn, monkeypatch)
+    assert result["scrub"]["vault_coverage_unknown"] == "could not reach the secrets app: boom"
+    assert result["scrub"]["vault_names_uncovered"] is None
 
 
 def test_nul_bytes_are_stripped_client_side(calls, monkeypatch):

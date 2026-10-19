@@ -14,11 +14,23 @@ backup's retention life, and it cannot be un-written by a later fix.
 **Why it runs here and not in aw-knowledgeable.** Two reasons, and they are
 the same reason:
 
-* This process is where ``SecretStore`` lives, so the set of known-live
-  secret VALUES is enumerable. Exact matching against that set is a far
-  stronger guarantee than any pattern — it catches a credential with no
-  recognisable shape, which is the whole residual risk pattern scrubbing
-  leaves behind.
+* This process is where the per-app FILE ``SecretStore`` lives, so the set of
+  known-live secret VALUES *in that store* is enumerable. Exact matching
+  against that set is a far stronger guarantee than any pattern — it catches
+  a credential with no recognisable shape, which is the whole residual risk
+  pattern scrubbing leaves behind.
+
+  **Qualified, not unqualified (§6 point 1, corrected 2026-10-19).** There is
+  a second secret store in this workspace — aw-vault, written by
+  ``write_secret``/``aw-workspace-cli secrets`` — and this module does not
+  read it: the vault's read path is approval-gated by design, and an
+  unattended bulk read every sync tick would either spam a human or require
+  a new ungated endpoint (§10). So "the set of known-live secret VALUES is
+  enumerable" holds only for the file store; a vault-only credential is
+  pattern-scrubbed only. ``vault_coverage.py`` is the monitored replacement
+  for that lost guarantee — it compares ``list_secrets()`` NAMES (never
+  values) against a committed registry of argued pattern coverage and
+  reports an unacknowledged name rather than assuming one can't exist.
 * The workspace must never hold the production Neo4j password (§4). Scrubbing
   and loading are connector-side for exactly that reason: this side holds the
   Postgres credential and the service secret it already had, and posts
@@ -327,6 +339,13 @@ def _apply_patterns(text: str) -> str:
     return text
 
 
+#: Every pattern-family name a replacement can carry (`<REDACTED:{kind}>`).
+#: Public so `vault_coverage.py`'s registry can be validated against it at
+#: test time — a registry entry naming a family that doesn't exist here
+#: would otherwise silently argue coverage for nothing (§12 risk 8).
+PATTERN_KINDS = frozenset(kind for kind, _pattern, _replacement in _PATTERNS)
+
+
 # ---------------------------------------------------------------------------
 # Exact-match pass (§6 point 1a) — the strong half.
 # ---------------------------------------------------------------------------
@@ -360,7 +379,8 @@ def _usable_exact_values(values: Iterable[str]) -> list[str]:
 
 
 def workspace_secret_values() -> tuple[list[str], str | None]:
-    """Every value in the workspace secret store, for the redaction table.
+    """Every value in the workspace's per-app FILE secret store, for the
+    redaction table.
 
     Returns ``(values, error)``. A failure here is **never** fatal and is
     **never** silent: the caller reports `exact_match_unavailable` on the sync
@@ -382,6 +402,15 @@ def workspace_secret_values() -> tuple[list[str], str | None]:
     * scoping it to this app's own namespace would reduce the table to the
       connector's own two secrets, which would make §6 point 1a's "far
       stronger guarantee than patterns" false while still claiming it.
+
+    **Qualified, not unqualified (§6 point 1, corrected 2026-10-19).** This
+    enumerates the per-app FILE store ONLY — ``SecretStore`` over
+    ``.aw-workspace/secrets/*.json``. aw-vault (written by ``write_secret``)
+    is a second, separate store this function does not read and cannot: its
+    read path is approval-gated by design. A vault-only credential therefore
+    never enters this table and is pattern-scrubbed only; see
+    ``vault_coverage.py`` for the tested, monitored requirement that replaces
+    the exact-match guarantee for that case.
     """
     root = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
     if root not in sys.path:

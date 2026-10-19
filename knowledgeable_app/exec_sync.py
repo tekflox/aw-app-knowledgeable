@@ -54,7 +54,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import exec_scrub
+from . import exec_scrub, vault_coverage
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.exec_sync")
@@ -464,6 +464,10 @@ async def _run_tick_locked(
     watermark = (status or {}).get("watermark")
 
     scrubber = exec_scrub.Scrubber.from_workspace()
+    # §6 point 1 correction / §12 risk 8 — checked every tick, alongside
+    # `exact_match_unavailable`: a vault secret with no argued pattern
+    # coverage must degrade the status visibly, not pass unnoticed.
+    scrub_status = {**scrubber.status, **(await vault_coverage.coverage_status())}
     params = {
         "tenant": source_tenant,
         "watermark": watermark,
@@ -487,7 +491,7 @@ async def _run_tick_locked(
                 last_error=None,
             )
             return _empty_result(
-                False, "no runs due", watermark=watermark, scrub=scrubber.status
+                False, "no runs due", watermark=watermark, scrub=scrub_status
             )
 
         totals = {"runs": 0, "tool_calls": 0, "called": 0, "batches": 0}
@@ -532,7 +536,7 @@ async def _run_tick_locked(
         "blocked": False,
         "reason": last_error,
         "watermark": new_watermark,
-        "scrub": scrubber.status,
+        "scrub": scrub_status,
         **totals,
     }
 
