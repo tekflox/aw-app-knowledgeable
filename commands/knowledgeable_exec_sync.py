@@ -12,6 +12,7 @@ Usage:
     aw-workspace-cli knowledgeable-exec-sync status               # sentinel + staleness + counts
     aw-workspace-cli knowledgeable-exec-sync reconcile            # SQL vs graph count table
     aw-workspace-cli knowledgeable-exec-sync retention [--days N] # the args_text valve
+    aw-workspace-cli knowledgeable-exec-sync purge-secret-args    # §13.2 secret-tool purge
 
 Exit codes for `run`: 0 progressed or nothing to do, 1 the tick was blocked —
 the flag is off, no DSN, no source tenant, no service secret, another tick in
@@ -32,6 +33,15 @@ outside the loaded window creates no edge by design), whereas a missing
 `ExecToolCall.args_text` older than 180 days. The text is rebuildable from
 Postgres at any time (Postgres is the system of record), so this is a cache
 eviction — but it is also irreversible in the graph until a re-backfill.
+
+`purge-secret-args` is §13.2's remediation: it nulls `args_text` on every
+`ExecToolCall` whose name's terminal segment is a secret-store tool, however
+the gateway spelled the prefix. It exists because the drop used to be an
+exact match on the bare name and therefore never fired for a real
+MCP-routed call, so prefixed `write_secret` arguments — vault-only values,
+which are both unmatchable by the exact pass and shapeless to the pattern
+pass — landed in the graph. Idempotent, and all zeroes once it has run; run
+it again after adding a name to `SECRET_TOOL_NAMES`.
 """
 from __future__ import annotations
 
@@ -114,6 +124,17 @@ def run(args: list[str] | None = None) -> int:
         print(json.dumps(body, indent=2))
         if not body.get("ok"):
             print(f"retention: {body.get('error')}", file=sys.stderr)
+            return 1
+        return 0
+
+    if sub == "purge-secret-args":
+        status, body = local_client.request("POST", f"{_BASE}/purge-secret-args", {})
+        if status != 200:
+            print(f"purge-secret-args failed: HTTP {status} {body}", file=sys.stderr)
+            return 1
+        print(json.dumps(body, indent=2))
+        if not body.get("ok"):
+            print(f"purge-secret-args: {body.get('error')}", file=sys.stderr)
             return 1
         return 0
 

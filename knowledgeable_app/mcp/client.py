@@ -557,6 +557,14 @@ async def post_exec_retention(days: int | None = None) -> tuple[dict | None, str
     return await _post_json("/api/exec/retention", {"days": days} if days is not None else {})
 
 
+async def post_exec_purge_secret_args() -> tuple[dict | None, str | None]:
+    """POST /api/exec/purge-secret-args — §13.2's purge. Nulls `args_text` on
+    every already-landed secret-tool call, matched on the name's terminal
+    segment. Idempotent; all zeroes once it has run. Takes no body: the
+    predicate is the server's own `SECRET_TOOL_NAMES`."""
+    return await _post_json("/api/exec/purge-secret-args", {})
+
+
 # ---------------------------------------------------------------------------
 # §9 step 4 — the two agent-facing MCP tools named in the design doc
 # (`search_execution_graph`, `exec_run_detail`), over the search/detail

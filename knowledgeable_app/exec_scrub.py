@@ -83,6 +83,49 @@ SECRET_TOOL_NAMES = frozenset(
     }
 )
 
+
+def tool_name_segment(name: str | None) -> str:
+    """A tool's identity is its TERMINAL SEGMENT — the substring after the
+    last ``__`` or ``.``
+    (docs/design/execution-history-in-production-neo4j.md §13.2).
+
+    **This function exists because the exact match it replaced never fired
+    in production.** `SECRET_TOOL_NAMES` held bare names and the drop was
+    `if name in SECRET_TOOL_NAMES`, but a real MCP-routed call arrives
+    gateway-prefixed, in at least three measured spellings:
+
+    * ``mcp__aw-gateway__aw__aw_secrets__write_secret``
+    * ``aw-gateway.aw__aw_secrets__write_secret``
+    * ``mcp__workspace-gateway__aw__aw_secrets__write_secret``
+
+    So prefixed ``write_secret`` arguments reached the graph, and because
+    `write_secret` writes to the VAULT the values were vault-only (no exact
+    match — see the module docstring's §6 point 1 qualification) and
+    shapeless (no pattern). Three independent defences, all missed, on the
+    one channel that is a credential by definition. Found live in the
+    production graph, not theorised.
+
+    Two ``rsplit`` passes rather than one ``rfind``, because either
+    separator can be the last one: the first pass leaves no ``__`` behind,
+    so the second lands on the last ``.`` in what remains. The result is the
+    text after the last occurrence of either separator.
+    """
+    if not name:
+        return ""
+    return name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+
+
+def is_secret_tool(name: str | None) -> bool:
+    """Whether ``name`` identifies a secret-handling tool.
+
+    Segment EQUALITY, never ``name.endswith(bare)``: the sloppy form matches
+    a hypothetical ``spread_secret`` or ``misread_secret`` and would drop the
+    arguments of a tool that has nothing to do with the secret store —
+    over-correcting the exact-match bug into a different wrong answer. A
+    name is a secret tool iff its terminal segment IS one of the four.
+    """
+    return tool_name_segment(name) in SECRET_TOOL_NAMES
+
 #: The shortest secret-store value this module will exact-match on.
 #:
 #: The trade this number makes, in both directions, because getting it wrong
@@ -512,7 +555,11 @@ class Scrubber:
     def scrub_tool_args(self, *, name: str | None, args_text: Any) -> Any:
         """§6 point 3 — a secret-handling tool's arguments are dropped
         wholesale, not scrubbed. Everything else goes through
-        :meth:`scrub`."""
-        if name in SECRET_TOOL_NAMES:
+        :meth:`scrub`.
+
+        Matched on the name's terminal segment (`is_secret_tool`), because
+        the exact match this replaced never fired for the gateway-prefixed
+        spellings every real call carries (§13.2)."""
+        if is_secret_tool(name):
             return None
         return self.scrub(args_text)

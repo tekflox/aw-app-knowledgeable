@@ -453,6 +453,96 @@ def test_secret_tool_arguments_are_dropped_wholesale(name):
     assert _scrubber().scrub_tool_args(name=name, args_text=args) is None
 
 
+#: The gateway prefixes measured in the production graph, 2026-10-19, via
+#: `search_execution_graph(search_in='name')` — the three real spellings the
+#: old `if name in SECRET_TOOL_NAMES` silently failed to match. Pinned as
+#: data rather than prose: a fourth spelling appearing is a one-line change
+#: here, and the row that proves the fix covers it.
+_MEASURED_PREFIXES = (
+    "mcp__aw-gateway__aw__aw_secrets__",
+    "aw-gateway.aw__aw_secrets__",
+    "mcp__workspace-gateway__aw__aw_secrets__",
+)
+
+
+@pytest.mark.parametrize("prefix", _MEASURED_PREFIXES)
+@pytest.mark.parametrize("bare", sorted(exec_scrub.SECRET_TOOL_NAMES))
+def test_a_gateway_prefixed_secret_tool_is_dropped_too(prefix, bare):
+    """**§13.2 — the hole this test exists for was live, not hypothetical.**
+
+    The drop was `if name in SECRET_TOOL_NAMES`, an exact match on the BARE
+    name, and every real MCP-routed call arrives prefixed. So prefixed
+    `write_secret` arguments landed in the production graph with `args_text`
+    intact — and because `write_secret` writes to the VAULT, those values
+    were vault-only (the exact pass cannot see them, §6 point 1) and
+    shapeless (no pattern fires). Three defences, all missed, on the one
+    channel whose arguments are a credential by definition.
+
+    MUTATION: restore `if name in SECRET_TOOL_NAMES` in `scrub_tool_args`
+    and all 12 of these go red while the bare-name test above stays green —
+    which is exactly how the bug shipped.
+    """
+    args = '{"name": "invented_token_name", "value": "invented-value-that-must-not-land"}'
+    assert _scrubber().scrub_tool_args(name=prefix + bare, args_text=args) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "spread_secret",
+        "misread_secret",
+        "mcp__aw-gateway__aw__aw_secrets__spread_secret",
+        "aw-gateway.aw__misread_secret",
+        "unwrite_secret",
+        "precollect_secret",
+        "undelete_secret",
+    ],
+)
+def test_a_tool_whose_name_merely_ends_with_a_secret_tool_is_not_dropped(name):
+    """The rule is terminal-segment EQUALITY, not `endswith` on the bare
+    name — `spread_secret` ends with `read_secret` and has nothing to do
+    with the secret store.
+
+    This is the other half of the fix, and it is not pedantry: dropping the
+    arguments of an unrelated tool destroys retrieval value silently, and
+    the §13.2 lesson ("a tool's identity is its terminal segment") is a
+    statement about identity in both directions. The sloppy
+    `name.endswith(bare)` form passes every test above and fails every one
+    here.
+
+    MUTATION: change `is_secret_tool` to
+    `any(name.endswith(b) for b in SECRET_TOOL_NAMES)` -> red here, green
+    everywhere else.
+    """
+    args = '{"command": "echo hello"}'
+    out = _scrubber().scrub_tool_args(name=name, args_text=args)
+    assert out is not None, f"{name} is not a secret-store tool — its args must be kept"
+    assert "echo hello" in out
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("write_secret", "write_secret"),
+        ("mcp__aw-gateway__aw__aw_secrets__write_secret", "write_secret"),
+        ("aw-gateway.aw__aw_secrets__write_secret", "write_secret"),
+        ("mcp__workspace-gateway__aw__aw_secrets__write_secret", "write_secret"),
+        # Either separator can be the last one, in either order — the two
+        # rsplit passes have to land after whichever came last.
+        ("mcp__gw__aw.read_secret", "read_secret"),
+        ("a.b__c.delete_secret", "delete_secret"),
+        ("a__b.c__collect_secret", "collect_secret"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_tool_name_segment_is_the_text_after_the_last_separator(name, expected):
+    """The helper on its own, because `scrub_tool_args` can only show it
+    through a boolean and a wrong segment that happens not to be in the set
+    looks identical to a right one."""
+    assert exec_scrub.tool_name_segment(name) == expected
+
+
 def test_ordinary_tool_arguments_are_scrubbed_not_dropped():
     """The drop must not spread: a `Bash` call's arguments are most of the
     measurement's retrieval value, so they are scrubbed and kept."""

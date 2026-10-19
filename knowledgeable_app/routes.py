@@ -483,6 +483,15 @@ def build_routes(ctx) -> FastAPI:
         result, err = await client.post_exec_retention(None if days is None else int(days))
         return {"ok": err is None, "error": err, "result": result}
 
+    @app.post("/exec-sync/purge-secret-args", dependencies=[Depends(_require_identity)])
+    async def exec_sync_purge_secret_args() -> dict:
+        """§13.2's purge trigger — nulls `args_text` on every already-landed
+        secret-tool call. Remediation for the rows that landed while the
+        drop was an exact match on the bare name and therefore never fired
+        for a gateway-prefixed call. Idempotent."""
+        result, err = await client.post_exec_purge_secret_args()
+        return {"ok": err is None, "error": err, "result": result}
+
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.
     # ------------------------------------------------------------------
