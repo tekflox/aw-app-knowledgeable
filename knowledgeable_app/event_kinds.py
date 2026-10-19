@@ -37,11 +37,12 @@ the hard way, carried over deliberately:
 * ``shipped`` says whether THIS release projects it as an `ExecEvent` — a
   judgement about slices.
 
-Keeping them separate is what makes a row like `thinking` readable: verdict
-``text``, shipped ``False``, reason "slice 2". It is reviewed, the verdict is
-recorded, and it is still not crossing yet. Folding the two into one flag
-would make "nobody looked" and "looked, decided, not yet" indistinguishable
-— and an unreviewed kind must never be able to hide behind a row that exists.
+Keeping them separate is what makes a row like `tool_result` readable:
+verdict ``text``, shipped ``False``, reason "slice 3". It is reviewed, the
+verdict is recorded, and it is still not crossing yet. Folding the two into
+one flag would make "nobody looked" and "looked, decided, not yet"
+indistinguishable — and an unreviewed kind must never be able to hide behind
+a row that exists.
 
 **No `payload_json` catch-all, anywhere** (§13.3 / §13.10). Only the fields
 named in a row cross the seam. The scenario this is for is concrete and was
@@ -323,37 +324,38 @@ EVENT_KIND_REGISTRY: dict[str, EventKind] = {
         fields={"timeout_s": "timeout_s"},
         reason="Runner CLI hit its own timeout. Measured payload: {timeout_s}.",
     ),
-    # ---- reviewed, with a verdict, NOT shipped by this slice --------------
+    # ---- slice 2: the text kinds -----------------------------------------
     "thinking": EventKind(
         verdict="text",
-        shipped=False,
+        shipped=True,
         text_field="text",
         reason=(
-            "SLICE 2. Reasoning text, scrubbed. Reviewed and NOT credential-free: "
-            "a model can restate a secret it just read, and the earlier claim to "
-            "the contrary was wrong and is corrected on the card. §13.3 decided "
-            "against a per-run drop for runs that touched a secret tool, with "
-            "grounds and a reopen condition — the by-definition channels (a "
-            "secret tool's args and its result) are dropped wholesale, so what "
-            "remains is a restatement risk that `output_text` has carried since "
-            "v1. Sparse: 8,349 events over ~27% of runs."
+            "SLICE 2 — SHIPPED. Reasoning text, scrubbed. Reviewed and NOT "
+            "credential-free: a model can restate a secret it just read, and the "
+            "earlier claim to the contrary was wrong and is corrected on the "
+            "card. §13.3 decided against a per-run drop for runs that touched a "
+            "secret tool, with grounds and a reopen condition — the by-definition "
+            "channels (a secret tool's args and its result) are dropped "
+            "wholesale, so what remains is a restatement risk that `output_text` "
+            "has carried since v1. Sparse: 8,349 events over ~27% of runs."
         ),
     ),
     "node_end": EventKind(
         verdict="text",
-        shipped=False,
+        shipped=True,
         text_field="text",
         fields={"tokens_in": "tokens_in", "tokens_out": "tokens_out", "cost_usd": "cost_usd"},
         reason=(
-            "SLICE 2, and the trap §13.12 point 3 names: the NAME lies. This is "
-            "not lifecycle metadata — the measured payload is {text, tokens_in, "
-            "tokens_out, cost_usd, run_id} and `text` is the node's final OUTPUT. "
-            "Classified by measurement, not by name. Shipping it in slice 1 "
-            "would have projected unscrubbed-class output text through the "
-            "structured path, which is the single most expensive mistake "
-            "available in this registry."
+            "SLICE 2 — SHIPPED, and the trap §13.12 point 3 names: the NAME "
+            "lies. This is not lifecycle metadata — the measured payload is "
+            "{text, tokens_in, tokens_out, cost_usd, run_id} and `text` is the "
+            "node's final OUTPUT. Classified by measurement, not by name. "
+            "Shipping it in slice 1 would have projected unscrubbed-class "
+            "output text through the structured path, which is the single most "
+            "expensive mistake available in this registry."
         ),
     ),
+    # ---- reviewed, with a verdict, NOT shipped by this slice --------------
     "tool_call": EventKind(
         verdict="structured",
         shipped=False,

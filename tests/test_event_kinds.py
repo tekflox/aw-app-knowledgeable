@@ -144,10 +144,10 @@ def test_every_measured_kind_has_a_registry_row():
     )
 
 
-def test_the_shipped_set_is_exactly_slice_1():
-    """Pinned by name. Slice 2 flips `thinking`/`node_end`, slice 3 adds
-    `tool_result` on another label — each a deliberate edit here plus its own
-    scrub test, never a widening nothing pinned."""
+def test_the_shipped_set_is_exactly_slice_2():
+    """Pinned by name. Slice 2 flips `thinking`/`node_end` to shipped (this
+    change); slice 3 adds `tool_result` on another label — each a deliberate
+    edit here plus its own scrub test, never a widening nothing pinned."""
     assert event_kinds.shipped_kinds() == (
         "auto_compact.blind",
         "auto_compact.ineffective",
@@ -160,8 +160,10 @@ def test_the_shipped_set_is_exactly_slice_1():
         "error",
         "finalizing",
         "log",
+        "node_end",
         "node_start",
         "system.init",
+        "thinking",
     )
 
 
@@ -276,7 +278,8 @@ def test_cap_text_leaves_short_text_alone():
     assert event_kinds.cap_text(None) == (None, None, None)
 
 
-def test_a_planted_credential_straddling_the_cap_is_still_redacted():
+@pytest.mark.parametrize("kind,text_field", [("error", "error"), ("thinking", "text"), ("node_end", "text")])
+def test_a_planted_credential_straddling_the_cap_is_still_redacted(kind, text_field):
     """§13.12 point 6, as a test rather than a comment: the build path scrubs
     and THEN caps, so a credential lying ACROSS the cut cannot be bisected
     into a fragment that both passes then miss.
@@ -307,8 +310,13 @@ def test_a_planted_credential_straddling_the_cap_is_still_redacted():
     `cap_text(scrubber.scrub(...))` to `scrubber.scrub(cap_text(...))` in
     `build_event_row` turns exactly this test red.
 
-    This matters most for slice 3: `tool_result` text routinely exceeds the
-    cap, so the boundary is where that slice's credentials will actually sit.
+    Parametrised over `error` (slice 1, the original find) plus `thinking`
+    and `node_end` (slice 2, this change) — the exact same straddle pattern,
+    reused rather than re-derived, per the Architect's instruction that the
+    cap-then-scrub bug is a property of `build_event_row` itself and not of
+    any one kind. This matters most for slice 3: `tool_result` text
+    routinely exceeds the cap, so the boundary is where that slice's
+    credentials will actually sit.
     """
     # Half the value before the cut, half after it.
     straddle = len(PLANTED_STORE_SECRET) // 2
@@ -317,8 +325,8 @@ def test_a_planted_credential_straddling_the_cap_is_still_redacted():
     # redaction marker is shorter than the value it replaces — otherwise the
     # correct order would not truncate at all and the two orders would again
     # be indistinguishable.
-    payload = {"error": f"{padding}{PLANTED_STORE_SECRET}{'t' * 100}"}
-    row, dropped = exec_sync.build_event_row(_record("error", payload), _scrubber())
+    payload = {text_field: f"{padding}{PLANTED_STORE_SECRET}{'t' * 100}"}
+    row, dropped = exec_sync.build_event_row(_record(kind, payload), _scrubber())
     assert dropped == 0
 
     fragment = PLANTED_STORE_SECRET[:straddle]
@@ -332,6 +340,36 @@ def test_a_planted_credential_straddling_the_cap_is_still_redacted():
     assert row["text_truncated"] is True
     assert row["text_len"] > event_kinds.EVENT_TEXT_MAX
     assert len(row["text"]) == event_kinds.EVENT_TEXT_MAX
+
+
+def test_documented_residual_vault_style_shapeless_secret_survives_in_thinking():
+    """§13.3's stated residual, honestly demonstrated rather than papered over.
+
+    `exec_scrub.py`'s own docstring: the Scrubber's exact-match pass reads
+    the per-app FILE secret store only. aw-vault (written by `write_secret`)
+    is a second store this module never reads — its read path is
+    approval-gated by design. So a vault-only credential that ALSO has no
+    recognisable shape is caught by neither pass, for `thinking` exactly as
+    for every other text kind. §13.3 decided to ship `thinking` anyway, on
+    the strength of an equivalence argument (§13.5), not a claim of complete
+    coverage — this test proves the limitation it accepted rather than
+    pretending it doesn't exist.
+
+    If a future change starts catching this shape, this test goes red: that
+    is the intended signal. Update it and say so plainly — do not delete it.
+    """
+    # Invented, shapeless (no pattern family matches it), and deliberately
+    # NOT in `_scrubber()`'s exact-match table — standing in for a secret
+    # that lives only in the vault, which this Scrubber cannot see.
+    shapeless = "zq9mxk2vtr8qln4"
+    payload = {"text": f"the value I just read was {shapeless}, noting it for later"}
+    row, dropped = exec_sync.build_event_row(_record("thinking", payload), _scrubber())
+    assert dropped == 0
+    assert shapeless in row["text"], (
+        "a shapeless, vault-only-style secret survived scrubbing — this IS the "
+        "documented §13.3 residual, not a regression; if this now fails, the "
+        "residual has shrunk and the comment above should be updated to say so"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +399,36 @@ _PLANTED_TEXT_SHAPES = {
         "secret-store": f"booting worker with {PLANTED_STORE_SECRET}",
         "env-assignment": "exporting PGPASSWORD=invented-event-test-pg",
         "url-userinfo": "syncing from redis://:invented-event-test-redis@aw-redis:6379/0",
+    },
+    # Slice 2 — §13.3's restatement risk: a model can restate a secret it
+    # just read, so `thinking` gets the same shape coverage as `error`.
+    "thinking": {
+        "secret-store": f"I should remember this value: {PLANTED_STORE_SECRET}",
+        "url-userinfo": (
+            "let me connect via bolt://neo4j:invented-thinking-test-pw@"
+            "aw-stack-aw-neo4j-1:7687 first"
+        ),
+        "env-assignment": "the env had NEO4J_AUTH=neo4j/invented-thinking-test-pw set",
+        "credential-field": (
+            'the response looked like {"api_key": "invented-thinking-test-key"}'
+        ),
+        "authorization-header": (
+            "the failing request sent Authorization: Bearer invented.thinking.test.token"
+        ),
+    },
+    # Slice 2 — §13.12 point 3: `node_end.text` is the node's final OUTPUT,
+    # the same restatement-risk class `output_text` already carries.
+    "node_end": {
+        "secret-store": f"final answer: authenticated with {PLANTED_STORE_SECRET}",
+        "url-userinfo": (
+            "wrote the result to bolt://neo4j:invented-nodeend-test-pw@"
+            "aw-stack-aw-neo4j-1:7687"
+        ),
+        "env-assignment": "set NEO4J_AUTH=neo4j/invented-nodeend-test-pw in the output",
+        "credential-field": 'returned {"token": "invented-nodeend-test-token"}',
+        "authorization-header": (
+            "sent Authorization: Bearer invented.nodeend.test.token to finish"
+        ),
     },
 }
 
@@ -406,6 +474,12 @@ def test_a_planted_credential_in_event_text_is_redacted(kind, family):
         "invented.event.test.token",
         "invented-event-test-pg",
         "invented-event-test-redis",
+        "invented-thinking-test-pw",
+        "invented-thinking-test-key",
+        "invented.thinking.test.token",
+        "invented-nodeend-test-pw",
+        "invented-nodeend-test-token",
+        "invented.nodeend.test.token",
     ):
         assert leaked not in row["text"], (
             f"{kind}/{family}: {leaked!r} survived into {row['text']!r}"
@@ -470,13 +544,39 @@ def test_an_unshipped_or_unregistered_kind_projects_nothing_but_identity():
     """The defensive branch. `SQL_EVENTS` cannot return these — it binds the
     registry's shipped set — so this is about a hand-built row: it projects
     identity and NO payload-derived property, rather than guessing a shape.
-    `node_end` is the one that matters: its `text` is the node's final
-    output, and leaking it a slice early is §13.12 point 3's named trap."""
-    for kind in ("node_end", "thinking", "llm_token", "some.kind.invented.next.year"):
+    `tool_result` is the one that matters now that `node_end`/`thinking`
+    shipped in slice 2: it has a `text_field` too (slice 3), and leaking its
+    text a slice early is the same §13.12 point 3 trap, one kind over."""
+    for kind in ("tool_call", "tool_result", "llm_token", "some.kind.invented.next.year"):
         payload = SAMPLED_PAYLOADS.get(kind, {"anything": "at all"})
         row, dropped = exec_sync.build_event_row(_record(kind, payload), _scrubber())
         assert set(row) == {"id", "run_id", "kind", "ts", "node_id"}, f"{kind}: {sorted(row)}"
         assert dropped == 0
+
+
+def test_shipped_gate_gatekeeps_text_field_not_just_verdict():
+    """§13.12 point 2 as the Architect restated it for this slice:
+    `build_event_row` only honours a registry row's `text_field` when
+    `shipped` is True — that condition is load-bearing, not symmetry.
+    Flipping `thinking`/`node_end` to `shipped=True` must make their text
+    actually flow, and `tool_result` — same verdict, same shape, still
+    `shipped=False` (slice 3) — must still get none through the identical
+    function."""
+    for kind in ("thinking", "node_end"):
+        spec = event_kinds.EVENT_KIND_REGISTRY[kind]
+        assert spec.shipped is True, f"{kind}: slice 2 must flip shipped=True"
+        row, dropped = exec_sync.build_event_row(
+            _record(kind, SAMPLED_PAYLOADS[kind]), _scrubber()
+        )
+        assert dropped == 0
+        assert row.get("text"), f"{kind}: text did not flow despite shipped=True"
+
+    assert event_kinds.EVENT_KIND_REGISTRY["tool_result"].shipped is False
+    row, dropped = exec_sync.build_event_row(
+        _record("tool_result", SAMPLED_PAYLOADS["tool_result"]), _scrubber()
+    )
+    assert "text" not in row, "tool_result is shipped=False — its text must not land yet"
+    assert dropped == 0
 
 
 def test_nul_bytes_are_stripped_from_event_text_and_properties():
