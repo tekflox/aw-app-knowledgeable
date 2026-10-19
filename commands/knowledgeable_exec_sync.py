@@ -30,10 +30,13 @@ drift: a `CHILD_OF`/`QA_OF` mismatch is often correct behaviour (an endpoint
 outside the loaded window creates no edge by design), whereas a missing
 `ExecToolCall` is a batch that failed.
 
-`retention` is §8's disk valve, not a schedule to run casually: it nulls
-`ExecToolCall.args_text` older than 180 days. The text is rebuildable from
-Postgres at any time (Postgres is the system of record), so this is a cache
-eviction — but it is also irreversible in the graph until a re-backfill.
+`retention` is §8's disk valve, not a schedule to run casually. It nulls
+three properties older than 180 days — `ExecToolCall.args_text`,
+`ExecToolCall.result_text` and `ExecEvent.text` (§13.7's three arms) — and
+reports a per-property count, because "it trimmed 412 rows" is not a number
+anyone can go and re-measure. All three are rebuildable from Postgres at any
+time (Postgres is the system of record), so this is a cache eviction — but
+it is also irreversible in the graph until a re-backfill.
 
 `reset-watermark` is §13.8's per-slice backfill trigger: it clears the
 freshness watermark so the next bounded ticks re-read every run from the
@@ -42,8 +45,21 @@ runs that were already synced. Nothing is deleted and nothing can be lost —
 every statement behind the ingest route is a MERGE, so a re-read is free
 while a skip is permanent. What it costs is TICKS: ~14 bounded passes over
 ~28k runs, sharing the single production worker with live search, so run it
-off-hours and never from a scheduled task. After it, call `run` repeatedly
-until `runs` comes back 0 / "no runs due".
+off-hours and never from a scheduled task.
+
+It also carries §13.7's DISK PREFLIGHT and will refuse below 25 GB free on
+the host, naming the numbers: slice 3's backfill adds ~0.8-1.2 GB of store
+plus Lucene index on a host measured at 92% used, and the nightly Neo4j dump
+needs room of its own. The preflight gates the BACKFILL only — the
+10-minute tick is never blocked by it, because stopping the live projection
+would trade bounded growth for silent staleness. If it refuses, run
+`retention` first.
+
+After a reset, call `run` repeatedly until the WATERMARK REACHES THE PRESENT
+— not until `runs` comes back 0. In steady state the watermark oscillates
+between two timestamps minutes apart (the 48 h re-sweep re-selecting a
+non-terminal run below the frontier), so with any run in flight "0 runs due"
+never arrives and is not the drain signal. Measured on slices 1 and 2 both.
 
 `purge-secret-args` is §13.2's remediation: it nulls `args_text` on every
 `ExecToolCall` whose name's terminal segment is a secret-store tool, however

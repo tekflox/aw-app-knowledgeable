@@ -89,6 +89,103 @@ MAX_RUNS_PER_TICK = 2_000
 #: Fetched this many runs at a time from the server-side cursor.
 _CURSOR_ITERSIZE = 200
 
+#: §13.7's disk preflight: the backfill refuses to START below this much
+#: free space on the host filesystem, and says why.
+#:
+#: Why 25 GB and why this is the feature's own guard rather than a platform
+#: problem to wait on: the host measured 92 % used / 36 GB free on
+#: 2026-10-19 — already AT §8's retention tripwire line, before this feature
+#: added a byte — and slice 3's backfill adds ~0.8–1.2 GB of store plus
+#: Lucene. §13.10 rejected blocking the cheap slices on that trajectory
+#: (scope-shrinking by stealth, on a problem this feature did not create),
+#: so the expensive one carries the preflight instead. The 11 GB of headroom
+#: between the floor and today's free space is the room a ~1 GB backfill
+#: plus the nightly dump need, not a round number.
+#:
+#: **It gates the BACKFILL, not the 10-minute tick**, and that asymmetry is
+#: deliberate: refusing ordinary ticks would stop the live projection
+#: entirely the day the host crosses a line this feature cannot move, which
+#: trades a bounded growth problem for a silent-staleness one. Steady-state
+#: growth is bounded by the retention valve (§13.7); the one-off ~1 GB burst
+#: is what needs a floor under it.
+MIN_FREE_DISK_GB = 25
+
+#: Where free space is measured. The workspace tree is host-mounted
+#: (`AW_WORKSPACE_HOME` in the Dockerfile), so `statvfs` on it reports the
+#: HOST filesystem's figures — which is what §13.7's number is about. Not
+#: `/` (a container overlay in some topologies here) and not the Neo4j data
+#: dir, which this process cannot see at all: it never speaks Bolt and has
+#: no mount into that container (§4).
+_DISK_PROBE_PATH = "/opt/aw-workspace"
+
+
+def free_disk_bytes(path: str | None = None) -> tuple[int | None, str | None]:
+    """``(free_bytes, error)`` for the host filesystem (see
+    `_DISK_PROBE_PATH`).
+
+    Returns the error rather than raising, and the caller REFUSES on it
+    (`disk_preflight` below) instead of proceeding: "I could not measure the
+    disk" must not read like "the disk is fine", which is this estate's named
+    failure mode and the whole reason §13.7 asked for a preflight at all.
+    """
+    import os  # noqa: PLC0415
+
+    try:
+        stat = os.statvfs(path or _DISK_PROBE_PATH)
+    except OSError as exc:
+        return None, f"could not measure free disk space: {type(exc).__name__}"
+    return stat.f_bavail * stat.f_frsize, None
+
+
+def disk_preflight(
+    free_bytes: int | None,
+    error: str | None = None,
+    *,
+    min_free_gb: int = MIN_FREE_DISK_GB,
+) -> dict:
+    """§13.7's preflight verdict, as data: ``{ok, free_gb, min_free_gb,
+    reason}``.
+
+    Pure, and takes the measurement as an argument rather than taking it
+    itself, so the low-disk case is exercised by a TEST with an invented
+    number instead of by filling a production host — which is the only
+    honest way to prove a guard whose trigger condition is a disaster.
+
+    `ok` is False when the measurement failed, not just when it came back
+    low. `reason` always says the actual numbers: a refusal that does not
+    tell an operator how much is free and how much is needed sends them to
+    `df` to find out whether to believe it.
+    """
+    min_bytes = min_free_gb * 1024**3
+    if error or free_bytes is None:
+        return {
+            "ok": False,
+            "free_gb": None,
+            "min_free_gb": min_free_gb,
+            "reason": (
+                f"{error or 'free disk space is unknown'} — refusing to start a "
+                f"backfill that adds ~1 GB without knowing whether there is room "
+                f"for it (§13.7)"
+            ),
+        }
+    free_gb = round(free_bytes / 1024**3, 1)
+    if free_bytes < min_bytes:
+        return {
+            "ok": False,
+            "free_gb": free_gb,
+            "min_free_gb": min_free_gb,
+            "reason": (
+                f"only {free_gb} GB free on the host, below the {min_free_gb} GB "
+                f"floor — §13 slice 3's backfill adds ~0.8-1.2 GB of store plus "
+                f"Lucene index, and the nightly Neo4j dump needs room of its own. "
+                f"Free space first (the retention valve, "
+                f"`knowledgeable-exec-sync retention`, is the one this feature "
+                f"owns), then reset the watermark again. The 10-minute tick is "
+                f"NOT blocked by this — only the backfill is"
+            ),
+        }
+    return {"ok": True, "free_gb": free_gb, "min_free_gb": min_free_gb, "reason": None}
+
 
 def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
     return {
@@ -97,6 +194,11 @@ def _empty_result(blocked: bool, reason: str | None = None, **extra) -> dict:
         "runs": 0,
         "tool_calls": 0,
         "events": 0,
+        # §13 slice 3 — present and zero on a blocked/quiet tick rather than
+        # absent, so a caller reading `orphan_results` never has to tell a
+        # missing key from a clean pass.
+        "tool_results": 0,
+        "orphan_results": 0,
         "batches": 0,
         "watermark": None,
         **extra,
@@ -174,6 +276,35 @@ SQL_TOOL_CALLS = """
            row_number() OVER (PARTITION BY e.run_id ORDER BY e.ts, e.id) AS seq
     FROM run_events e
     WHERE e.kind = 'tool_call' AND e.run_id = ANY(%(run_ids)s)
+    ORDER BY e.run_id, e.ts, e.id
+"""
+
+#: §13 slice 3 — the tool RESULTS for the same batch of run ids, paired
+#: client-side onto the tool calls `SQL_TOOL_CALLS` just fetched.
+#:
+#: `SQL_TOOL_CALLS`' shape, deliberately, down to the raw `payload` (§13.12
+#: point 5 — `run_events.payload` is `json`, not `jsonb`, and holds literal
+#: `\\u0000`, so no server-side extraction of any kind is usable; psycopg
+#: parses it client-side and `_clean` strips the NULs). `kind` is a plain
+#: varchar so filtering on it server-side is safe, exactly as the tool-call
+#: query already does.
+#:
+#: What this query does NOT have, and must not grow: a `row_number()`
+#: window. `ExecToolCall`'s identity is `run_id:seq` where `seq` is the
+#: tool_call row's ordinal — a result's own ordinal among RESULTS is a
+#: different number, and a batch where a call did not return (measured:
+#: ~500 of 308k) would silently shift every subsequent pairing by one. The
+#: pairing key is the payload's `tool_use_id`, nothing positional (§13.12
+#: point 2).
+#:
+#: Fetched per batch rather than in one sweep, same as the calls, because
+#: the pairing has to happen within one run's rows in one batch — the ingest
+#: route refuses a tool call whose run is not in the same request, so the
+#: result has nowhere else to land.
+SQL_TOOL_RESULTS = """
+    SELECT e.run_id, e.payload, e.ts
+    FROM run_events e
+    WHERE e.kind = %(kind)s AND e.run_id = ANY(%(run_ids)s)
     ORDER BY e.run_id, e.ts, e.id
 """
 
@@ -420,6 +551,91 @@ def build_toolcall_row(
         "args_text": exec_policy.apply_call_axis(policy.decide(name), args_text),
         "ts": _iso(ts),
     }
+
+
+def toolcall_use_id(record) -> str | None:
+    """A tool_call row's PAIRING key — ``payload["id"]`` (§13.12 point 2).
+
+    Its own one-line function, called from the same place that builds the
+    row, because the whole hazard in slice 3 is that the two sides of the
+    join are spelled differently: a `tool_call` keys its id as **`id`** and
+    a `tool_result` keys the same value as **`tool_use_id`**. Reading both
+    out of the payload inline, 60 lines apart, is how one of them silently
+    becomes the wrong key and the pairing quietly produces zero matches —
+    which would look exactly like "results are not in Postgres yet".
+
+    NOT `ExecToolCall.id` (`run_id:seq`): that is the graph identity, minted
+    server-side from the ordinal. This is the upstream correlation id, and
+    the two are unrelated strings.
+    """
+    _run_id, payload, _ts, _seq = record
+    payload = payload if isinstance(payload, dict) else {}
+    value = _clean(payload.get("id"))
+    return str(value) if value else None
+
+
+def attach_results(
+    index: dict[tuple[str, str], dict],
+    result_records,
+    scrubber: exec_scrub.Scrubber,
+) -> int:
+    """Join `tool_result` rows onto the `ExecToolCall` rows they belong to,
+    in place. Returns the count of UNPAIRED results (§13.3's
+    ``orphan_results``).
+
+    `index` is keyed `(run_id, tool_use_id)` — scoped per run and not by the
+    bare `tool_use_id`, because nothing upstream promises that id is unique
+    across runs and a collision would attach one run's output to another
+    run's call. Pure apart from the mutation of `index`'s own row dicts, so
+    the pairing is testable with no database.
+
+    The orderings here are the same two scars `build_event_row` records, and
+    both are properties of THIS function now as well:
+
+    * **Drop before scrub, scrub before cap.** A secret tool's result is the
+      credential itself (§13.2's closing paragraph), so it never reaches the
+      scrubber at all; everything else is scrubbed and only then truncated
+      (§13.12 point 6 — a cap applied first can bisect a secret, hiding it
+      from both passes while leaving the surviving half greppable). This cap
+      is not theoretical for this kind: the measured `tool_result` maximum
+      is 20.7 KB against a 16,384 ceiling.
+    * **`_clean` every string.** The NUL is legal in the client-side-parsed
+      payload and illegal as a Neo4j property, and it arrives when it
+      arrives.
+
+    An unpaired result is COUNTED and logged, never fatal and never silent
+    (§13.10 names "unpaired results stop being rare" as the condition that
+    reopens the separate-nodes decision, so the count has to be observable
+    or that condition can never be noticed). Measured ~500 of 308k: a call
+    that never returned, or a result whose call sits outside this batch.
+    """
+    spec = event_kinds.EVENT_KIND_REGISTRY.get(event_kinds.RESULT_KIND)
+    payload_key = (spec.text_field if spec else None) or "content"
+    orphans = 0
+    for record in result_records:
+        run_id, payload, ts = record
+        payload = payload if isinstance(payload, dict) else {}
+        use_id = _clean(payload.get("tool_use_id"))
+        row = index.get((run_id, str(use_id))) if use_id else None
+        if row is None:
+            orphans += 1
+            continue
+        text, length, truncated = event_kinds.cap_text(
+            scrubber.scrub_tool_result(
+                name=row.get("name"), result_text=_as_text(payload.get(payload_key))
+            ),
+            limit=event_kinds.RESULT_TEXT_MAX,
+        )
+        row["result_text"] = _clean(text)
+        row["result_len"] = length
+        row["result_truncated"] = truncated
+        row["result_ts"] = _iso(ts)
+        # Recorded on the row rather than inferred from a null `result_text`
+        # server-side: "dropped because this tool handles secrets" and "this
+        # call returned nothing we projected" are different facts, and the
+        # drop is the one somebody will eventually want to verify fired.
+        row["result_dropped"] = exec_scrub.is_secret_tool(row.get("name")) or None
+    return orphans
 
 
 def build_event_row(record, scrubber: exec_scrub.Scrubber) -> tuple[dict, int]:
@@ -686,6 +902,7 @@ def event_kinds_unreviewed(graph_status: dict | None) -> list[str]:
         return []
     return [str(k) for k in value]
 
+
 def policy_unresolved(graph_status: dict | None) -> list[str]:
     """The per-tool-policy alarm, read back off the freshness sentinel —
     exec-index-per-tool-policy.md §3.5, on the mechanism
@@ -708,7 +925,6 @@ def policy_unresolved(graph_status: dict | None) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(k) for k in value]
-
 
 
 def scrub_degraded(status: dict) -> bool:
@@ -851,12 +1067,35 @@ async def _run_tick_locked(
             "called": 0,
             "batches": 0,
             "event_fields_dropped": 0,
+            # §13 slice 3. `orphan_results` is the number §13.10 names as a
+            # reopen condition for the separate-nodes decision ("unpaired
+            # results stop being rare"), so it is counted on every tick and
+            # reported on the sentinel — a condition nobody can observe is
+            # not a condition.
+            "tool_results": 0,
+            "orphan_results": 0,
         }
         last_error = None
         aborted = False
         for batch in plan_batches(run_rows, batch_bytes=batch_bytes):
             run_ids = [r["id"] for r in batch]
-            toolcalls = _fetch_tool_calls(conn, run_ids, scrubber, policy)
+            toolcalls, call_index = _fetch_tool_calls(conn, run_ids, scrubber, policy)
+            # BEFORE `plan_posts`, not after: the results are attached onto
+            # the call rows, so the byte bound has to be computed with them
+            # already on there or a batch's real POST size is understated by
+            # exactly the thing that doubled it.
+            orphans = _fetch_tool_results(conn, run_ids, call_index, scrubber)
+            totals["orphan_results"] += orphans
+            totals["tool_results"] += sum(
+                1 for r in toolcalls if r.get("result_ts") is not None
+            )
+            if orphans:
+                log.warning(
+                    "exec sync: %d tool_result row(s) in this batch paired with no "
+                    "tool_call (no matching payload id within the batch's runs) — "
+                    "counted as orphan_results, not projected",
+                    orphans,
+                )
             events, dropped = _fetch_events(conn, run_ids, scrubber)
             totals["event_fields_dropped"] += dropped
             called = rollup_called(toolcalls)
@@ -948,11 +1187,54 @@ def _fetch_tool_calls(
     run_ids: list[str],
     scrubber: exec_scrub.Scrubber,
     policy: exec_policy.PolicyTable,
-) -> list[dict]:
+) -> tuple[list[dict], dict[tuple[str, str], dict]]:
+    """The batch's tool calls, plus the `(run_id, tool_use_id)` index
+    §13 slice 3's result pairing joins on.
+
+    The index holds the SAME dict objects as the list, not copies — that is
+    what lets `attach_results` set `result_text` on a row that is already in
+    the list about to be POSTed. A call whose payload carries no `id` is
+    simply absent from the index: it can never be paired, and its result
+    (if any) counts as an orphan, which is the honest outcome rather than a
+    guess at a positional match.
+    """
     cur = conn.cursor()
     try:
         cur.execute(SQL_TOOL_CALLS, {"run_ids": run_ids})
-        return [build_toolcall_row(record, scrubber, policy) for record in cur]
+        rows: list[dict] = []
+        index: dict[tuple[str, str], dict] = {}
+        for record in cur:
+            row = build_toolcall_row(record, scrubber, policy)
+            rows.append(row)
+            use_id = toolcall_use_id(record)
+            if use_id:
+                index[(row["run_id"], use_id)] = row
+        return rows, index
+    finally:
+        cur.close()
+
+
+def _fetch_tool_results(
+    conn,
+    run_ids: list[str],
+    index: dict[tuple[str, str], dict],
+    scrubber: exec_scrub.Scrubber,
+) -> int:
+    """§13 slice 3's results for one batch of runs, attached onto the calls
+    in `index`. Returns the unpaired count.
+
+    `kind` is bound from `event_kinds.RESULT_KIND` rather than written as a
+    literal in the SQL, so the query cannot select a kind the registry has
+    not verdicted — the same discipline `SQL_EVENTS` holds with
+    `shipped_kinds()`.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            SQL_TOOL_RESULTS,
+            {"kind": event_kinds.RESULT_KIND, "run_ids": run_ids},
+        )
+        return attach_results(index, cur, scrubber)
     finally:
         cur.close()
 

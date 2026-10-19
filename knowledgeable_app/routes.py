@@ -442,6 +442,17 @@ def build_routes(ctx) -> FastAPI:
         # line rather than from a future incident — which is the whole
         # mitigation for fail-closed resolution being silent otherwise.
         payload["policy_unresolved"] = exec_sync.policy_unresolved(remote)
+        # §13.7's disk preflight, reported here as well as enforced on
+        # `reset-watermark`: an operator about to run a backfill should be
+        # able to see the verdict BEFORE the route refuses them, and the
+        # trajectory (36 GB free and falling, on a host at 92 %) is worth
+        # being visible on the status surface rather than only at the moment
+        # it blocks something. Deliberately NOT folded into `degraded`
+        # below: low disk is a platform condition this feature did not
+        # create (§13.10), and a red doctor check for it would blame the
+        # sync for someone else's trajectory while telling nobody anything
+        # the host-disk card does not already say.
+        payload["disk"] = exec_sync.disk_preflight(*exec_sync.free_disk_bytes())
         # Degraded is computed on THIS side too, not only read off the
         # sentinel: a sentinel we cannot reach is itself degraded, and a
         # status surface that reports `None` for that reads as healthy.
@@ -520,13 +531,23 @@ def build_routes(ctx) -> FastAPI:
                     "source tenant and this route will not guess it"
                 ),
             }
+        # §13.7's disk preflight. This route IS "the backfill starts" — it is
+        # the only thing that makes the next ticks re-read ~28k runs and
+        # re-project every result — so this is where the floor belongs,
+        # rather than on the 10-minute tick (see `MIN_FREE_DISK_GB`: gating
+        # the tick would trade bounded growth for silent staleness). It
+        # refuses when the measurement FAILED too, not only when it came
+        # back low.
+        disk = exec_sync.disk_preflight(*exec_sync.free_disk_bytes())
+        if not disk["ok"]:
+            return {"ok": False, "error": disk["reason"], "disk": disk}
         ok, err = await client.put_exec_sync_state(
             source_tenant=cfg["source_tenant"],
             watermark=None,
             counts={},
             last_error="watermark reset for a §13.8 backfill",
         )
-        return {"ok": ok, "error": err, "watermark": None}
+        return {"ok": ok, "error": err, "watermark": None, "disk": disk}
 
     @app.post("/exec-sync/reconcile", dependencies=[Depends(_require_identity)])
     async def exec_sync_reconcile() -> dict:

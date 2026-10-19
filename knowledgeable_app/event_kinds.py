@@ -72,6 +72,27 @@ from dataclasses import dataclass, field
 #: a caller that forgot; two copies on purpose, same as `SECRET_TOOL_NAMES`.
 EVENT_TEXT_MAX = 16_384
 
+#: §13.4's cap on `ExecToolCall.result_text` (slice 3). Same number as
+#: `EVENT_TEXT_MAX`, its own constant: the measured distributions differ
+#: (`thinking` p95 5.1 KB, `tool_result` p95 5.7 KB with a 20.7 KB MAXIMUM —
+#: so unlike the event cap, this one actually fires in production), and the
+#: day one of them needs moving should not move the other by accident.
+#: aw-knowledgeable declares the same number server-side
+#: (`core/exec_history.RESULT_TEXT_MAX`) and re-applies it as a size bound;
+#: two copies on purpose, same as `SECRET_TOOL_NAMES`.
+RESULT_TEXT_MAX = 16_384
+
+#: The `run_events.kind` whose payload lands on `ExecToolCall` rather than
+#: on an `ExecEvent` — the one kind that is projected WITHOUT being in
+#: :func:`shipped_kinds`.
+#:
+#: Named here rather than written as a literal in `exec_sync.py`'s SQL for
+#: the same reason every other kind fact lives in this module: the registry
+#: row below is where the verdict, the payload key (`text_field` =
+#: `"content"`) and the reason are recorded, and a second spelling of
+#: `"tool_result"` in the query would be a place for those to drift apart.
+RESULT_KIND = "tool_result"
+
 #: Every `ExecEvent` property any row below can fill, and the type it is
 #: coerced to before it crosses the seam.
 #:
@@ -372,16 +393,26 @@ EVENT_KIND_REGISTRY: dict[str, EventKind] = {
         shipped=False,
         text_field="content",
         reason=(
-            "SLICE 3, and NOT as an ExecEvent: it lands on the existing "
+            "SLICE 3 — SHIPPED, and NOT as an ExecEvent, which is why "
+            "`shipped` stays False here: it lands on the existing "
             "`ExecToolCall` as `result_text`, paired through "
             "`tool_result.payload.tool_use_id` <-> `tool_call.payload.id` "
-            "(§13.12 point 2 — the two keys have different names). The one "
-            "genuinely dangerous kind: results are the channel through which "
-            "secrets ENTER a run (a read_secret return, a `cat .env`, a "
-            "`docker inspect`), and the exact-match pass structurally cannot "
-            "cover a third-party credential that was never in the file store. "
-            "Secret-tool results are dropped wholesale under the same "
-            "terminal-segment rule."
+            "(§13.12 point 2 — the two keys have different names). "
+            "`shipped=False` means exactly what it means for `tool_call` "
+            "above: not as an ExecEvent. It keeps this row OUT of "
+            "`shipped_kinds()`, so `SQL_EVENTS` cannot select it and "
+            "`build_event_row` cannot route its `content` through the event "
+            "path — which matters more for this kind than for any other, "
+            "because that path applies neither the secret-tool result drop "
+            "nor the result cap. `text_field` is still recorded and still "
+            "used: the result path reads the payload key from here rather "
+            "than spelling 'content' a second time. "
+            "The one genuinely dangerous kind: results are the channel "
+            "through which secrets ENTER a run (a read_secret return, a "
+            "`cat .env`, a `docker inspect`), and the exact-match pass "
+            "structurally cannot cover a third-party credential that was "
+            "never in the file store. Secret-tool results are dropped "
+            "wholesale under the same terminal-segment rule."
         ),
     ),
     # ---- reviewed and permanently excluded --------------------------------
@@ -431,7 +462,7 @@ def unreviewed_kinds(kinds) -> list[str]:
     return sorted({k for k in kinds if k and k not in EVENT_KIND_REGISTRY})
 
 
-def cap_text(text):
+def cap_text(text, *, limit: int = EVENT_TEXT_MAX):
     """``(text, true_length, truncated)`` under §13.4's cap.
 
     Call this with ALREADY-SCRUBBED text, always. The order is the rule
@@ -440,12 +471,18 @@ def cap_text(text):
     truncating scrubbed text can only ever cut a redaction marker in half.
     The true length is returned rather than the stored one so a cut stays
     visible instead of reading as naturally short text.
+
+    `limit` defaults to the event cap and is passed `RESULT_TEXT_MAX` by the
+    slice-3 result path. One function with a parameter rather than two
+    near-identical ones: the scrub-then-cap ordering above is the property
+    being protected, and it is protected by there being ONE place the cut
+    happens — a second copy is a second place for the order to be wrong.
     """
     if not isinstance(text, str):
         return None, None, None
     length = len(text)
-    if length > EVENT_TEXT_MAX:
-        return text[:EVENT_TEXT_MAX], length, True
+    if length > limit:
+        return text[:limit], length, True
     return text, length, False
 
 

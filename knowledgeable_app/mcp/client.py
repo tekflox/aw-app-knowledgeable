@@ -568,8 +568,14 @@ async def put_exec_sync_state(
 
 
 async def post_exec_retention(days: int | None = None) -> tuple[dict | None, str | None]:
-    """POST /api/exec/retention — §8's 180-day `args_text` valve. A monthly
-    task; a no-op (`trimmed: 0`) when nothing is old enough."""
+    """POST /api/exec/retention — §8's 180-day text valve. A monthly task; a
+    no-op when nothing is old enough.
+
+    Three arms since §13 slice 3 (§13.7): `ExecToolCall.args_text`,
+    `ExecToolCall.result_text` and `ExecEvent.text`. The response's `trimmed`
+    is a per-property map rather than one integer, so a caller can say which
+    property actually shrank; `total` is the sum, for a caller that only
+    wants the headline."""
     return await _post_json("/api/exec/retention", {"days": days} if days is not None else {})
 
 
@@ -739,12 +745,54 @@ EXEC_TOOLCALL_SCOPE_CAVEAT = (
     "check `matched_field` on each row — 'args' means that run did NOT call "
     "the tool, it only talked about it. Use search_in='name' to rule out "
     "this false-positive class entirely rather than trusting ranking alone. "
+    "This arm searches the tool NAME and its ARGUMENTS only. A tool's "
+    "RESULT has its own index: ask for search_in='result' (§13 slice 3) — "
+    "the two cannot be queried in one call, and a name/args search finding "
+    "nothing says nothing about what the tool returned. "
     "A tool may also appear under more than one spelling "
     "(a current vs. a legacy MCP-gateway prefix, or a malformed variant) — "
     "each distinct `name` string below is counted separately; sum the ones "
     "that mean the same tool yourself. 'How many runs called X in total' has "
     "no single honest number from this data — see name_counts_among_returned_"
     "results and possibly_truncated instead of trusting a bare count."
+)
+
+
+#: Attached to every `search_in='result'` result set (§13 slice 3). A
+#: DIFFERENT caveat from the name/args one above, not a copy, because the
+#: two arms are honest about different things: that one's hazard is
+#: overcounting ("the name appears in another call's arguments"), which
+#: cannot happen here — a hit in `result_text` IS that call's output. What
+#: this arm owes instead is the list of results that are deliberately
+#: absent, because every one of them makes a zero ambiguous.
+EXEC_TOOLCALL_RESULT_SCOPE_CAVEAT = (
+    "WHAT IS DELIBERATELY ABSENT FROM THIS INDEX, each making an empty "
+    "result ambiguous rather than conclusive. (1) SECRET-HANDLING TOOLS' "
+    "results are dropped wholesale and never projected — read_secret, "
+    "write_secret, delete_secret, collect_secret, matched on the tool "
+    "name's terminal segment so every gateway prefix is covered. Their "
+    "node carries result_dropped=true instead; `exec_run_detail` shows it. "
+    "The return value of a read_secret is not retrievable from this graph "
+    "at all, by design. (2) RESULTS OLDER THAN 180 DAYS may have been "
+    "nulled by the retention valve (result_trimmed on the call says so); "
+    "Postgres still has them. (3) A CALL THAT NEVER RETURNED has no result "
+    "— ~500 of 308k measured, plus anything still in flight. (4) Only "
+    "named MCP tool-call events synced from AP-MT run_events are here at "
+    "all: a curl to an app's /mcp route inside a Bash call is invisible to "
+    "this whole layer, as its args_text sibling already states. "
+    "An event's result is scrubbed then capped at 16,384 chars — result_len "
+    "is the TRUE pre-cap length and result_truncated says whether the cap "
+    "fired, which it genuinely does here (measured maximum 20.7 KB), so "
+    "call exec_run_detail for the full stored text rather than assuming the "
+    "snippet is all of it. "
+    "SCRUBBING IS BEST-EFFORT AND THIS IS THE CHANNEL IT MATTERS MOST ON: "
+    "results are how third-party credentials enter a run (a `cat .env`, a "
+    "`docker inspect`, a git remote with an embedded token), and a "
+    "credential that was never in this workspace's own secret store is "
+    "covered by pattern matching alone. Treat anything that looks like a "
+    "live credential here as one, and report it rather than quoting it. "
+    "possibly_truncated is true when the result count hit `limit`: a count "
+    "is only trustworthy when this is false."
 )
 
 
@@ -756,18 +804,22 @@ EXEC_TOOLCALL_SCOPE_CAVEAT = (
 EXEC_EVENT_SCOPE_CAVEAT = (
     "PARTIAL BY CONSTRUCTION, in two separate ways. (1) Only text-BEARING "
     "event kinds are searchable here at all, because only they have a text "
-    "property: today that is `error` (a run's error string) and `log` (a "
-    "workflow log line). The other eleven projected kinds — node_start, "
-    "finalizing, cli.first_byte, system.init, done, cli.error, "
+    "property: `error` (a run's error string), `log` (a workflow log line), "
+    "`thinking` (the model's own reasoning) and `node_end` (a workflow "
+    "node's final output text). The other eleven projected kinds — "
+    "node_start, finalizing, cli.first_byte, system.init, done, cli.error, "
     "auto_compact.blind, auto_compact.ineffective, connector.timing, "
     "container.started, cli.timeout — are STRUCTURED: they carry typed "
     "properties and no text, so they are read as a run's timeline through "
     "exec_run_detail, never found by this search. An empty result here does "
-    "NOT mean the run emitted no events. (2) `thinking` and `node_end` (the "
-    "node's final output text) are designed and verdicted but NOT YET "
-    "projected — slice 2 — and `tool_result` lands on the tool call rather "
-    "than here (slice 3). `llm_token` never will be: it is excluded from the "
-    "timeline's own upstream definition. "
+    "NOT mean the run emitted no events. (2) `tool_result` is NOT here: a "
+    "tool's output rides the tool CALL, so search it with "
+    "target='tool_calls', search_in='result'. `llm_token` is never "
+    "projected anywhere: it is excluded from the timeline's own upstream "
+    "definition, and its deltas reassemble into text already projected as a "
+    "run's output_text. "
+    "`thinking` is SPARSE — about 27% of runs emit any at all — so a run "
+    "with no reasoning in its timeline is the normal case, not a gap. "
     "An event's `text` is scrubbed and capped at 16,384 chars; `text_len` is "
     "the TRUE pre-cap length and `text_truncated` says whether the cap fired "
     "— call exec_run_detail for the full stored text. "
@@ -830,8 +882,8 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
     if target not in ("runs", "tool_calls", "events", "both"):
         return "target must be one of: runs, tool_calls, events, both", True
     search_in = (args.get("search_in") or "both").strip().lower()
-    if search_in not in ("name", "args", "both"):
-        return "search_in must be one of: name, args, both", True
+    if search_in not in ("name", "args", "result", "both"):
+        return "search_in must be one of: name, args, result, both", True
     try:
         limit = int(args.get("limit") or 10)
     except (TypeError, ValueError):
@@ -853,7 +905,55 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
             "possibly_truncated": len(results) >= limit,
         }
 
-    if target in ("tool_calls", "both"):
+    if target in ("tool_calls", "both") and search_in == "result":
+        # §13 slice 3 — `search_in='result'` is its own ROUTE over its own
+        # index (`exec_toolcall_result`), not a field-qualified query against
+        # `exec_toolcall_text`: that index does not contain `result_text` at
+        # all (§13.3 kept it a new index so the live name/args surface was
+        # untouched by a rebuild over 288k populated nodes), so a
+        # `result_text:*foo*` clause there would match nothing and read as
+        # "no run ever got that output".
+        #
+        # Unwildcarded literal terms, like `runs` and `events` and unlike
+        # `name`: a tool RESULT is output prose — a stdout blob, a JSON
+        # document, an error message — not an underscore-joined identifier,
+        # so the tokenization miss that forces wildcarding on tool NAMES
+        # does not apply, and wildcarding natural-language words would only
+        # widen every term for no recall gain.
+        data, err = await _get(
+            "/api/exec/search/tool-call-results",
+            {"q": _lucene_escape(q), "limit": limit},
+        )
+        if err:
+            return f"search_execution_graph failed (tool_call results): {err}", True
+        results = data.get("results", [])
+        words = [w for w in q.split() if w]
+        for r in results:
+            # One value, no ambiguity to resolve: this index covers exactly
+            # one property, so unlike the name/args arm there is nothing to
+            # compute. Stated on every row anyway so a caller can treat all
+            # the arms uniformly.
+            r["matched_field"] = "result_text"
+            snippet, stored_len = _text_snippet(r.pop("result_text", None), words)
+            r["result_text_snippet"] = snippet
+            # The backend's `result_len` is the TRUE pre-cap length (§13.4) —
+            # and this cap really fires here (measured max 20.7 KB against a
+            # 16,384 ceiling), so falling back to the stored length when it
+            # is present would understate it.
+            if r.get("result_len") is None:
+                r["result_len"] = stored_len
+        name_counts: dict = {}
+        for r in results:
+            name = r.get("name") or "<unknown>"
+            name_counts[name] = name_counts.get(name, 0) + 1
+        payload["tool_calls"] = {
+            "results": results,
+            "count": len(results),
+            "possibly_truncated": len(results) >= limit,
+            "name_counts_among_returned_results": name_counts,
+            "scope_caveat": EXEC_TOOLCALL_RESULT_SCOPE_CAVEAT,
+        }
+    elif target in ("tool_calls", "both"):
         if search_in == "name":
             tc_query = _lucene_wildcard_terms_scoped(q, "name")
         elif search_in == "args":
@@ -1564,17 +1664,19 @@ TOOLS_SCHEMA = [
             "cannot recover a query spanning a HYPHEN boundary, so search by the "
             "hyphen-free segment of a tool name, not the full prefixed name. "
             "target='events' searches ExecEvent.text — the Event timeline's "
-            "free-text kinds (`error` strings and workflow `log` lines today; "
-            "`thinking` and `node_end` output text are designed but not yet "
-            "projected). Prose, so plain fulltext like 'runs'. The other "
-            "eleven projected kinds are STRUCTURED (typed properties, no "
-            "text) and are read as a run's chronological timeline through "
-            "exec_run_detail's `events`, never found by this search — an "
-            "empty result does not mean the run emitted no events. Each row "
+            "free-text kinds: `error` strings, workflow `log` lines, "
+            "`thinking` (the model's own reasoning, SPARSE — ~27% of runs) "
+            "and `node_end` (a workflow node's final output text). Prose, so "
+            "plain fulltext like 'runs'. The other eleven projected kinds "
+            "are STRUCTURED (typed properties, no text) and are read as a "
+            "run's chronological timeline through exec_run_detail's "
+            "`events`, never found by this search — an empty result does not "
+            "mean the run emitted no events. Each row "
             "carries kind, matched_field='event_text', text_snippet (a "
             "match-centred window) and text_len/text_truncated, plus a "
             "scope_caveat stating exactly which kinds are and are not "
-            "reachable. "
+            "reachable. A tool's RESULT is NOT an event — it rides the tool "
+            "call; use target='tool_calls' with search_in='result'. "
             "target='both' (default) runs runs+tool_calls — NOT events: the "
             "default is byte-identical to the release before the event layer "
             "existed, so ask for target='events' explicitly. "
@@ -1590,6 +1692,18 @@ TOOLS_SCHEMA = [
             "looks identical to a real call unless you check that field — prefer "
             "search_in='name' over trusting ranking alone when the question is "
             "specifically 'who called X'. "
+            "'result' searches what the tool RETURNED (ExecToolCall.result_text) "
+            "— a separate index, so it is never mixed into the other three and a "
+            "name/args search finding nothing says nothing about outputs. Use it "
+            "for 'which run saw this error / got this output / read this file'. "
+            "Rows carry matched_field='result_text', result_text_snippet and "
+            "result_len/result_truncated (the cap really fires here — results run "
+            "to 20 KB). SECRET-HANDLING TOOLS' RESULTS ARE NEVER PROJECTED (the "
+            "return value of a read_secret/collect_secret is unreachable from "
+            "this graph by design, `result_dropped` on the node says so), and "
+            "results older than 180 days may have been nulled by the retention "
+            "valve — so an empty result here is ambiguous; read the scope_caveat "
+            "before reporting one as 'it never happened'. "
             "Every tool_calls result also carries args_text_snippet (a window "
             "centred on the matched term, capped — the full argument blob can run "
             "to kilobytes and would overflow an agent's own result budget) and "
@@ -1620,14 +1734,17 @@ TOOLS_SCHEMA = [
                 },
                 "search_in": {
                     "type": "string",
-                    "enum": ["name", "args", "both"],
+                    "enum": ["name", "args", "result", "both"],
                     "description": (
                         "Only applies to target='tool_calls'/'both'. 'name' = only "
                         "genuine named tool-call events, no argument-mention false "
                         "positives. 'args' = only matches inside a call's own "
-                        "arguments (the tool was NOT called). 'both' (default) = "
-                        "everything, each row tagged matched_field, name hits "
-                        "ranked first."
+                        "arguments (the tool was NOT called). 'result' = only "
+                        "matches in what the tool RETURNED, over its own index; "
+                        "secret-handling tools' results are never projected and "
+                        "results over 180 days old may have been trimmed. 'both' "
+                        "(default) = name + args, each row tagged matched_field, "
+                        "name hits ranked first — it does NOT include results."
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max results per target. Range 1-100. Default 10."},
@@ -1648,13 +1765,20 @@ TOOLS_SCHEMA = [
             "(node_start -> agent/label/provider/model_slug; finalizing -> "
             "tokens_in/tokens_out/cost_usd; system.init -> model/cwd/"
             "permission_mode/session_id/tools_count; cli.error -> subtype/is_error; "
-            "error and log -> scrubbed `text`; and so on). Interleave it with "
-            "`tool_calls` by ts to reconstruct the full Event timeline. "
-            "INCOMPLETE BY SLICE, state this rather than implying a gap means "
-            "nothing happened: `thinking` and `node_end` (a workflow node's final "
-            "output text) are not projected yet, `tool_result` lands on the tool "
-            "call rather than in `events`, and `llm_token` is excluded by the "
-            "timeline's own definition. "
+            "error, log, thinking and node_end -> scrubbed `text`; and so on). "
+            "Interleave it with `tool_calls` — each call at its own `ts` and its "
+            "result at `result_ts` — to reconstruct the full Event timeline. "
+            "COMPLETE as of §13 slice 3, with these standing exceptions, which "
+            "you should state rather than letting a gap read as 'nothing "
+            "happened': `tool_result` is on the tool CALL as `result_text`, not "
+            "in `events`; `thinking` is sparse (~27% of runs emit any); and "
+            "`llm_token` is never projected (excluded by the timeline's own "
+            "definition — its deltas reassemble into the run's own output_text). "
+            "A tool call's `result_text` can be absent for three DIFFERENT "
+            "reasons the row distinguishes: result_dropped=true (a "
+            "secret-handling tool — its return value is never projected), "
+            "result_trimmed=true (the 180-day retention valve nulled it; "
+            "Postgres still has it), or neither (the call never returned). "
             "The response always carries `caveat`: CHILD_OF understates lineage "
             "across wakeups (a wakeup-resumed run's causal parent is recorded as "
             "prose inside its input, not a foreign key) — measured: a chain whose "

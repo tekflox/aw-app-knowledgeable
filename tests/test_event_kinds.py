@@ -145,9 +145,17 @@ def test_every_measured_kind_has_a_registry_row():
 
 
 def test_the_shipped_set_is_exactly_slice_2():
-    """Pinned by name. Slice 2 flips `thinking`/`node_end` to shipped (this
-    change); slice 3 adds `tool_result` on another label — each a deliberate
-    edit here plus its own scrub test, never a widening nothing pinned."""
+    """Pinned by name. Slice 2 flipped `thinking`/`node_end` to shipped —
+    each such change is a deliberate edit here plus its own scrub test,
+    never a widening nothing pinned.
+
+    **Slice 3 deliberately did not change this set**, which is why the
+    name still reads "slice_2" rather than being stale: `tool_result` ships
+    in slice 3 onto `ExecToolCall.result_text`, a different label reached
+    through `attach_results`, so its row stays `shipped=False` and the SQL
+    behind `shipped_kinds()` must go on not selecting it. See
+    `test_tool_result_is_not_an_event_kind_and_cannot_flow_through_the_event_path`
+    in test_exec_sync.py for the other half of that."""
     assert event_kinds.shipped_kinds() == (
         "auto_compact.blind",
         "auto_compact.ineffective",
@@ -620,3 +628,55 @@ def test_coerce_never_turns_a_boolean_into_a_number_or_back():
     assert event_kinds.coerce("cwd", {"a": 1}) is None
     assert event_kinds.coerce("not_a_declared_prop", "x") is None
     assert event_kinds.coerce("cwd", None) is None
+
+
+# ---------------------------------------------------------------------------
+# §13 slice 3 — the result cap. The REGISTRY-level facts live here; the
+# pairing, the drop and the straddle-the-cap credential tests run through the
+# real tick in test_exec_sync.py, because what has to be proven about them is
+# that the SYNC PATH routes results through the scrubber and the cap, and a
+# unit test of `cap_text` alone cannot say that.
+# ---------------------------------------------------------------------------
+
+
+def test_cap_text_takes_an_explicit_limit_for_the_result_path():
+    """One `cap_text` with a `limit` parameter rather than two near-identical
+    functions: the scrub-then-cap ORDER is the property being protected
+    (§13.12 point 6), and it is protected by there being exactly one place
+    the cut happens."""
+    long = "y" * (event_kinds.RESULT_TEXT_MAX + 7)
+    text, length, truncated = event_kinds.cap_text(long, limit=event_kinds.RESULT_TEXT_MAX)
+    assert len(text) == event_kinds.RESULT_TEXT_MAX
+    assert length == len(long), "the TRUE length must survive, or a cut reads as short"
+    assert truncated is True
+    # The default is still the EVENT cap, so slice 1/2's callers are
+    # untouched by the parameter existing.
+    assert event_kinds.cap_text(long)[0] == long[: event_kinds.EVENT_TEXT_MAX]
+
+
+def test_the_result_cap_is_its_own_constant_even_though_the_numbers_are_equal():
+    """Two constants on purpose. The measured distributions differ —
+    `thinking` p95 5.1 KB and never truncated in production, `tool_result`
+    p95 5.7 KB with a 20.7 KB MAXIMUM, so this is the cap that actually
+    fires — and the day one needs moving it must not move the other."""
+    assert event_kinds.RESULT_TEXT_MAX == 16_384
+    assert "RESULT_TEXT_MAX" in dir(event_kinds)
+    assert "EVENT_TEXT_MAX" in dir(event_kinds)
+
+
+def test_the_result_kind_and_its_payload_key_come_from_the_registry():
+    """`exec_sync` reads both the kind name and the payload key from here,
+    never as literals of its own: a second spelling of `"tool_result"` or of
+    `"content"` in the SQL or the pairing is a place for the registry's
+    recorded verdict and the code's behaviour to drift apart."""
+    assert event_kinds.RESULT_KIND == "tool_result"
+    spec = event_kinds.EVENT_KIND_REGISTRY[event_kinds.RESULT_KIND]
+    assert spec.text_field == "content"
+    assert spec.verdict == "text"
+    # Reviewed, verdicted, projected — and still not an ExecEvent. That
+    # three-way distinction is what §13.6's "three states, not two" buys,
+    # and `tool_result` is the row that makes it necessary.
+    assert spec.shipped is False
+    assert spec.text_field in SAMPLED_PAYLOADS[event_kinds.RESULT_KIND], (
+        "the registry's payload key does not exist in the measured payload shape"
+    )

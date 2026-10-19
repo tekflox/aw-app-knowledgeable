@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import exec_scrub, exec_sync, vault_coverage  # noqa: E402
+from knowledgeable_app import event_kinds, exec_scrub, exec_sync, vault_coverage  # noqa: E402
 from knowledgeable_app.mcp import client  # noqa: E402
 
 
@@ -66,6 +66,18 @@ class _FakeCursor:
         elif "row_number()" in sql:
             ids = set((params or {}).get("run_ids") or [])
             self._rows = [r for r in self._conn.tool_calls if r[0] in ids]
+        elif "e.kind = %(kind)s" in sql:
+            # §13 slice 3's `SQL_TOOL_RESULTS`. Matched on the bound-kind
+            # predicate rather than on the word "tool_result", because the
+            # whole point of binding `event_kinds.RESULT_KIND` is that the
+            # kind is NOT a literal in the SQL — a fake that matched on the
+            # literal would go green the day someone put one back.
+            ids = set((params or {}).get("run_ids") or [])
+            assert (params or {}).get("kind") == "tool_result", (
+                f"the result query bound kind={(params or {}).get('kind')!r} — it "
+                f"must come from the registry, not from a literal"
+            )
+            self._rows = [r for r in self._conn.tool_results if r[0] in ids]
         elif "SELECT DISTINCT e.kind" in sql:
             # §13.6's open-set sweep. Returns whatever kinds this fake tenant
             # has "emitted", including ones the registry has never seen — that
@@ -106,9 +118,21 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, runs=(), tool_calls=(), counts=(), events=(), event_kinds=None):
+    def __init__(
+        self,
+        runs=(),
+        tool_calls=(),
+        counts=(),
+        events=(),
+        event_kinds=None,
+        tool_results=(),
+    ):
         self.runs = list(runs)
         self.tool_calls = list(tool_calls)
+        #: §13 slice 3 — `(run_id, payload, ts)` rows in `SQL_TOOL_RESULTS`'
+        #: column order. Empty by default, so every pre-slice-3 test in this
+        #: file goes on describing a corpus with no results in it.
+        self.tool_results = list(tool_results)
         self.counts = list(counts)
         self.events = list(events)
         # Default: exactly the registry's own shipped set, so an ordinary
@@ -1024,3 +1048,385 @@ def test_every_query_is_scoped_to_one_source_tenant_or_to_explicit_run_ids():
     assert "e.run_id = ANY(%(run_ids)s)" in exec_sync.SQL_TOOL_CALLS
     for entity, sql in exec_sync.SQL_RECONCILE.items():
         assert "%(tenant)s" in sql, f"{entity}'s reconcile SQL is not tenant-scoped"
+    assert "e.run_id = ANY(%(run_ids)s)" in exec_sync.SQL_TOOL_RESULTS
+
+
+# ---------------------------------------------------------------------------
+# §13 slice 3 — result pairing, the result drop, and the disk preflight.
+#
+# The pairing is the one mechanism in this slice that can fail SILENTLY and
+# still look healthy: a join on the wrong key produces zero matches, every
+# tick reports success, and the graph simply has no results in it — which is
+# indistinguishable from "Postgres has no results yet" unless the unpaired
+# count is observable. So these tests are about the key, the count, and the
+# drop, in that order.
+# ---------------------------------------------------------------------------
+
+
+def _pg_result(run_id="run-1", *, tool_use_id="toolu_1", content="ok", ts=None):
+    """One row in `SQL_TOOL_RESULTS`' column order — positional, like the
+    real cursor. Note `tool_use_id`, NOT `id`: that asymmetry with the
+    tool_call payload is §13.12 point 2 and it is the whole hazard here, so
+    the fixture spells it the way production does rather than the way the
+    other side does."""
+    return (
+        run_id,
+        {"tool_use_id": tool_use_id, "content": content},
+        ts or datetime(2026, 10, 18, 10, 1, 3, tzinfo=timezone.utc),
+    )
+
+
+def _pg_call(run_id="run-1", *, tool_use_id="toolu_1", name="Bash", seq=1, args=None):
+    """One row in `SQL_TOOL_CALLS`' column order, with the payload `id` that
+    is the pairing key's other half."""
+    return (
+        run_id,
+        {"id": tool_use_id, "name": name, "input": args or {"command": "ls"}},
+        datetime(2026, 10, 18, 10, 1, tzinfo=timezone.utc),
+        seq,
+    )
+
+
+def test_a_result_is_paired_onto_its_own_call_across_the_two_key_names(calls, monkeypatch):
+    """§13.12 point 2, as the test that would have caught the obvious bug:
+    `tool_call.payload` keys its id as `id` and `tool_result.payload` keys
+    the SAME value as `tool_use_id`.
+
+    MUTATION: change either side to read the other's key name and this goes
+    red with `result_text` absent — which, without this test, is exactly
+    what "results are not in Postgres yet" looks like from the outside.
+    """
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[
+            _pg_call("run-1", tool_use_id="toolu_a", seq=1),
+            _pg_call("run-1", tool_use_id="toolu_b", name="Read", seq=2),
+        ],
+        tool_results=[
+            # Deliberately NOT in call order: the join is by id, never
+            # positional, and a reversed fixture is what proves it.
+            _pg_result("run-1", tool_use_id="toolu_b", content="file contents"),
+            _pg_result("run-1", tool_use_id="toolu_a", content="a.txt b.txt"),
+        ],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["tool_results"] == 2
+    assert result["orphan_results"] == 0
+    posted = {c["name"]: c for c in calls.ingest[0]["tool_calls"]}
+    assert posted["Bash"]["result_text"] == "a.txt b.txt"
+    assert posted["Read"]["result_text"] == "file contents"
+    assert posted["Bash"]["result_ts"] == "2026-10-18T10:01:03+00:00"
+    assert posted["Bash"]["result_len"] == len("a.txt b.txt")
+    assert posted["Bash"]["result_truncated"] is False
+    # The counts ride the sentinel, like every other number a tick observed.
+    assert calls.sync_state[0]["counts"]["tool_results"] == 2
+    assert calls.sync_state[0]["counts"]["orphan_results"] == 0
+
+
+def test_an_unpaired_result_is_counted_and_never_crashes_the_pass(calls, monkeypatch):
+    """§13.10 names "unpaired results stop being rare" as the condition that
+    reopens the separate-nodes decision. A condition nobody can observe is
+    not a condition, so the count is on the tick result AND on the sentinel
+    — and an unpaired row is neither fatal nor silently discarded."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_a")],
+        tool_results=[
+            _pg_result("run-1", tool_use_id="toolu_a", content="paired"),
+            # A result whose call is not in this batch at all.
+            _pg_result("run-1", tool_use_id="toolu_nowhere", content="orphan"),
+            # A result with no `tool_use_id` — nothing to join on.
+            ("run-1", {"content": "keyless"}, datetime(2026, 10, 18, 10, 2, tzinfo=timezone.utc)),
+        ],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["blocked"] is False, "an unpaired result must not abort the pass"
+    assert result["orphan_results"] == 2
+    assert result["tool_results"] == 1
+    posted = calls.ingest[0]["tool_calls"]
+    assert len(posted) == 1
+    assert posted[0]["result_text"] == "paired"
+    assert calls.sync_state[0]["counts"]["orphan_results"] == 2
+
+
+def test_a_result_never_pairs_across_runs_even_on_the_same_tool_use_id(calls, monkeypatch):
+    """The index is keyed `(run_id, tool_use_id)`, not by the bare id.
+
+    Nothing upstream promises that id is unique across runs, and the failure
+    this prevents is the worst shape available in this slice: one run's
+    OUTPUT attached to a different run's call, which no count would ever
+    reveal — both sides would look fully paired.
+    """
+    conn = _FakeConn(
+        runs=[_pg_row("run-1"), _pg_row("run-2", started="2026-10-18T11:00:00+00:00",
+                                        ended="2026-10-18T11:05:00+00:00")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_collide")],
+        tool_results=[
+            _pg_result("run-2", tool_use_id="toolu_collide", content="run-2 output"),
+        ],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["orphan_results"] == 1, (
+        "a result from run-2 paired onto run-1's call — the index must be scoped "
+        "per run, and this mis-pairing is invisible to every count"
+    )
+    posted = calls.ingest[0]["tool_calls"]
+    assert posted[0].get("result_text") is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "collect_secret",
+        "read_secret",
+        "mcp__aw-gateway__aw__aw_secrets__collect_secret",
+        "aw-gateway.aw__aw_secrets__read_secret",
+        "mcp__workspace-gateway__aw__aw_secrets__write_secret",
+    ],
+)
+def test_a_secret_tools_result_is_dropped_not_scrubbed(name, calls, monkeypatch):
+    """§13.2's own closing paragraph, delivered: for `read_secret`,
+    `delete_secret` and `collect_secret`, the ARGUMENTS carry a name or a
+    request id and "the value lives in the RESULT, which slice 3 is what
+    drops".
+
+    Dropped, not scrubbed: the value is a credential by definition, so there
+    is nothing for a pattern to recognise and nothing a redaction marker
+    would add. Over the bare name plus all three measured gateway spellings,
+    because §13.12 point 1 is that a tool's identity is never its full
+    prefixed name.
+
+    MUTATION: swap `scrub_tool_result` for `scrub` in `attach_results` and
+    every case here goes red — the planted value has no shape and is not in
+    the fake secret store, so the scrubber returns it verbatim. That is the
+    point: this channel cannot be defended by scrubbing.
+    """
+    planted = "invented-vault-value-with-no-recognisable-shape-at-all"
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_s", name=name)],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_s", content=planted)],
+    )
+    result = _tick(conn, monkeypatch)
+
+    assert result["orphan_results"] == 0, "the row paired — the drop is not a pairing miss"
+    posted = calls.ingest[0]["tool_calls"][0]
+    assert posted["result_text"] is None
+    assert posted["result_dropped"] is True, (
+        "the drop has to be RECORDED — an absent result that does not say it was "
+        "dropped is indistinguishable from a call that never returned"
+    )
+    assert planted not in str(calls.ingest), "the planted value reached the ingest payload"
+
+
+def test_an_ordinary_tools_result_is_not_marked_dropped(calls, monkeypatch):
+    """The other half of the signal: if `result_dropped` were set on every
+    row it would mean nothing. `None` rather than `False` so the property is
+    simply absent on the node."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_a", name="Bash")],
+        tool_results=[_pg_result("run-1", tool_use_id="toolu_a", content="ok")],
+    )
+    _tick(conn, monkeypatch)
+    assert calls.ingest[0]["tool_calls"][0]["result_dropped"] is None
+
+
+def test_a_result_goes_through_the_scrubber_on_the_way_out(calls, monkeypatch):
+    """A scrubber the build path does not call is the same as no scrubber —
+    the standard this file already holds the run and tool-call paths to,
+    applied to the channel where credentials actually surface."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_a", name="Bash")],
+        tool_results=[
+            _pg_result(
+                "run-1",
+                tool_use_id="toolu_a",
+                # Four result-shaped fixtures in one payload, all INVENTED
+                # (§13.12 point 9): a `cat .env` line, a `docker inspect`
+                # env entry, a git remote with an embedded token, and the
+                # fake store's own value.
+                content=(
+                    "$ cat .env\n"
+                    "DATABASE_PASSWORD=invented-result-test-pw\n"
+                    '  "Env": ["GITHUB_TOKEN=invented-result-test-token"],\n'
+                    "origin\thttps://x-access-token:invented-result-test-git@github.com/o/r\n"
+                    f"stored={STORE_SECRET}\n"
+                ),
+            )
+        ],
+    )
+    _tick(conn, monkeypatch)
+    text = calls.ingest[0]["tool_calls"][0]["result_text"]
+    assert "<REDACTED:" in text, text
+    for leaked in (
+        "invented-result-test-pw",
+        "invented-result-test-token",
+        "invented-result-test-git",
+        STORE_SECRET,
+    ):
+        assert leaked not in text, f"{leaked!r} survived into {text!r}"
+    # The non-credential context survives — a scrubber that shreds the
+    # corpus is one that gets turned off (see `exec_scrub`'s own `-p` scar).
+    assert "cat .env" in text
+    assert "DATABASE_PASSWORD=" in text, "the env var NAME is the retrieval value"
+    assert '"Env":' in text
+    # MEASURED, not assumed, and recorded because it contradicts a promise
+    # `exec_scrub`'s `url-userinfo` family makes in its own comment ("the
+    # host survives; it is the useful half"): for a git remote whose
+    # USERNAME contains the word `token`
+    # (`https://x-access-token:SECRET@github.com/o/r`), the
+    # `credential-field` family runs first — it is ordered ahead of
+    # `url-userinfo` — matches `x-access-token:` as a key/value pair, and
+    # eats the rest of the line including the host. The credential is gone
+    # either way, which is what matters here; what is lost is the repo name.
+    # Pinned so it is a known behaviour rather than a surprise, and so a
+    # future reordering of `_PATTERNS` shows up as a change in this
+    # assertion instead of silently.
+    assert "github.com/o/r" not in text, (
+        "if this now passes, the pattern ordering changed and the git-remote "
+        "shape keeps its host — update this assertion and say so rather than "
+        "deleting the case"
+    )
+
+
+def test_a_planted_credential_straddling_the_result_cap_is_still_redacted(calls, monkeypatch):
+    """§13.12 point 6 for `result_text`, in the straddle shape slice 2
+    generalised — and this is the kind the cap actually fires on in
+    production (measured maximum 20.7 KB against a 16,384 ceiling), so the
+    boundary is where this slice's credentials really sit.
+
+    The assertion is on the FRAGMENT, not the whole value: cap-then-scrub
+    leaves a leading half that matches no stored value and has no pattern
+    shape, so it survives in the graph and stays greppable. Scrub-then-cap
+    can only ever bisect the redaction MARKER.
+    """
+    straddle = len(STORE_SECRET) // 2
+    padding = "p" * (event_kinds.RESULT_TEXT_MAX - straddle)
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_a", name="Bash")],
+        tool_results=[
+            _pg_result(
+                "run-1",
+                tool_use_id="toolu_a",
+                content=f"{padding}{STORE_SECRET}{'t' * 100}",
+            )
+        ],
+    )
+    _tick(conn, monkeypatch)
+    posted = calls.ingest[0]["tool_calls"][0]
+    fragment = STORE_SECRET[:straddle]
+    assert len(fragment) >= 8, "the fragment must be long enough to be a real leak"
+    assert fragment not in posted["result_text"], (
+        "a leading FRAGMENT of the planted credential survived the cut — the cap "
+        "ran before the scrubber (§13.12 point 6)"
+    )
+    assert STORE_SECRET not in posted["result_text"]
+    assert len(posted["result_text"]) == event_kinds.RESULT_TEXT_MAX
+    assert posted["result_len"] > event_kinds.RESULT_TEXT_MAX
+    assert posted["result_truncated"] is True
+
+
+def test_nul_bytes_are_stripped_from_result_text(calls, monkeypatch):
+    """§13.12 point 5. The NUL is legal in the client-side-parsed payload and
+    illegal as a Neo4j property, and it arrives when it arrives — the first
+    N ticks passing proves nothing."""
+    conn = _FakeConn(
+        runs=[_pg_row("run-1")],
+        tool_calls=[_pg_call("run-1", tool_use_id="toolu_a")],
+        tool_results=[
+            _pg_result("run-1", tool_use_id="toolu_a", content="before\x00after")
+        ],
+    )
+    _tick(conn, monkeypatch)
+    assert "\x00" not in calls.ingest[0]["tool_calls"][0]["result_text"]
+
+
+def test_tool_result_is_not_an_event_kind_and_cannot_flow_through_the_event_path():
+    """The constant slice 3 must NOT change: `tool_result` rides
+    `ExecToolCall`, so its registry row stays `shipped=False`, which keeps
+    it out of `shipped_kinds()` and therefore out of `SQL_EVENTS`.
+
+    This matters more for this kind than for any other: `build_event_row`
+    applies neither the secret-tool result drop nor the result cap, so a
+    `tool_result` that reached the event path would land unscrubbed-class
+    output text through the one route that handles none of it."""
+    assert "tool_result" not in event_kinds.shipped_kinds()
+    assert event_kinds.EVENT_KIND_REGISTRY["tool_result"].shipped is False
+    row, dropped = exec_sync.build_event_row(
+        (
+            "ev-1",
+            "run-1",
+            "tool_result",
+            "2026-10-18T10:00:00+00:00",
+            None,
+            {"tool_use_id": "toolu_a", "content": "secret output"},
+        ),
+        exec_scrub.Scrubber([STORE_SECRET]),
+    )
+    assert dropped == 0
+    assert "text" not in row, (
+        "the event path produced text for tool_result — `shipped` is part of the "
+        "build-path condition precisely so this cannot happen"
+    )
+    assert "secret output" not in str(row)
+
+
+# ---------------------------------------------------------------------------
+# §13.7's disk preflight. Exercised with invented numbers, never by filling a
+# host: a guard whose trigger condition is a disaster can only be proven
+# honestly by injecting the measurement.
+# ---------------------------------------------------------------------------
+
+
+def test_the_preflight_refuses_below_the_floor_and_says_the_numbers():
+    verdict = exec_sync.disk_preflight(3 * 1024**3)
+    assert verdict["ok"] is False
+    assert verdict["free_gb"] == 3.0
+    assert verdict["min_free_gb"] == exec_sync.MIN_FREE_DISK_GB
+    assert "3.0 GB free" in verdict["reason"]
+    assert str(exec_sync.MIN_FREE_DISK_GB) in verdict["reason"]
+    # It has to say what to do and what is NOT blocked, or an operator reads
+    # a refusal as the whole sync being down.
+    assert "retention" in verdict["reason"]
+    assert "10-minute tick is NOT blocked" in verdict["reason"]
+
+
+def test_the_preflight_passes_with_headroom():
+    verdict = exec_sync.disk_preflight(40 * 1024**3)
+    assert verdict["ok"] is True
+    assert verdict["free_gb"] == 40.0
+    assert verdict["reason"] is None
+
+
+def test_the_preflight_refuses_when_the_MEASUREMENT_failed_not_only_when_disk_is_low():
+    """"I could not measure the disk" must not read like "the disk is fine" —
+    silent degradation is this estate's named failure mode and a preflight
+    that fails open is worse than none, because it reports a verdict."""
+    verdict = exec_sync.disk_preflight(None, "could not measure free disk space: OSError")
+    assert verdict["ok"] is False
+    assert verdict["free_gb"] is None
+    assert "could not measure" in verdict["reason"]
+
+
+def test_the_preflight_floor_is_the_designs_number():
+    """§13.7 named 25 GB against a host measured at 92% used / 36 GB free.
+    Pinned, so a future "it keeps refusing, lower it" is a deliberate edit
+    with the design in front of whoever makes it."""
+    assert exec_sync.MIN_FREE_DISK_GB == 25
+
+
+def test_free_disk_bytes_measures_the_host_mounted_workspace_tree():
+    """The probe path has to be the host-mounted tree, not `/` (a container
+    overlay in some topologies here) and not the Neo4j data dir, which this
+    process cannot see at all — it never speaks Bolt and has no mount into
+    that container (§4)."""
+    assert exec_sync._DISK_PROBE_PATH == "/opt/aw-workspace"
+    free, err = exec_sync.free_disk_bytes()
+    assert err is None, err
+    assert isinstance(free, int) and free > 0

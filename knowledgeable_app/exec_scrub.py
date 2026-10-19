@@ -563,3 +563,27 @@ class Scrubber:
         if is_secret_tool(name):
             return None
         return self.scrub(args_text)
+
+    def scrub_tool_result(self, *, name: str | None, result_text: Any) -> Any:
+        """§13 slice 3 — a secret-handling tool's RESULT is dropped
+        wholesale, not scrubbed. Everything else goes through :meth:`scrub`.
+
+        **The sharper half of the same rule, and the reason this method
+        exists rather than a second call to `scrub_tool_args`.** §13.2's own
+        closing paragraph: `read_secret`/`delete_secret` arguments carry a
+        secret NAME and `collect_secret`'s carries a request id — "the value
+        lives in the RESULT, which slice 3 is what drops". So for three of
+        the four names in `SECRET_TOOL_NAMES`, THIS is the call that drops
+        the credential and `scrub_tool_args` was only ever dropping its
+        label.
+
+        Returning `None` rather than a redaction marker is deliberate and
+        matches `scrub_tool_args`: the caller records `result_dropped` on
+        the row, which is a cheaper and more honest signal than a marker a
+        reader has to recognise. Same terminal-segment predicate, same
+        reason (§13.12 point 1 — a tool's identity is never its full
+        gateway-prefixed name).
+        """
+        if is_secret_tool(name):
+            return None
+        return self.scrub(result_text)
