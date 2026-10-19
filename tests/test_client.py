@@ -339,6 +339,54 @@ def test_lucene_wildcard_terms_escapes_lucene_syntax_inside_each_word():
     assert client._lucene_wildcard_terms("x*y") == "*x\\*y*"
 
 
+def test_lucene_wildcard_terms_scoped_restricts_the_wildcard_to_one_field():
+    """card 3fe5bf3b-9510-8181-8ac4-fc5b334c5286, Defect 2 — the actual fix:
+    `exec_toolcall_text` indexes `name` and `args_text` as separate Lucene
+    fields in one document, so a field-qualified clause can restrict a hit
+    to exactly one of them."""
+    assert (
+        client._lucene_wildcard_terms_scoped("approve_pending_deletions", "name")
+        == "name:*approve_pending_deletions*"
+    )
+    assert (
+        client._lucene_wildcard_terms_scoped("pending deletions", "args_text")
+        == "args_text:*pending* OR args_text:*deletions*"
+    )
+    assert client._lucene_wildcard_terms_scoped("   ", "name") == ""
+
+
+def test_matched_field_reads_from_the_already_returned_name_no_requery():
+    assert client._matched_field({"name": "mcp__aw-gateway__aw__aw_knowledgeable__approve_pending_deletions"}, ["approve_pending_deletions"]) == "name"
+    assert client._matched_field({"name": "run_agent_async"}, ["approve_pending_deletions"]) == "args"
+    assert client._matched_field({}, ["approve_pending_deletions"]) == "args"
+
+
+def test_args_text_snippet_centres_on_the_match_not_the_head():
+    """Defect 1 — do NOT head-truncate: the match is usually deep inside a
+    long blob, so truncating from byte 0 would discard exactly what the
+    caller searched for."""
+    args_text = ("x" * 1000) + "approve_pending_deletions" + ("y" * 1000)
+    snippet, full_len = client._args_text_snippet(args_text, ["approve_pending_deletions"])
+    assert full_len == len(args_text)
+    assert "approve_pending_deletions" in snippet
+    assert len(snippet) <= client._ARGS_SNIPPET_MAX_CHARS + 2  # +2 for the ellipses
+    assert snippet.startswith("…") and snippet.endswith("…")
+
+
+def test_args_text_snippet_falls_back_to_a_leading_window_with_no_match():
+    """A result can match on `name` alone (search_in='both') with nothing in
+    args_text at all — there is no match position to centre on."""
+    args_text = "no query words appear in this argument payload whatsoever"
+    snippet, full_len = client._args_text_snippet(args_text, ["approve_pending_deletions"])
+    assert full_len == len(args_text)
+    assert snippet == args_text
+
+
+def test_args_text_snippet_passes_through_none_and_empty():
+    assert client._args_text_snippet(None, ["x"]) == (None, 0)
+    assert client._args_text_snippet("", ["x"]) == ("", 0)
+
+
 def test_search_execution_graph_requires_q():
     text, is_error = _run(client.search_execution_graph({}))
     assert is_error is True and "q is required" in text
@@ -412,6 +460,102 @@ def test_search_execution_graph_surfaces_a_backend_error_verbatim():
     text, is_error = _run(client.search_execution_graph({"q": "x", "target": "runs"}))
     assert is_error is True
     assert "index not ready" in text
+
+
+def test_search_execution_graph_rejects_an_unknown_search_in():
+    text, is_error = _run(client.search_execution_graph({"q": "x", "search_in": "bogus"}))
+    assert is_error is True and "search_in must be one of" in text
+
+
+def test_search_execution_graph_echoes_the_resolved_search_in():
+    """Default, when the caller omits it entirely, is 'both' — unchanged
+    recall from before this parameter existed (card
+    3fe5bf3b-9510-8181-8ac4-fc5b334c5286 acceptance #3)."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    text, is_error = _run(client.search_execution_graph({"q": "x", "target": "tool_calls"}))
+    assert is_error is False
+    assert '"search_in": "both"' in text
+
+
+def test_search_execution_graph_search_in_name_queries_only_the_name_field():
+    """Defect 2, acceptance #1 — the actual query sent to the existing
+    backend route is field-scoped, not merely re-labelled client-side."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_execution_graph({
+        "q": "approve_pending_deletions", "target": "tool_calls", "search_in": "name",
+    }))
+    assert _FakeAsyncClient._CALLS[0]["params"] == {
+        "q": "name:*approve_pending_deletions*", "limit": 10,
+    }
+
+
+def test_search_execution_graph_search_in_args_queries_only_the_args_text_field():
+    """Acceptance #4 — explicit search_in='args' is the escape hatch for
+    anyone whose use relies purely on argument-content matching."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_execution_graph({
+        "q": "approve_pending_deletions", "target": "tool_calls", "search_in": "args",
+    }))
+    assert _FakeAsyncClient._CALLS[0]["params"] == {
+        "q": "args_text:*approve_pending_deletions*", "limit": 10,
+    }
+
+
+def test_search_execution_graph_search_in_name_negative_control_returns_a_clean_zero():
+    """Acceptance #5 — this is the property that makes 'built and never
+    invoked' provable, and it must not regress."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    text, is_error = _run(client.search_execution_graph({
+        "q": "decline_pending_deletions", "target": "tool_calls", "search_in": "name",
+    }))
+    assert is_error is False
+    assert _FakeAsyncClient._CALLS[0]["params"]["q"] == "name:*decline_pending_deletions*"
+    assert '"count": 0' in text
+    assert '"name_counts_among_returned_results": {}' in text
+
+
+def test_search_execution_graph_both_tags_matched_field_and_ranks_name_hits_first():
+    """Defect 2, acceptance #3 — default 'both' keeps today's unqualified
+    query (same three rows a caller got before this card), but every row
+    now carries matched_field and the genuine named call sorts first even
+    though it was returned last by the backend."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [
+        {"toolcall_id": "a", "name": "run_agent_async",
+         "args_text": "card mentions approve_pending_deletions"},
+        {"toolcall_id": "c", "name": "schedule_wakeup",
+         "args_text": "wakeup prompt: approve_pending_deletions soon"},
+        {"toolcall_id": "b", "name": "mcp__aw-gateway__aw__aw_knowledgeable__approve_pending_deletions",
+         "args_text": "{}"},
+    ]}))
+    text, is_error = _run(client.search_execution_graph({
+        "q": "approve_pending_deletions", "target": "tool_calls",
+    }))
+    assert is_error is False
+    import json
+    results = json.loads(text)["tool_calls"]["results"]
+    assert [r["toolcall_id"] for r in results] == ["b", "a", "c"]
+    assert results[0]["matched_field"] == "name"
+    assert results[1]["matched_field"] == "args"
+    assert results[2]["matched_field"] == "args"
+
+
+def test_search_execution_graph_replaces_the_unbounded_args_text_blob():
+    """Defect 1, acceptance #2 — args_text itself must not be present at
+    all; only the capped snippet plus the true length."""
+    args_text = ("x" * 1000) + "approve_pending_deletions" + ("y" * 1000)
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [
+        {"toolcall_id": "z", "name": "create_kanban_task", "args_text": args_text},
+    ]}))
+    text, is_error = _run(client.search_execution_graph({
+        "q": "approve_pending_deletions", "target": "tool_calls",
+    }))
+    assert is_error is False
+    import json
+    result = json.loads(text)["tool_calls"]["results"][0]
+    assert "args_text" not in result
+    assert result["args_text_len"] == len(args_text)
+    assert "approve_pending_deletions" in result["args_text_snippet"]
+    assert len(result["args_text_snippet"]) < len(args_text)
 
 
 def test_exec_run_detail_requires_run_id():

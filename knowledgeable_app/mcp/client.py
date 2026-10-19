@@ -597,11 +597,97 @@ def _lucene_wildcard_terms(text: str) -> str:
     query that spans a hyphen boundary (e.g. `aw-gateway`); search by the
     hyphen-free segment of a tool name instead (`approve_pending_deletions`,
     not the full qualified name).
+
+    Unqualified — matches either `name` or `args_text`, whichever the
+    `exec_toolcall_text` index finds it in first. This is `search_in='both'`
+    (default)'s query, unchanged from before `search_in` existed (card
+    3fe5bf3b-9510-8181-8ac4-fc5b334c5286 acceptance #3) — see
+    `_lucene_wildcard_terms_scoped` for the field-restricted form that backs
+    `search_in='name'`/`'args'`.
     """
     words = [w for w in text.split() if w]
     if not words:
         return ""
     return " OR ".join(f"*{_lucene_escape(w)}*" for w in words)
+
+
+def _lucene_wildcard_terms_scoped(text: str, field: str) -> str:
+    """Same per-word wildcard as `_lucene_wildcard_terms`, qualified to one
+    Lucene field. `exec_toolcall_text` is one fulltext index over TWO
+    properties (`tc.name`, `tc.args_text`) — Neo4j stores each as its own
+    field in the underlying Lucene document, so a field-qualified clause
+    (`name:*foo*`) restricts a hit to that one property instead of either.
+
+    This is the actual fix for Defect 2 (card 3fe5bf3b-9510-8181-8ac4-
+    fc5b334c5286): the measured failure was that a bare/unqualified query
+    cannot tell "the tool was called" from "the tool's name string appears
+    inside some OTHER call's arguments" — `search_in='name'` asks the index
+    to only consider the `name` field, so a result literally cannot be an
+    argument-blob false positive any more.
+    """
+    words = [w for w in text.split() if w]
+    if not words:
+        return ""
+    return " OR ".join(f"{field}:*{_lucene_escape(w)}*" for w in words)
+
+
+def _matched_field(result: dict, words: list[str]) -> str:
+    """Which field actually carries the match, computed from the row's own
+    already-returned `name` (never re-queried — no extra round trip). Used
+    to label every tool-call result regardless of `search_in`, and to rank
+    name hits above args hits in `search_in='both'` (default): a row whose
+    only hit is inside `args_text` did NOT call the named tool, it only
+    mentions the string inside its own arguments (e.g. a card brief, a
+    wakeup prompt) — exactly the overcounting failure Defect 2 measured.
+    """
+    name = (result.get("name") or "").lower()
+    if any(w.lower() in name for w in words):
+        return "name"
+    return "args"
+
+
+#: Match-centred snippet window for Defect 1 (card 3fe5bf3b-9510-8181-8ac4-
+#: fc5b334c5286): `args_text` measured at 5,831 bytes in a single result,
+#: 83,609 characters across 20 results — the agent's tool-result budget
+#: never saw it, it was spilled to a file instead. `_ARGS_SNIPPET_RADIUS` is
+#: how much context survives on each side of the matched term;
+#: `_ARGS_SNIPPET_MAX_CHARS` is a hard ceiling regardless of word length.
+_ARGS_SNIPPET_RADIUS = 160
+_ARGS_SNIPPET_MAX_CHARS = 400
+
+
+def _args_text_snippet(args_text: str | None, words: list[str]) -> tuple[str | None, int]:
+    """Return `(snippet, full_length)`. The snippet is centred on the first
+    case-insensitive occurrence of any query word — deliberately NOT a
+    head-truncation: the measured match is usually deep inside a long
+    prompt, so truncating from the start would discard precisely what the
+    caller searched for. Falls back to a leading window only when no query
+    word appears in `args_text` at all (the result matched on `name`
+    instead) — there is nothing to centre on in that case.
+    """
+    if not args_text:
+        return args_text, 0
+    length = len(args_text)
+    lowered = args_text.lower()
+    match_at = None
+    match_len = 0
+    for w in words:
+        idx = lowered.find(w.lower())
+        if idx != -1:
+            match_at, match_len = idx, len(w)
+            break
+    if match_at is None:
+        snippet = args_text[:_ARGS_SNIPPET_MAX_CHARS]
+        return (snippet + "…" if length > _ARGS_SNIPPET_MAX_CHARS else snippet), length
+    start = max(0, match_at - _ARGS_SNIPPET_RADIUS)
+    end = min(length, match_at + match_len + _ARGS_SNIPPET_RADIUS)
+    if end - start > _ARGS_SNIPPET_MAX_CHARS:
+        end = start + _ARGS_SNIPPET_MAX_CHARS
+    snippet = args_text[start:end]
+    return (
+        ("…" if start > 0 else "") + snippet + ("…" if end < length else ""),
+        length,
+    )
 
 
 #: Attached to every tool-call search result. The measurement
@@ -610,12 +696,20 @@ def _lucene_wildcard_terms(text: str) -> str:
 #: tool sees exactly one of them (named MCP tool-call events synced from
 #: AP-MT `run_events`), and must say so rather than imply completeness.
 EXEC_TOOLCALL_SCOPE_CAVEAT = (
-    "Covers only named MCP tool-call events synced from AP-MT run_events "
-    "(kind='tool_call'). Does NOT include: a curl to an app's own /mcp route "
+    "UNDERCOUNTING — what this never sees: a curl to an app's own /mcp route "
     "inside a Bash call (often guarded by a shell conditional whose exit "
     "status was never recorded), or a denormalised boolean column on `runs` "
     "(e.g. marked_flow_done) — both live only in Postgres and are not "
-    "projected here. A tool may also appear under more than one spelling "
+    "projected here. Covers only named MCP tool-call events synced from "
+    "AP-MT run_events (kind='tool_call'). "
+    "OVERCOUNTING — the more dangerous direction, stated just as plainly: in "
+    "search_in='both' (the default), a result whose args_text merely "
+    "mentions the queried string (e.g. inside a card brief or a wakeup "
+    "prompt) is returned alongside genuine named calls with the SAME shape; "
+    "check `matched_field` on each row — 'args' means that run did NOT call "
+    "the tool, it only talked about it. Use search_in='name' to rule out "
+    "this false-positive class entirely rather than trusting ranking alone. "
+    "A tool may also appear under more than one spelling "
     "(a current vs. a legacy MCP-gateway prefix, or a malformed variant) — "
     "each distinct `name` string below is counted separately; sum the ones "
     "that mean the same tool yourself. 'How many runs called X in total' has "
@@ -640,6 +734,21 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
     miss — without it, searching for a tool by its bare name finds nothing
     even when it was called.
 
+    For `target in ('tool_calls', 'both')`, `search_in` (card
+    3fe5bf3b-9510-8181-8ac4-fc5b334c5286) decides which Lucene field the
+    query is scoped to: 'name' queries only `ExecToolCall.name` (genuine
+    named calls, no argument-blob false positives — the fix for Defect 2),
+    'args' queries only `args_text`, 'both' (default) sends the SAME
+    unqualified query as always, unchanged. Every tool-call result carries
+    `matched_field` ('name'/'args', computed from the row's own `name` —
+    no extra round trip) regardless of mode, and in `search_in='both'`
+    results are sorted name-hits-first.
+
+    Every tool-call result also carries `args_text_snippet` (a window
+    centred on the matched term, capped — never the full blob, which
+    measured 5,831 bytes in a single result) and `args_text_len` (the true
+    length); call `exec_run_detail` for the untruncated text (Defect 1).
+
     Every tool-call result set carries `scope_caveat` and
     `name_counts_among_returned_results` rather than a single trusted count:
     the measurement found at least four non-equivalent encodings of "which
@@ -654,13 +763,16 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
     target = (args.get("target") or "both").strip().lower()
     if target not in ("runs", "tool_calls", "both"):
         return "target must be one of: runs, tool_calls, both", True
+    search_in = (args.get("search_in") or "both").strip().lower()
+    if search_in not in ("name", "args", "both"):
+        return "search_in must be one of: name, args, both", True
     try:
         limit = int(args.get("limit") or 10)
     except (TypeError, ValueError):
         limit = 10
     limit = max(1, min(limit, 100))
 
-    payload: dict = {"query": q, "target": target}
+    payload: dict = {"query": q, "target": target, "search_in": search_in}
 
     if target in ("runs", "both"):
         data, err = await _get(
@@ -676,13 +788,28 @@ async def search_execution_graph(args: dict) -> tuple[str, bool]:
         }
 
     if target in ("tool_calls", "both"):
+        if search_in == "name":
+            tc_query = _lucene_wildcard_terms_scoped(q, "name")
+        elif search_in == "args":
+            tc_query = _lucene_wildcard_terms_scoped(q, "args_text")
+        else:
+            tc_query = _lucene_wildcard_terms(q)
         data, err = await _get(
             "/api/exec/search/tool-calls",
-            {"q": _lucene_wildcard_terms(q), "limit": limit},
+            {"q": tc_query, "limit": limit},
         )
         if err:
             return f"search_execution_graph failed (tool_calls): {err}", True
         results = data.get("results", [])
+        words = [w for w in q.split() if w]
+        for r in results:
+            r["matched_field"] = _matched_field(r, words)
+            snippet, full_len = _args_text_snippet(r.pop("args_text", None), words)
+            r["args_text_snippet"] = snippet
+            r["args_text_len"] = full_len
+        # Stable sort: name hits first, original (score DESC) order
+        # preserved as the tiebreak within each group.
+        results.sort(key=lambda r: 0 if r["matched_field"] == "name" else 1)
         name_counts: dict = {}
         for r in results:
             name = r.get("name") or "<unknown>"
@@ -1337,14 +1464,32 @@ TOOLS_SCHEMA = [
             "cannot recover a query spanning a HYPHEN boundary, so search by the "
             "hyphen-free segment of a tool name, not the full prefixed name. "
             "target='both' (default) runs both. "
-            "Every tool_calls result carries scope_caveat (this only sees named MCP "
-            "tool-call events — NOT a curl-to-/mcp-route inside Bash, NOT a "
-            "denormalised boolean column on `runs`; multiple spellings of the same "
-            "tool are counted separately) and name_counts_among_returned_results — "
-            "there is no single honest total for 'how many runs called tool X', only "
-            "a documented breakdown of what was actually found. possibly_truncated "
-            "is true when the result count hit `limit`: a count is only trustworthy "
-            "when this is false."
+            "For tool_calls, `search_in` picks WHICH field counts as a hit: "
+            "'name' returns ONLY genuine named calls of that tool — use this to "
+            "answer 'did run X actually call tool Y'. 'args' returns ONLY matches "
+            "inside a call's own arguments (the string is merely mentioned — e.g. "
+            "in a prompt or card brief — that run did NOT call the tool). 'both' "
+            "(default) is unchanged from before this parameter existed: every "
+            "match either field, but now every result also carries `matched_field` "
+            "('name'/'args') and name hits sort before args hits. The overcounting "
+            "failure this fixes: at the default, a result with matched_field='args' "
+            "looks identical to a real call unless you check that field — prefer "
+            "search_in='name' over trusting ranking alone when the question is "
+            "specifically 'who called X'. "
+            "Every tool_calls result also carries args_text_snippet (a window "
+            "centred on the matched term, capped — the full argument blob can run "
+            "to kilobytes and would overflow an agent's own result budget) and "
+            "args_text_len (the true full length); call exec_run_detail for the "
+            "untruncated text. "
+            "Every tool_calls result set carries scope_caveat (states BOTH the "
+            "undercounting gaps — NOT a curl-to-/mcp-route inside Bash, NOT a "
+            "denormalised boolean column on `runs` — AND the overcounting one "
+            "above; multiple spellings of the same tool are counted separately) "
+            "and name_counts_among_returned_results — there is no single honest "
+            "total for 'how many runs called tool X', only a documented breakdown "
+            "of what was actually found. possibly_truncated is true when the "
+            "result count hit `limit`: a count is only trustworthy when this is "
+            "false."
         ),
         "inputSchema": {
             "type": "object",
@@ -1354,6 +1499,18 @@ TOOLS_SCHEMA = [
                     "type": "string",
                     "enum": ["runs", "tool_calls", "both"],
                     "description": "Which half of the exec subgraph to search. Default 'both'.",
+                },
+                "search_in": {
+                    "type": "string",
+                    "enum": ["name", "args", "both"],
+                    "description": (
+                        "Only applies to target='tool_calls'/'both'. 'name' = only "
+                        "genuine named tool-call events, no argument-mention false "
+                        "positives. 'args' = only matches inside a call's own "
+                        "arguments (the tool was NOT called). 'both' (default) = "
+                        "everything, each row tagged matched_field, name hits "
+                        "ranked first."
+                    ),
                 },
                 "limit": {"type": "integer", "description": "Max results per target. Range 1-100. Default 10."},
             },
