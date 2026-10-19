@@ -257,7 +257,7 @@ def test_mcp_post_tools_list(app_client):
     resp = tc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert resp.status_code == 200
     tools = resp.json()["result"]["tools"]
-    assert len(tools) == 11
+    assert len(tools) == 13
 
 
 def test_mcp_post_threads_actor_and_db_into_approve_pending_deletions(app_client, monkeypatch):

@@ -20,6 +20,7 @@ dropped here rather than depending on the far side tolerating it.
 from __future__ import annotations
 
 import base64
+import re
 from typing import Callable
 
 import httpx
@@ -554,6 +555,175 @@ async def post_exec_retention(days: int | None = None) -> tuple[dict | None, str
     """POST /api/exec/retention — §8's 180-day `args_text` valve. A monthly
     task; a no-op (`trimmed: 0`) when nothing is old enough."""
     return await _post_json("/api/exec/retention", {"days": days} if days is not None else {})
+
+
+# ---------------------------------------------------------------------------
+# §9 step 4 — the two agent-facing MCP tools named in the design doc
+# (`search_execution_graph`, `exec_run_detail`), over the search/detail
+# routes the sync engine's own calls above already prove reachable. Both ARE
+# in `TOOLS_SCHEMA` below — this is where the exec subgraph stops being
+# something only the sync engine can see.
+# ---------------------------------------------------------------------------
+
+#: Lucene query-syntax metacharacters (standard analyser) — duplicated from
+#: aw-knowledgeable's own `core/graph.py::_lucene_escape` rather than
+#: imported: this connector is a plain HTTP client with no import of that
+#: repo's code (module docstring, D2 §10).
+_LUCENE_SPECIAL_RE = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
+
+
+def _lucene_escape(text: str) -> str:
+    return _LUCENE_SPECIAL_RE.sub(r"\\\1", text)
+
+
+def _lucene_wildcard_terms(text: str) -> str:
+    """OR of per-word leading+trailing wildcards over the tool-call fulltext
+    index — the fix for the measured defect named in the §9 step 4 card:
+    Lucene's standard analyser does not split tokens on underscores, so a
+    qualified tool-call name like
+    `mcp__aw-gateway__aw__aw_knowledgeable__approve_pending_deletions` is ONE
+    indexed token, and a bare term query for a substring of it (e.g.
+    `approve_pending_deletions`) matches nothing even though the tool was
+    called. Verified empirically against a throwaway Neo4j 5 + fulltext
+    index: 0 hits on the bare term, 2 hits (the current and legacy
+    MCP-gateway prefix spellings) on `*approve_pending_deletions*`, no
+    parser error either way.
+
+    Splits only on whitespace, so a multi-word free-text query ORs each
+    word's wildcard rather than requiring one token to contain the whole
+    phrase. The index DOES still split on hyphens — verified the same way, a
+    wildcard pattern containing a literal hyphen matches nothing, because no
+    indexed token contains that character anymore — so this cannot recover a
+    query that spans a hyphen boundary (e.g. `aw-gateway`); search by the
+    hyphen-free segment of a tool name instead (`approve_pending_deletions`,
+    not the full qualified name).
+    """
+    words = [w for w in text.split() if w]
+    if not words:
+        return ""
+    return " OR ".join(f"*{_lucene_escape(w)}*" for w in words)
+
+
+#: Attached to every tool-call search result. The measurement
+#: (.tmp/exec-retrieval-test/RESULTS.md) found at least four non-equivalent
+#: encodings of "run X called tool Y" that disagree with each other; this
+#: tool sees exactly one of them (named MCP tool-call events synced from
+#: AP-MT `run_events`), and must say so rather than imply completeness.
+EXEC_TOOLCALL_SCOPE_CAVEAT = (
+    "Covers only named MCP tool-call events synced from AP-MT run_events "
+    "(kind='tool_call'). Does NOT include: a curl to an app's own /mcp route "
+    "inside a Bash call (often guarded by a shell conditional whose exit "
+    "status was never recorded), or a denormalised boolean column on `runs` "
+    "(e.g. marked_flow_done) — both live only in Postgres and are not "
+    "projected here. A tool may also appear under more than one spelling "
+    "(a current vs. a legacy MCP-gateway prefix, or a malformed variant) — "
+    "each distinct `name` string below is counted separately; sum the ones "
+    "that mean the same tool yourself. 'How many runs called X in total' has "
+    "no single honest number from this data — see name_counts_among_returned_"
+    "results and possibly_truncated instead of trusting a bare count."
+)
+
+
+async def search_execution_graph(args: dict) -> tuple[str, bool]:
+    """GET /api/exec/search/runs and/or /api/exec/search/tool-calls.
+
+    `target` picks which half of the exec subgraph's fulltext layer to hit:
+    'runs' (free text over Run input/output text), 'tool_calls' (tool-call
+    name + arguments), or 'both' (default).
+
+    Run-text queries are sent as literal Lucene terms, unwildcarded — the
+    measurement's text-bearing pass (RESULTS.md v2) scored 10/10 on semantic
+    recall, paraphrase recall and open synthesis with plain fulltext over
+    natural-language run prose; no wildcarding was needed or wanted there.
+    Tool-call queries are wildcard-wrapped per word (see
+    `_lucene_wildcard_terms`) to fix the measured underscore-tokenization
+    miss — without it, searching for a tool by its bare name finds nothing
+    even when it was called.
+
+    Every tool-call result set carries `scope_caveat` and
+    `name_counts_among_returned_results` rather than a single trusted count:
+    the measurement found at least four non-equivalent encodings of "which
+    runs called tool X", and a tool returning one confident integer here
+    would be lying. `possibly_truncated` is true when the result count hit
+    `limit` — raise it (max 100) or narrow the query before treating a count
+    as complete.
+    """
+    q = (args.get("q") or "").strip()
+    if not q:
+        return "q is required", True
+    target = (args.get("target") or "both").strip().lower()
+    if target not in ("runs", "tool_calls", "both"):
+        return "target must be one of: runs, tool_calls, both", True
+    try:
+        limit = int(args.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 100))
+
+    payload: dict = {"query": q, "target": target}
+
+    if target in ("runs", "both"):
+        data, err = await _get(
+            "/api/exec/search/runs", {"q": _lucene_escape(q), "limit": limit}
+        )
+        if err:
+            return f"search_execution_graph failed (runs): {err}", True
+        results = data.get("results", [])
+        payload["runs"] = {
+            "results": results,
+            "count": len(results),
+            "possibly_truncated": len(results) >= limit,
+        }
+
+    if target in ("tool_calls", "both"):
+        data, err = await _get(
+            "/api/exec/search/tool-calls",
+            {"q": _lucene_wildcard_terms(q), "limit": limit},
+        )
+        if err:
+            return f"search_execution_graph failed (tool_calls): {err}", True
+        results = data.get("results", [])
+        name_counts: dict = {}
+        for r in results:
+            name = r.get("name") or "<unknown>"
+            name_counts[name] = name_counts.get(name, 0) + 1
+        payload["tool_calls"] = {
+            "results": results,
+            "count": len(results),
+            "possibly_truncated": len(results) >= limit,
+            "name_counts_among_returned_results": name_counts,
+            "scope_caveat": EXEC_TOOLCALL_SCOPE_CAVEAT,
+        }
+
+    return _as_text(payload), False
+
+
+async def exec_run_detail(args: dict) -> tuple[str, bool]:
+    """GET /api/exec/runs/{run_id} — one run's metadata and scrubbed text,
+    its tool calls, and its structural joins: direct CHILD_OF children,
+    plus parent/qa/session/card pointers on the run itself.
+
+    Passed through verbatim rather than re-formatted, which matters for one
+    field in particular: the backend's own `caveat` — `CHILD_OF understates
+    lineage across wakeups` (measured: 4 descendants reported where the real
+    causal chain had 11) — stays in the response body exactly as the backend
+    worded it, so there is one copy of that warning, not two that could
+    drift apart.
+    """
+    run_id = (args.get("run_id") or "").strip()
+    if not run_id:
+        return "run_id is required", True
+    params: dict = {}
+    for key in ("toolcall_limit", "children_limit"):
+        if args.get(key) is not None:
+            try:
+                params[key] = int(args[key])
+            except (TypeError, ValueError):
+                pass
+    data, err = await _get(f"/api/exec/runs/{run_id}", params or None)
+    if err:
+        return f"exec_run_detail failed: {err}", True
+    return _as_text(data), False
 
 
 async def create_node(args: dict) -> tuple[str, bool]:
@@ -1149,6 +1319,68 @@ TOOLS_SCHEMA = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "search_execution_graph",
+        "description": (
+            "Full-text search over this workspace's own agent-run execution history "
+            "(docs/design/execution-history-in-production-neo4j.md) — a separate, "
+            "tenant-isolated subgraph next to the knowledge corpus, service-caller-only. "
+            "Searches run input/output text and/or tool-call names+arguments. "
+            "target='runs' searches Run.input_text/output_text (natural-language "
+            "prose — plain fulltext, no wildcarding). target='tool_calls' searches "
+            "ExecToolCall.name/args_text, wildcard-wrapped per word so a tool name "
+            "like 'approve_pending_deletions' is found even though the full qualified "
+            "name (e.g. 'mcp__aw-gateway__aw__aw_knowledgeable__approve_pending_deletions') "
+            "is one indexed token that a bare term query would miss entirely — this "
+            "cannot recover a query spanning a HYPHEN boundary, so search by the "
+            "hyphen-free segment of a tool name, not the full prefixed name. "
+            "target='both' (default) runs both. "
+            "Every tool_calls result carries scope_caveat (this only sees named MCP "
+            "tool-call events — NOT a curl-to-/mcp-route inside Bash, NOT a "
+            "denormalised boolean column on `runs`; multiple spellings of the same "
+            "tool are counted separately) and name_counts_among_returned_results — "
+            "there is no single honest total for 'how many runs called tool X', only "
+            "a documented breakdown of what was actually found. possibly_truncated "
+            "is true when the result count hit `limit`: a count is only trustworthy "
+            "when this is false."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "Query text. For tool_calls, use the bare tool name (no gateway prefix, no hyphens) for the most reliable match."},
+                "target": {
+                    "type": "string",
+                    "enum": ["runs", "tool_calls", "both"],
+                    "description": "Which half of the exec subgraph to search. Default 'both'.",
+                },
+                "limit": {"type": "integer", "description": "Max results per target. Range 1-100. Default 10."},
+            },
+            "required": ["q"],
+        },
+    },
+    {
+        "name": "exec_run_detail",
+        "description": (
+            "One agent run from the execution-history subgraph: metadata, scrubbed "
+            "input/output text, its tool calls, and its structural joins — direct "
+            "CHILD_OF children plus parent_run_id/qa_of_run_id/session_id/card_page_id "
+            "on the run itself. 404 if run_id does not exist in this tenant. "
+            "The response always carries `caveat`: CHILD_OF understates lineage "
+            "across wakeups (a wakeup-resumed run's causal parent is recorded as "
+            "prose inside its input, not a foreign key) — measured: a chain whose "
+            "real depth was 11 traversed as 4. Do not report a descendant count or a "
+            "root run from this data as exhaustive without repeating that caveat."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The run id to look up."},
+                "toolcall_limit": {"type": "integer", "description": "Max tool calls to return. Range 0-2000. Default 200."},
+                "children_limit": {"type": "integer", "description": "Max direct children to return. Range 0-1000. Default 100."},
+            },
+            "required": ["run_id"],
         },
     },
     {

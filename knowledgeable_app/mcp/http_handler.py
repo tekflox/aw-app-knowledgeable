@@ -32,6 +32,12 @@ _DISPATCH = {
     # `include_code` absent/false delegates straight to `client.knowledge_search`
     # unchanged; no other dispatch row changes.
     "knowledge_search": forwarding.compose_knowledge_search,
+    # §9 step 4 (docs/design/execution-history-in-production-neo4j.md) — the
+    # agent-facing surface over the exec subgraph the sync engine's own calls
+    # in client.py already populate. Same dispatch shape as every read-only
+    # tool above; service-caller-only enforcement happens server-side.
+    "search_execution_graph": client.search_execution_graph,
+    "exec_run_detail": client.exec_run_detail,
     "list_pending_deletions": pending_deletions.list_pending_deletions,
 }
 

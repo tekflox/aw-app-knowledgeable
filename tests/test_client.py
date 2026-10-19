@@ -100,12 +100,13 @@ def _fresh_fake_client(monkeypatch):
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: "")
 
 
-def test_all_eleven_tools_are_advertised_and_dispatchable():
+def test_all_thirteen_tools_are_advertised_and_dispatchable():
     names = {t["name"] for t in client.TOOLS_SCHEMA}
     assert names == {
         "upload_document", "create_node", "create_link",
         "get_graph", "list_documents", "search_nodes", "search_graph",
-        "knowledge_search", "list_pending_deletions", "approve_pending_deletions",
+        "knowledge_search", "search_execution_graph", "exec_run_detail",
+        "list_pending_deletions", "approve_pending_deletions",
         "decline_pending_deletions",
     }
     # approve/decline need `db` (the audit trail) so they dispatch through
@@ -315,6 +316,136 @@ def test_search_graph_surfaces_backend_400_verbatim():
     text, is_error = _run(client.search_graph({"q": "sushi", "mode": "lexical", "beam_width": "5"}))
     assert is_error is True
     assert "beam_width is only valid with mode=tree" in text
+
+
+def test_lucene_wildcard_terms_fixes_the_measured_underscore_miss():
+    """docs/design/execution-history-in-production-neo4j.md §9 step 4 card —
+    verified empirically against a real Neo4j fulltext index (not asserted
+    here, just pinned): a bare term for 'approve_pending_deletions' misses
+    the qualified name entirely because Lucene's standard analyser does not
+    split on underscores; a leading+trailing wildcard recovers it."""
+    assert client._lucene_wildcard_terms("approve_pending_deletions") == "*approve_pending_deletions*"
+    assert (
+        client._lucene_wildcard_terms("pending deletions")
+        == "*pending* OR *deletions*"
+    )
+    assert client._lucene_wildcard_terms("   ") == ""
+
+
+def test_lucene_wildcard_terms_escapes_lucene_syntax_inside_each_word():
+    """A caller's query must not be able to break out of the wildcard and
+    inject Lucene query syntax (e.g. a field qualifier or boolean operator)."""
+    assert client._lucene_wildcard_terms("a:b") == '*a\\:b*'
+    assert client._lucene_wildcard_terms("x*y") == "*x\\*y*"
+
+
+def test_search_execution_graph_requires_q():
+    text, is_error = _run(client.search_execution_graph({}))
+    assert is_error is True and "q is required" in text
+
+
+def test_search_execution_graph_rejects_an_unknown_target():
+    text, is_error = _run(client.search_execution_graph({"q": "x", "target": "bogus"}))
+    assert is_error is True and "target must be one of" in text
+
+
+def test_search_execution_graph_both_hits_runs_and_tool_calls():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [{"run_id": "r1"}]}))
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [{"name": "approve_pending_deletions"}]}))
+    text, is_error = _run(client.search_execution_graph({"q": "approve_pending_deletions"}))
+    assert is_error is False
+    assert "r1" in text and "approve_pending_deletions" in text
+
+    runs_call, tc_call = _FakeAsyncClient._CALLS
+    assert runs_call["url"] == "http://aw-knowledgeable:8090/api/exec/search/runs"
+    assert runs_call["params"] == {"q": "approve_pending_deletions", "limit": 10}, (
+        "run-text queries must stay literal, unwildcarded — the measurement's v2 "
+        "pass hit 10/10 on prose questions with plain fulltext"
+    )
+    assert tc_call["url"] == "http://aw-knowledgeable:8090/api/exec/search/tool-calls"
+    assert tc_call["params"] == {"q": "*approve_pending_deletions*", "limit": 10}, (
+        "tool-call queries must be wildcard-wrapped to find a bare tool name "
+        "inside its full qualified, underscore-joined form"
+    )
+
+
+def test_search_execution_graph_target_runs_only_makes_one_call():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    text, is_error = _run(client.search_execution_graph({"q": "redis acl", "target": "runs"}))
+    assert is_error is False
+    assert len(_FakeAsyncClient._CALLS) == 1
+    assert "tool_calls" not in text
+
+
+def test_search_execution_graph_tool_calls_carry_the_scope_caveat_and_name_counts():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [
+        {"name": "approve_pending_deletions"},
+        {"name": "approve_pending_deletions"},
+        {"name": "aw-gateway.aw__aw_knowledgeable__approve_pending_deletions"},
+    ]}))
+    text, is_error = _run(
+        client.search_execution_graph({"q": "approve_pending_deletions", "target": "tool_calls"})
+    )
+    assert is_error is False
+    assert "Covers only named MCP tool-call events" in text
+    assert '"approve_pending_deletions": 2' in text
+    assert '"aw-gateway.aw__aw_knowledgeable__approve_pending_deletions": 1' in text
+
+
+def test_search_execution_graph_flags_possible_truncation():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": [{"id": str(i)} for i in range(3)]}))
+    text, is_error = _run(
+        client.search_execution_graph({"q": "x", "target": "runs", "limit": 3})
+    )
+    assert is_error is False
+    assert '"possibly_truncated": true' in text
+
+
+def test_search_execution_graph_clamps_limit_to_the_backend_floor_and_ceiling():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"results": []}))
+    _run(client.search_execution_graph({"q": "x", "target": "runs", "limit": 9999}))
+    assert _FakeAsyncClient._CALLS[0]["params"]["limit"] == 100
+
+
+def test_search_execution_graph_surfaces_a_backend_error_verbatim():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(503, {"detail": "index not ready"}))
+    text, is_error = _run(client.search_execution_graph({"q": "x", "target": "runs"}))
+    assert is_error is True
+    assert "index not ready" in text
+
+
+def test_exec_run_detail_requires_run_id():
+    text, is_error = _run(client.exec_run_detail({}))
+    assert is_error is True and "run_id is required" in text
+
+
+def test_exec_run_detail_sends_the_secret_header_and_run_id_in_the_path():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {
+        "run": {"id": "run-1"}, "tool_calls": [], "children": [],
+        "caveat": "CHILD_OF understates lineage across wakeups",
+    }))
+    text, is_error = _run(client.exec_run_detail({"run_id": "run-1"}))
+    assert is_error is False
+    assert "CHILD_OF understates lineage across wakeups" in text, (
+        "the backend's own lineage caveat must reach the agent verbatim"
+    )
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["url"] == "http://aw-knowledgeable:8090/api/exec/runs/run-1"
+    assert call["headers"] == {"X-Internal-Secret": "s3cr3t"}
+    assert call["params"] is None
+
+
+def test_exec_run_detail_forwards_optional_limits():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"run": {}, "tool_calls": [], "children": []}))
+    _run(client.exec_run_detail({"run_id": "run-1", "toolcall_limit": "5", "children_limit": "2"}))
+    assert _FakeAsyncClient._CALLS[0]["params"] == {"toolcall_limit": 5, "children_limit": 2}
+
+
+def test_exec_run_detail_reports_404_as_a_tool_error_not_a_crash():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(404, {"detail": "run 'ghost' not found"}))
+    text, is_error = _run(client.exec_run_detail({"run_id": "ghost"}))
+    assert is_error is True
+    assert "run 'ghost' not found" in text
 
 
 def test_upload_document_requires_filename_and_content():
@@ -613,7 +744,7 @@ def test_initialize_and_tools_list():
     init = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
     assert init["result"]["serverInfo"]["name"] == "aw-knowledgeable"
     listed = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-    assert len(listed["result"]["tools"]) == 11
+    assert len(listed["result"]["tools"]) == 13
 
 
 def test_initialized_notification_gets_no_response():
