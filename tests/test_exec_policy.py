@@ -859,3 +859,55 @@ def test_the_output_axis_resolves_through_the_same_cache(tmp_path):
     # And the per-ROW counters are not deduplicated by the memo (slice 2's
     # own property, re-asserted for the axis this slice adds).
     assert table.counters["policy_denied_results"] == 1000
+
+
+def test_a_failed_scan_files_everything_as_actionable_not_known(tmp_path):
+    """The check Frederico asked for before accepting the test-is-wrong
+    reading, which turned out to find a real defect.
+
+    A degraded table (apps root unreadable) denies BOTH axes — that is §3.5
+    working, and it is why slice 4's release went red on a test that read the
+    live tree. But the counter split must not then quietly file a
+    `UNRESOLVABLE_UPSTREAMS` name under "known and unactionable": in that
+    state the name is unresolved because the TREE could not be read, not
+    because it is a linked-workspace federation, and the registry's claim
+    ("no manifest could ever attribute this") is a statement about a tree
+    that WAS read. A `FileNotFoundError` on the apps root is the most
+    actionable condition in this subsystem and no part of it may be
+    classified as expected.
+    """
+    table = exec_policy.PolicyTable.from_workspace(str(tmp_path / "nope"))
+    assert table.status["scan_error"], "this test is only meaningful on a degraded table"
+    federation = "mcp__aw-gateway__aw__fredericowu__fredericowu__google_workspace__list_calendars"
+    uninstalled = "mcp__aw-gateway__aw__gone__some_tool"
+    for name in (federation, uninstalled):
+        d = table.decide_output(name)
+        assert (d.allow_call, d.allow_output) == (False, False), name
+        assert exec_policy.apply_output_axis(d, "whatever came back") is None, name
+
+    counters = table.counters
+    assert counters["policy_unresolved_known"] == [], (
+        "a failed scan must not classify anything as known-and-unactionable"
+    )
+    assert counters["policy_unresolved_actionable"] == 2
+    assert counters["policy_unresolved_results"] == 2, (
+        "a total degradation is not a policy denial — it belongs in the "
+        "fail-closed bucket, and it must actually fill up"
+    )
+    assert counters["policy_denied_results"] == 0
+    assert counters["policy_scan_error"]
+
+
+def test_the_known_bucket_still_works_when_the_scan_SUCCEEDED(tmp_path):
+    """The other half: the suppression above is conditional on the scan
+    failing, not a removal of the registry. With a tree that read fine, a
+    federation is still filed as known — otherwise the fix would have
+    deleted the thing slice 4 added."""
+    table = _table(tmp_path)
+    assert table.status["scan_error"] is None
+    federation = "mcp__aw-gateway__aw__fredericowu_browser__fredericowu__playwright__browser_click"
+    table.decide_output(federation)
+    table.decide_output("mcp__aw-gateway__aw__gone__some_tool")
+    counters = table.counters
+    assert counters["policy_unresolved_known"] == [federation]
+    assert counters["policy_unresolved_actionable"] == 1

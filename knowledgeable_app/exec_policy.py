@@ -574,13 +574,30 @@ class PolicyTable:
         app, a fourth gateway spelling, a third-party ``mcp__`` server, a
         row with no name at all. That second list is the one where a NEW
         entry means something changed and somebody should look.
+
+        **A FAILED SCAN puts everything in ``actionable``, including the
+        names this registry normally covers.** When the apps root could not
+        be read at all, a federation's name is unresolved because the TREE
+        is unreadable, not because it is a federation — and the registry's
+        whole claim ("no manifest could ever attribute this") is a statement
+        about a tree that was successfully read. Letting those names keep
+        filing themselves under "known and unactionable" in that state would
+        both understate the actionable count by however many federations the
+        tick happened to see, and do it in exactly the direction this
+        registry exists to avoid: a `FileNotFoundError` on the apps root is
+        the most actionable thing in this subsystem, and no part of it may
+        be classified as expected. ``policy_scan_error`` is reported
+        alongside, but a reader who only watches the counters must not be
+        told the quiet version.
         """
         actionable: list[str] = []
         known: list[str] = []
+        degraded = self._scan_error is not None
         for name in sorted(self._unresolved):
             decision = self._cache.get(name if name != EMPTY_NAME_LABEL else "")
             upstream = decision.upstream if decision else None
-            (known if upstream in UNRESOLVABLE_UPSTREAMS else actionable).append(name)
+            is_known = not degraded and upstream in UNRESOLVABLE_UPSTREAMS
+            (known if is_known else actionable).append(name)
         return actionable, known
 
     def _resolve(self, name: str) -> Decision:

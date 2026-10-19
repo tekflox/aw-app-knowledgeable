@@ -1453,29 +1453,56 @@ import json  # noqa: E402
 from knowledgeable_app import exec_policy  # noqa: E402
 
 
-def _policy_tree(tmp_path, monkeypatch, indexing):
+def _policy_tree(tmp_path, monkeypatch, apps):
     """Point the tick's own `PolicyTable.from_workspace()` at a fake installed
     tree. Patched at `_apps_root` rather than by passing a table in, so the
-    test exercises the real build-per-tick path (§5) — no app manifest ships
-    `contributes.mcp.indexing` yet, so a declaration cannot come from the
-    real tree.
+    test exercises the real build-per-tick path (§5).
 
-    The server key is the REAL one (`aw-app-remote-host-cli`, slug
-    `remote-host-cli` — a key != slug join), because a fixture that invented
-    it would pass against itself and resolve nothing in production.
+    **Every policy test in this block must call this, including the ones
+    whose expectation happens to match the live workspace.** The blind spot
+    it closes, paid for once in CI on slice 4's own release: a test that read
+    the REAL `/opt/aw-workspace/apps` was green for every human and every
+    agent running the suite inside this workspace, and red only in CI, where
+    that directory does not exist — so `from_workspace()` degrades, every
+    routed name fails closed, and "a never-declared tool's result lands"
+    becomes false. Two independent full-suite verifications both reported
+    715 passed and neither could see it. `tests/conftest.py`'s autouse guard
+    now makes the dependency impossible to acquire by accident; this helper
+    is what a test uses instead.
+
+    `apps` is `{slug: {"servers": [...], "indexing": [...] | None}}`. Server
+    keys must be the REAL ones (`aw-app-remote-host-cli` for slug
+    `remote-host-cli`, `aw-kanban` for slug `notion` — both key != slug
+    joins), because a fixture that invented them would pass against itself
+    and resolve nothing in production (§12 risk 1). `indexing: None` writes
+    a manifest with no `indexing` key at all, which is the "never declared"
+    state ~36 installed apps are really in.
     """
     root = tmp_path / "apps"
-    (root / "remote-host-cli").mkdir(parents=True)
-    (root / "remote-host-cli" / "mcp.json").write_text(
-        json.dumps({"mcpServers": {"aw-app-remote-host-cli": {"type": "http"}}}),
-        encoding="utf-8",
-    )
-    (root / "remote-host-cli" / "aw-app.json").write_text(
-        json.dumps({"id": "remote-host-cli", "contributes": {"mcp": {"indexing": indexing}}}),
-        encoding="utf-8",
-    )
+    for slug, spec in apps.items():
+        app_dir = root / slug
+        app_dir.mkdir(parents=True)
+        (app_dir / "mcp.json").write_text(
+            json.dumps({"mcpServers": {k: {"type": "http"} for k in spec["servers"]}}),
+            encoding="utf-8",
+        )
+        contributes = {}
+        if spec.get("indexing") is not None:
+            contributes["mcp"] = {"indexing": spec["indexing"]}
+        (app_dir / "aw-app.json").write_text(
+            json.dumps({"id": slug, "contributes": contributes}), encoding="utf-8"
+        )
     monkeypatch.setattr(exec_policy, "_apps_root", lambda: str(root))
     return root
+
+
+def _rhc_tree(tmp_path, monkeypatch, indexing):
+    """The common case: just `remote-host-cli`, with the given declaration."""
+    return _policy_tree(
+        tmp_path,
+        monkeypatch,
+        {"remote-host-cli": {"servers": ["aw-app-remote-host-cli"], "indexing": indexing}},
+    )
 
 
 _RHC = "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file"
@@ -1493,7 +1520,7 @@ def test_a_declared_output_false_empties_the_result_the_floor_would_have_kept(
     goes red with the planted value in the ingest payload — which is exactly
     the state the connector shipped in between §13 slice 3 and this slice.
     """
-    _policy_tree(
+    _rhc_tree(
         tmp_path,
         monkeypatch,
         [{"tool": "remote_host_read_file", "call": True, "output": False,
@@ -1527,7 +1554,7 @@ def test_a_declared_output_false_empties_the_result_the_floor_would_have_kept(
 def test_a_declared_output_true_keeps_the_result(calls, monkeypatch, tmp_path):
     """The other half of the signal. If `output: true` emptied results too,
     the slice would be a blanket ban with extra steps."""
-    _policy_tree(
+    _rhc_tree(
         tmp_path,
         monkeypatch,
         [{"tool": "remote_host_read_file", "call": True, "output": True}],
@@ -1544,12 +1571,28 @@ def test_a_declared_output_true_keeps_the_result(calls, monkeypatch, tmp_path):
     assert result["policy_denied_results"] == 0
 
 
-def test_a_never_declared_tools_result_still_lands(calls, monkeypatch):
-    """The blacklist on the output axis, through the REAL installed tree (no
-    `_apps_root` patch): `add_kanban_comment` is a real tool of a real
-    installed app that declares nothing, and its result must still project.
+def test_a_never_declared_tools_result_still_lands(calls, monkeypatch, tmp_path):
+    """The blacklist on the output axis: `add_kanban_comment` is attributed to
+    an installed app that declares nothing, and its result must still project.
     The opposite default would empty ~1 GB of legitimately searchable text,
-    which is how a security layer gets switched off."""
+    which is how a security layer gets switched off.
+
+    **This test used to read the real `/opt/aw-workspace/apps` and that is
+    why slice 4's release went red.** `notion`/`aw-kanban` is a real
+    installed app here, so the assertion held for anyone running the suite
+    inside this workspace — and in CI, where the directory does not exist,
+    `from_workspace()` degrades, every routed name fails closed, and the
+    result is correctly denied. The test was asserting a property of the
+    machine it ran on. The real tree is now unreachable by default
+    (`tests/conftest.py`) and the app is declared here instead; the key is
+    still the REAL one (`aw-kanban` -> slug `notion`, a key != slug join),
+    because that join is the thing worth pinning.
+    """
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        {"notion": {"servers": ["notion", "aw-kanban"], "indexing": None}},
+    )
     conn = _FakeConn(
         runs=[_pg_row("run-1")],
         tool_calls=[
@@ -1570,13 +1613,24 @@ def test_a_never_declared_tools_result_still_lands(calls, monkeypatch):
 
 
 def test_an_unresolvable_name_loses_its_result_as_well_as_its_arguments(
-    calls, monkeypatch
+    calls, monkeypatch, tmp_path
 ):
     """§3.5 on both axes. An unresolvable name is the one case where the
     output axis could plausibly have been left permissive, and it must not
     be: the output is the more dangerous of the two channels, so "nothing
     could attribute it, therefore index the result" would make the output
-    axis strictly weaker than the call axis for no reason."""
+    axis strictly weaker than the call axis for no reason.
+
+    Needs a tree that was READ SUCCESSFULLY and simply does not contain the
+    upstream — a scan FAILURE reaches the same verdict by a different route
+    (`policy_scan_error`), so leaving this on the real tree would have let
+    the right assertion pass for the wrong reason in CI.
+    """
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        {"notion": {"servers": ["notion", "aw-kanban"], "indexing": None}},
+    )
     conn = _FakeConn(
         runs=[_pg_row("run-1")],
         tool_calls=[
@@ -1600,7 +1654,7 @@ def test_an_unresolvable_name_loses_its_result_as_well_as_its_arguments(
 
 
 def test_a_standing_unresolvable_upstream_does_not_drown_the_new_counter(
-    calls, monkeypatch
+    calls, monkeypatch, tmp_path
 ):
     """The slice-2 measurement, as a tick. `fredericowu_browser` is a
     linked-workspace BYOD federation with no `apps/<slug>/mcp.json`: it fails
@@ -1611,8 +1665,21 @@ def test_a_standing_unresolvable_upstream_does_not_drown_the_new_counter(
 
     It is still denied, still counted, and still in `policy_unresolved`: the
     registry changes counting, never behaviour, and the acknowledge path on
-    the doctor is slice 3's."""
+    the doctor is slice 3's.
+
+    **A SUCCESSFULLY-READ tree is load-bearing here, not incidental.** The
+    registry's claim is "no manifest could ever attribute this", which is a
+    statement about a tree that was read; under `policy_scan_error` nothing
+    is classified as known (see `unresolved_split`). On the real tree in CI
+    this test passed for the wrong reason — the scan had failed and the
+    assertion happened to still hold before that rule existed.
+    """
     name = "mcp__aw-gateway__aw__fredericowu_browser__fredericowu__playwright__browser_snapshot"
+    _policy_tree(
+        tmp_path,
+        monkeypatch,
+        {"notion": {"servers": ["notion", "aw-kanban"], "indexing": None}},
+    )
     conn = _FakeConn(
         runs=[_pg_row("run-1")],
         tool_calls=[_pg_call("run-1", tool_use_id="toolu_f", name=name)],
@@ -1673,7 +1740,7 @@ def test_an_output_denial_on_a_call_that_returned_nothing_claims_no_drop(
     paired result with no content stays absent rather than being reported as
     dropped. `result_dropped` must mean something, and a row that claims a
     drop that never happened is how it stops meaning anything."""
-    _policy_tree(
+    _rhc_tree(
         tmp_path,
         monkeypatch,
         [{"tool": "remote_host_read_file", "call": True, "output": False, "reason": "x"}],
@@ -1696,7 +1763,7 @@ def test_the_output_counters_ride_the_sentinel(calls, monkeypatch, tmp_path):
     """The `event_kinds_unreviewed` mechanism (§8), for the slice-4 numbers.
     The tick is the only thing that sees them, so a counter it does not post
     onto the sentinel is a counter no status or doctor surface can read."""
-    _policy_tree(
+    _rhc_tree(
         tmp_path,
         monkeypatch,
         [{"tool": "remote_host_read_file", "call": True, "output": False, "reason": "x"}],
