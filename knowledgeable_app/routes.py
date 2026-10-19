@@ -435,6 +435,13 @@ def build_routes(ctx) -> FastAPI:
         # owed (§13.12 point 8) — the `vault_names_uncovered` mechanism, for
         # event kinds instead of vault secrets.
         payload["event_kinds_unreviewed"] = exec_sync.event_kinds_unreviewed(remote)
+        # The same mechanism for tool identities (exec-index-per-tool-policy.md
+        # §3.5/§11): observed names that parsed as MCP-routed, resolved to no
+        # installed app, and therefore had their ARGUMENTS DROPPED. Distinct
+        # raw spellings, so a fourth gateway prefix is diagnosed from this
+        # line rather than from a future incident — which is the whole
+        # mitigation for fail-closed resolution being silent otherwise.
+        payload["policy_unresolved"] = exec_sync.policy_unresolved(remote)
         # Degraded is computed on THIS side too, not only read off the
         # sentinel: a sentinel we cannot reach is itself degraded, and a
         # status surface that reports `None` for that reads as healthy.
@@ -450,6 +457,7 @@ def build_routes(ctx) -> FastAPI:
                 err or not remote or staleness.get("degraded")
                 or exec_sync.scrub_degraded(scrub)
                 or payload["event_kinds_unreviewed"]
+                or payload["policy_unresolved"]
             )
         )
         return payload

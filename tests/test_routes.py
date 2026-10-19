@@ -739,6 +739,46 @@ def test_exec_sync_status_is_degraded_by_an_unreviewed_event_kind(
     assert cleared["event_kinds_unreviewed"] == []
 
 
+def test_exec_sync_status_is_degraded_by_an_unresolved_tool_identity(
+    exec_app_client, monkeypatch
+):
+    """The per-tool-policy alarm, at the same endpoint
+    (docs/design/exec-index-per-tool-policy.md §3.5/§8, slice 2).
+
+    These names had their ARGUMENTS DROPPED because nothing could attribute
+    them to an installed app — fail closed. §11 states the cost of that
+    direction plainly: a gateway rename stops indexing arguments
+    workspace-wide until someone reads the doctor, so this line IS the
+    mitigation and has to be able to go red. Verified in both directions,
+    same as the event-kind alarm above.
+    """
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _with_unresolved():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": {
+                    "policy_unresolved": ["mcp__a-new-gateway__aw__kb__search_nodes"],
+                    "policy_denied_calls": 12,
+                },
+            },
+            None,
+        )
+
+    monkeypatch.setattr(client, "get_exec_status", _with_unresolved)
+    body = tc.get("/exec-sync/status").json()
+    assert body["degraded"] is True
+    assert body["policy_unresolved"] == ["mcp__a-new-gateway__aw__kb__search_nodes"]
+    assert tc.get("/exec-sync/doctor").json()["ok"] is False
+
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+    cleared = tc.get("/exec-sync/status").json()
+    assert cleared["degraded"] is False
+    assert cleared["policy_unresolved"] == []
+
+
 def test_a_sentinel_without_the_key_is_not_degraded(exec_app_client, monkeypatch):
     """A sentinel stamped by a connector older than §13 slice 1 has no
     `event_kinds_unreviewed` key at all. That must read as "nothing owed",
@@ -760,6 +800,8 @@ def test_a_sentinel_without_the_key_is_not_degraded(exec_app_client, monkeypatch
     monkeypatch.setattr(client, "get_exec_status", _old_sentinel)
     body = tc.get("/exec-sync/status").json()
     assert body["event_kinds_unreviewed"] == []
+    # Same contract for the policy alarm, for the same reason.
+    assert body["policy_unresolved"] == []
     assert body["degraded"] is False
 
 

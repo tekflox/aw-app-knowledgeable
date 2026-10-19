@@ -54,7 +54,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import event_kinds, exec_scrub, vault_coverage
+from . import event_kinds, exec_policy, exec_scrub, vault_coverage
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable.exec_sync")
@@ -382,19 +382,42 @@ def build_run_row(record, scrubber: exec_scrub.Scrubber) -> dict:
     }
 
 
-def build_toolcall_row(record, scrubber: exec_scrub.Scrubber) -> dict:
+def build_toolcall_row(
+    record, scrubber: exec_scrub.Scrubber, policy: exec_policy.PolicyTable
+) -> dict:
     """One `run_events` tool_call row -> one ingest row, scrubbed — and with
-    a secret-handling tool's arguments DROPPED, not scrubbed (§6 point 3)."""
+    a secret-handling tool's arguments DROPPED, not scrubbed (§6 point 3).
+
+    Two independent gates on the arguments, in this order, and the order is
+    the contract (exec-index-per-tool-policy.md §2):
+
+    1. **The floor**, via `scrubber.scrub_tool_args` — the four secret-store
+       tools' arguments become `None`, as they have since slice 0, with no
+       policy consulted at all. `exec_policy` re-checks the same floor first
+       in its own resolution, so neither gate depends on the other being
+       there.
+    2. **Per-tool policy**, via `exec_policy` — the app's manifest
+       declaration, a human override, or a fail-closed denial for a routed
+       name nothing can attribute. Denied arguments carry a marker distinct
+       from the floor's `None` (§12 risk 4), so §13.2's purge and
+       verification queries can still tell a remediated credential exposure
+       from routine policy.
+
+    `policy` is a required parameter rather than an optional one: a default
+    would mean "no policy table, therefore index", which is the exact
+    fail-open shape this whole card exists to delete.
+    """
     run_id, payload, ts, seq = record
     payload = payload if isinstance(payload, dict) else {}
     name = _clean(payload.get("name"))
+    args_text = scrubber.scrub_tool_args(
+        name=name, args_text=_as_text(payload.get("input"))
+    )
     return {
         "run_id": run_id,
         "seq": int(seq),
         "name": name,
-        "args_text": scrubber.scrub_tool_args(
-            name=name, args_text=_as_text(payload.get("input"))
-        ),
+        "args_text": exec_policy.apply_call_axis(policy.decide(name), args_text),
         "ts": _iso(ts),
     }
 
@@ -663,6 +686,30 @@ def event_kinds_unreviewed(graph_status: dict | None) -> list[str]:
         return []
     return [str(k) for k in value]
 
+def policy_unresolved(graph_status: dict | None) -> list[str]:
+    """The per-tool-policy alarm, read back off the freshness sentinel —
+    exec-index-per-tool-policy.md §3.5, on the mechanism
+    `event_kinds_unreviewed` above already proves.
+
+    These are the observed tool names that parsed as MCP-routed and resolved
+    to no installed app, so their arguments were DROPPED rather than indexed
+    (fail closed, §3). Each distinct spelling is one decision owed: a fourth
+    gateway prefix, an app that was uninstalled, a gateway upstream that is
+    not an app at all. §11 names the cost of that direction plainly — a
+    gateway rename stops indexing arguments workspace-wide until somebody
+    reads the doctor — and this list is the mitigation, so it degrades the
+    doctor check for exactly the same reason an unreviewed event kind does.
+
+    An absent key is an empty list, not a degradation: that is the normal
+    shape of a sentinel stamped by a connector older than this release.
+    """
+    reported = (graph_status or {}).get("reported_counts") or {}
+    value = reported.get("policy_unresolved")
+    if not isinstance(value, list):
+        return []
+    return [str(k) for k in value]
+
+
 
 def scrub_degraded(status: dict) -> bool:
     """Whether a `scrub_status()` dict represents a degraded coverage
@@ -738,6 +785,17 @@ async def _run_tick_locked(
     # `exact_match_unavailable`: a vault secret with no argued pattern
     # coverage must degrade the status visibly, not pass unnoticed.
     scrub_status_ = await scrub_status(scrubber)
+    # The per-tool indexing policy, built from the installed tree ONCE per
+    # tick — same shape and same reason as the scrubber above
+    # (exec-index-per-tool-policy.md §5): ~36 small JSON reads here, one dict
+    # lookup per row after that, and no module-level cache to diverge between
+    # workers (§12 risk 5).
+    policy = exec_policy.PolicyTable.from_workspace()
+    if policy.status["scan_error"]:
+        # Everything routed becomes unresolved, i.e. every argument is
+        # dropped. Loud by construction (`policy_unresolved` fills up), but
+        # the cause belongs in the log too.
+        log.warning("exec sync: policy table degraded — %s", policy.status["scan_error"])
     params = {
         "tenant": source_tenant,
         "watermark": watermark,
@@ -771,7 +829,10 @@ async def _run_tick_locked(
             await client.put_exec_sync_state(
                 source_tenant=source_tenant,
                 watermark=watermark,
-                counts={"event_kinds_unreviewed": unreviewed},
+                counts={
+                    "event_kinds_unreviewed": unreviewed,
+                    **policy.counters,
+                },
                 last_error=None,
             )
             return _empty_result(
@@ -780,6 +841,7 @@ async def _run_tick_locked(
                 watermark=watermark,
                 scrub=scrub_status_,
                 event_kinds_unreviewed=unreviewed,
+                **policy.counters,
             )
 
         totals = {
@@ -794,7 +856,7 @@ async def _run_tick_locked(
         aborted = False
         for batch in plan_batches(run_rows, batch_bytes=batch_bytes):
             run_ids = [r["id"] for r in batch]
-            toolcalls = _fetch_tool_calls(conn, run_ids, scrubber)
+            toolcalls = _fetch_tool_calls(conn, run_ids, scrubber, policy)
             events, dropped = _fetch_events(conn, run_ids, scrubber)
             totals["event_fields_dropped"] += dropped
             called = rollup_called(toolcalls)
@@ -845,6 +907,12 @@ async def _run_tick_locked(
     # sentinel therefore carries this tick's observation, which is what
     # "freshness" already means for every other number on it.
     counts["event_kinds_unreviewed"] = unreviewed
+    # Same mechanism, for tool identities instead of event kinds
+    # (exec-index-per-tool-policy.md §8): the distinct unattributable
+    # spellings this tick fail-closed on, and how many rows lost their
+    # arguments to policy. The tick is the only thing that sees them, so the
+    # sentinel is where the status and doctor surfaces read them from.
+    counts.update(policy.counters)
     await client.put_exec_sync_state(
         source_tenant=source_tenant,
         watermark=new_watermark,
@@ -857,6 +925,7 @@ async def _run_tick_locked(
         "watermark": new_watermark,
         "scrub": scrub_status_,
         "event_kinds_unreviewed": unreviewed,
+        **policy.counters,
         **totals,
     }
 
@@ -874,11 +943,16 @@ def _fetch_runs(conn, params: dict, scrubber: exec_scrub.Scrubber) -> list[dict]
         cur.close()
 
 
-def _fetch_tool_calls(conn, run_ids: list[str], scrubber: exec_scrub.Scrubber) -> list[dict]:
+def _fetch_tool_calls(
+    conn,
+    run_ids: list[str],
+    scrubber: exec_scrub.Scrubber,
+    policy: exec_policy.PolicyTable,
+) -> list[dict]:
     cur = conn.cursor()
     try:
         cur.execute(SQL_TOOL_CALLS, {"run_ids": run_ids})
-        return [build_toolcall_row(record, scrubber) for record in cur]
+        return [build_toolcall_row(record, scrubber, policy) for record in cur]
     finally:
         cur.close()
 

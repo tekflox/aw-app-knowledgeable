@@ -146,7 +146,7 @@
     },
     "doctor": [
       {
-        "label": "Exec-sync scrub/vault coverage",
+        "label": "Exec-sync scrub/vault/indexing-policy coverage",
         "route": "/exec-sync/doctor"
       }
     ]
