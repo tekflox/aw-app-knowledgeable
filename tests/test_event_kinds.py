@@ -276,21 +276,62 @@ def test_cap_text_leaves_short_text_alone():
     assert event_kinds.cap_text(None) == (None, None, None)
 
 
-def test_a_planted_credential_past_the_cap_is_still_redacted():
+def test_a_planted_credential_straddling_the_cap_is_still_redacted():
     """§13.12 point 6, as a test rather than a comment: the build path scrubs
-    and THEN caps, so a credential sitting beyond the cap boundary is
-    redacted before the cut can hide it from both passes.
+    and THEN caps, so a credential lying ACROSS the cut cannot be bisected
+    into a fragment that both passes then miss.
 
-    MUTATION that turns this red: cap first, scrub second — the planted value
-    then survives in the stored prefix, matched by nothing.
+    **The planted value has to straddle the boundary, and the first version
+    of this test did not** — found by QA on 2026-10-19, reversing the order
+    in `build_event_row` and watching this test stay green. It planted the
+    secret twice, once at index 0 and once past the cap, so the surviving
+    prefix always held a WHOLE copy: the exact-match pass caught it whichever
+    order ran, and a secret entirely beyond the cut is simply thrown away by
+    either order too. Neither shape can distinguish them. Recorded here
+    because the tautology was invisible from reading the test — it asserted
+    something true for the wrong reason, which is the failure mode §13.12
+    point 9's sibling rule exists for.
+
+    The distinguishing case is a value cut IN HALF:
+
+    * scrub-then-cap (correct) — the value becomes `<REDACTED:secret-store>`
+      before any cut, so the truncation can only ever bisect the redaction
+      MARKER. No part of the credential is in the graph.
+    * cap-then-scrub (the bug) — the cut leaves a leading fragment of the
+      real value. That fragment is not the stored value, so the exact-match
+      pass does not match it, and a fragment has no shape, so no pattern
+      fires either. It stays in the graph, and it stays greppable.
+
+    So the assertion that carries this test is on the FRAGMENT, not on the
+    whole value. MUTATION, run and measured rather than claimed: swapping
+    `cap_text(scrubber.scrub(...))` to `scrubber.scrub(cap_text(...))` in
+    `build_event_row` turns exactly this test red.
+
+    This matters most for slice 3: `tool_result` text routinely exceeds the
+    cap, so the boundary is where that slice's credentials will actually sit.
     """
-    padding = "p" * (event_kinds.EVENT_TEXT_MAX - 10)
-    payload = {"error": f"{PLANTED_STORE_SECRET} {padding} {PLANTED_STORE_SECRET}"}
+    # Half the value before the cut, half after it.
+    straddle = len(PLANTED_STORE_SECRET) // 2
+    padding = "p" * (event_kinds.EVENT_TEXT_MAX - straddle)
+    # A tail, so the scrubbed text still exceeds the cap even though the
+    # redaction marker is shorter than the value it replaces — otherwise the
+    # correct order would not truncate at all and the two orders would again
+    # be indistinguishable.
+    payload = {"error": f"{padding}{PLANTED_STORE_SECRET}{'t' * 100}"}
     row, dropped = exec_sync.build_event_row(_record("error", payload), _scrubber())
     assert dropped == 0
+
+    fragment = PLANTED_STORE_SECRET[:straddle]
+    assert len(fragment) >= 8, "the fragment must be long enough to be a real leak"
+    assert fragment not in row["text"], (
+        "a leading FRAGMENT of the planted credential survived the cut — the cap "
+        "ran before the scrubber, which is exactly the §13.12 point 6 bug: the "
+        "half that survives matches no stored value and has no pattern shape"
+    )
     assert PLANTED_STORE_SECRET not in row["text"]
     assert row["text_truncated"] is True
     assert row["text_len"] > event_kinds.EVENT_TEXT_MAX
+    assert len(row["text"]) == event_kinds.EVENT_TEXT_MAX
 
 
 # ---------------------------------------------------------------------------
