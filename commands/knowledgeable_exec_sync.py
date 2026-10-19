@@ -72,8 +72,11 @@ def run(args: list[str] | None = None) -> int:
             return 1
         # A tick that completed but reported an error advanced the watermark
         # only over the prefix that landed. Non-zero so the scheduled task
-        # notices, rather than reading a partial pass as a clean one.
-        if body.get("reason"):
+        # notices, rather than reading a partial pass as a clean one. "no
+        # runs due" is the engine's own benign no-op (it still stamps the
+        # sentinel) and must stay exit 0, matching this file's own
+        # docstring — it is not a partial pass.
+        if body.get("reason") and body["reason"] != "no runs due":
             print(f"partial: {body['reason']}", file=sys.stderr)
             return 1
         return 0
