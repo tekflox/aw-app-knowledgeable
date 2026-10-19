@@ -734,6 +734,24 @@ def test_exec_sync_doctor_is_not_ok_when_a_vault_secret_is_uncovered(exec_app_cl
     assert tc.get("/exec-sync/doctor").json()["ok"] is True
 
 
+def test_exec_sync_doctor_is_not_ok_when_vault_coverage_is_unknown(exec_app_client, monkeypatch):
+    """Same property as `test_exec_sync_status_is_degraded_when_vault_coverage_is_unknown`
+    above, but at `doctor` — the unreachable-secrets-app case must surface as
+    a failing check, never a clean pass, in the surface `aw-workspace-cli
+    doctor` actually polls."""
+    tc, ctx = exec_app_client
+    _enable_exec_sync(ctx, monkeypatch)
+
+    async def _unreachable_secrets_app():
+        return {"vault_coverage_unknown": "could not reach the secrets app: boom",
+                "vault_names_uncovered": None}
+
+    monkeypatch.setattr(vault_coverage, "coverage_status", _unreachable_secrets_app)
+    body = tc.get("/exec-sync/doctor").json()
+    assert body["ok"] is False
+    assert body["detail"]["scrub"]["vault_coverage_unknown"] == "could not reach the secrets app: boom"
+
+
 def test_exec_sync_doctor_needs_no_identity_at_all(ungated_app_client, monkeypatch):
     """`contributes.doctor` dials this in-process with no headers at all
     (`_app_doctor_checks` in aw-workspace core) — a `_require_identity` gate
