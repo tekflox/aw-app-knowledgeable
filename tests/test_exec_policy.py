@@ -40,7 +40,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowledgeable_app import exec_policy, exec_scrub, exec_sync  # noqa: E402
+from knowledgeable_app import (  # noqa: E402
+    exec_policy,
+    exec_policy_store,
+    exec_scrub,
+    exec_sync,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture helpers — a fake `apps/` tree in the real shape.
@@ -1135,3 +1140,190 @@ def test_the_three_read_paths_over_the_tree_now_agree_on_direction(tmp_path):
         str(_app_with_broken_manifest(tmp_path / "broken", "malformed"))
     )
     assert t3.decide_output(name).allow_output is False
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — the engine seams the maintenance UI stands on.
+#
+# Two of them, and both are "one copy, never two" arguments rather than new
+# behaviour:
+#
+# * `effective(app, tool)` answers for an IDENTITY instead of an observed
+#   name, because a page renders rows and not calls. §11 names the cost of
+#   getting that wrong precisely: "three sources per row make the UI's source
+#   column load-bearing — if it ever lies, humans will edit the wrong layer
+#   and conclude the system ignores them". So it shares `_attributed` /
+#   `_bare` with `_resolve` rather than restating §6's order.
+# * `acknowledged` upstreams join `UNRESOLVABLE_UPSTREAMS` for CLASSIFICATION
+#   only. The test that matters is the one proving a denial survives being
+#   acknowledged.
+# ---------------------------------------------------------------------------
+
+
+def test_effective_agrees_with_decide_on_every_identity_it_resolved(tmp_path):
+    """The anti-drift test for the two paths. Every observed name is resolved
+    by `decide`, then the SAME identity is asked of `effective`, and the two
+    must agree on both axes and on the state — otherwise the page and the sync
+    are telling an operator different things about the same tool."""
+    table = _table(tmp_path)
+    names = [
+        "mcp__aw-gateway__aw__aw_secrets__write_secret",
+        "mcp__aw-gateway__aw__kb__search_knowledge_base",
+        "mcp__aw-gateway__aw__kb__update_knowledge_base",
+        "mcp__aw-gateway__aw__aw_kanban__add_kanban_comment",
+        "aw-gateway.aw__kali__aw__playwright__browser_type",
+        "mcp__aw-gateway__aw__aw_app_remote_host_cli__remote_host_read_file",
+        "Bash",
+    ]
+    for name in names:
+        decided = table.decide(name)
+        effective = table.effective(decided.app, decided.tool)
+        assert (effective.allow_call, effective.allow_output, effective.state) == (
+            decided.allow_call, decided.allow_output, decided.state,
+        ), f"{name}: the page would disagree with the sync"
+
+
+def test_effective_applies_the_floor_first(tmp_path):
+    """Whatever an override claims. A floor row renders locked, and the page
+    asks this function to find that out."""
+    table = _table(tmp_path, overrides={("secrets", "write_secret"): (True, True)})
+    for tool in sorted(exec_scrub.SECRET_TOOL_NAMES):
+        for app in ("secrets", None, "some-other-app"):
+            decision = table.effective(app, tool)
+            assert decision.state == exec_policy.STATE_FLOOR
+            assert (decision.allow_call, decision.allow_output) == (False, False)
+
+
+def test_effective_puts_an_override_above_a_declaration(tmp_path):
+    """§6's whole point: the override exists because the manifest can be wrong,
+    and an app describing itself is the weakest evidence in the system."""
+    declared = _table(tmp_path).effective("kb", "update_knowledge_base")
+    assert (declared.allow_call, declared.state) == (
+        False, exec_policy.STATE_DECLARED_RESTRICTED,
+    )
+    overridden = _table(
+        tmp_path, overrides={("kb", "update_knowledge_base"): (True, True)}
+    ).effective("kb", "update_knowledge_base")
+    assert (overridden.allow_call, overridden.allow_output) == (True, True)
+    assert overridden.state == exec_policy.STATE_OVERRIDE
+
+
+def test_effective_keeps_declared_indexable_distinct_from_never_declared(tmp_path):
+    """Card point f at the engine level: identical behaviour, different state.
+    Pinned here as well as in the view, because the view can only report what
+    this function tells it."""
+    table = _table(tmp_path)
+    reviewed = table.effective("kb", "search_knowledge_base")
+    never = table.effective("kb", "list_documents")
+    assert (reviewed.allow_call, reviewed.allow_output) == (True, True)
+    assert (never.allow_call, never.allow_output) == (True, True)
+    assert reviewed.state == exec_policy.STATE_DECLARED_INDEXABLE
+    assert never.state == exec_policy.STATE_NEVER_DECLARED
+
+
+def test_effective_denies_an_app_whose_manifest_is_unreadable(tmp_path):
+    """Fails closed on the page exactly as it does on the tick — and keeps the
+    app attributed, so the row can point at the file to fix."""
+    table = exec_policy.PolicyTable.from_workspace(
+        str(_app_with_broken_manifest(tmp_path / "broken", "malformed"))
+    )
+    decision = table.effective("remote-host-cli", "remote_host_read_file")
+    assert (decision.allow_call, decision.allow_output) == (False, False)
+    assert decision.state == exec_policy.STATE_UNRESOLVED
+    assert decision.app == "remote-host-cli"
+
+
+def test_effective_takes_the_intersection_for_a_bare_identity(tmp_path):
+    """`app=None` is §3 step 6's path, unchanged: any restriction restricts."""
+    table = _table(tmp_path)
+    assert table.effective(None, "browser_type").allow_call is False
+    assert table.effective(None, "a_tool_nobody_declared").allow_call is True
+
+
+def test_an_acknowledged_upstream_is_counted_as_known_but_still_denied(tmp_path):
+    """§9's escalation, and the invariant inside it. Acknowledging moves a name
+    from `actionable` to `known` and does nothing else — the denial, the
+    dropped arguments and the dropped result are all unchanged."""
+    name = "mcp__aw-gateway__aw__a_future_federation__some__tool"
+    plain = _table(tmp_path)
+    assert plain.decide(name).allow_call is False
+    assert plain.unresolved_split() == ([name], [])
+
+    acked = exec_policy.PolicyTable.from_workspace(
+        str(_estate(tmp_path / "acked")),
+        acknowledged={"a_future_federation": "a federation with no apps/<slug>/mcp.json"},
+    )
+    decision = acked.decide(name)
+    assert (decision.allow_call, decision.allow_output) == (False, False)
+    assert decision.state == exec_policy.STATE_UNRESOLVED
+    assert decision.call_drop_marker == exec_policy.UNRESOLVED_DROP_MARKER
+    assert acked.decide_output(name).allow_output is False
+    assert acked.unresolved_split() == ([], [name])
+    assert acked.counters["policy_unresolved_actionable"] == 0
+    assert acked.counters["policy_unresolved_known"] == [name]
+    # Still on the full list, which the doctor subtracts from — slice 2's
+    # shipped surface is not narrowed from inside a counter.
+    assert acked.counters["policy_unresolved"] == [name]
+
+
+def test_a_failed_scan_overrides_an_acknowledgement(tmp_path):
+    """Same rule the built-in registry already has, for the same reason: the
+    claim "no manifest could ever attribute this" is a statement about a tree
+    that was successfully READ. A `FileNotFoundError` on the apps root is the
+    most actionable thing in this subsystem and no part of it may be filed as
+    expected."""
+    table = exec_policy.PolicyTable.from_workspace(
+        str(tmp_path / "absent"),
+        acknowledged={"fredericowu": "byod"},
+    )
+    name = "mcp__aw-gateway__aw__fredericowu__fredericowu__google_workspace__list_calendars"
+    table.decide(name)
+    assert table.unresolved_split() == ([name], [])
+
+
+def test_a_builtin_reason_wins_a_collision_with_an_acknowledgement(tmp_path):
+    table = exec_policy.PolicyTable.from_workspace(
+        str(_estate(tmp_path)), acknowledged={"fredericowu": "something vaguer"},
+    )
+    assert table.known_upstreams()["fredericowu"] == (
+        exec_policy.UNRESOLVABLE_UPSTREAMS["fredericowu"]
+    )
+
+
+def test_an_unreadable_override_store_is_reported_and_does_not_widen(tmp_path):
+    """It cannot fail closed — an unreadable store does not say WHICH tools a
+    human restricted, so there is nothing to deny — so it is loud instead.
+    What it must never do is silently become "a human restricted nothing"
+    while reading as a healthy tick."""
+    table = exec_policy.PolicyTable.from_workspace(
+        str(_estate(tmp_path)), overrides_error=exec_policy_store.UNREACHABLE,
+    )
+    assert table.status["overrides_error"] == exec_policy_store.UNREACHABLE
+    assert table.counters["policy_overrides_unreadable"] == exec_policy_store.UNREACHABLE
+    # The manifest and the floor still govern, unchanged.
+    assert table.decide("mcp__aw-gateway__aw__kb__update_knowledge_base").allow_call is False
+    assert table.decide("mcp__aw-gateway__aw__aw_secrets__write_secret").state == (
+        exec_policy.STATE_FLOOR
+    )
+
+
+def test_observed_identities_are_what_the_tick_actually_resolved(tmp_path):
+    """§7 row population source (c) — the only source that is honest about
+    what runs HERE rather than what a manifest claims."""
+    table = _table(tmp_path)
+    for name in (
+        "mcp__aw-gateway__aw__kb__search_knowledge_base",
+        "aw-gateway.aw__kali__aw__playwright__browser_type",
+        "Bash",
+        "mcp__aw-gateway__aw__aw_secrets__write_secret",
+        # Unattributable: no identity to key a row on, so NOT here — §7 gives
+        # it the unresolved section with its raw spelling instead.
+        "mcp__some-third-party__unknown_tool",
+    ):
+        table.decide(name)
+    observed = table.observed_identities()
+    assert ("kb", "search_knowledge_base") in observed
+    assert ("kali-linux", "browser_type") in observed
+    assert (None, "Bash") in observed
+    assert (None, "write_secret") in observed, "the floor's observations count too"
+    assert not any(tool == "unknown_tool" for _app, tool in observed)

@@ -54,6 +54,20 @@
       ]
     },
     {
+      "id": "exec_policy",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "### Exec-indexing policy, per tool (`docs/design/exec-index-per-tool-policy.md` §7)\nWhat the execution-graph sync may keep from each tool — its **call** arguments and its **output**. Indexed unless something opts it out; each app declares its own exceptions in its manifest (`contributes.mcp.indexing`), a human override below beats that declaration, and the four secret-store tools are a hard-coded floor nothing here can lift.\n\nThe page below is the only place the effective table is visible. `never declared` and `declared — indexable` behave identically under the blacklist and are rendered differently on purpose: that difference is the only way to tell which tools have actually been reviewed."
+        },
+        {
+          "type": "iframe",
+          "title": "Exec-indexing policy",
+          "src": "/api/apps/knowledgeable/policy-ui"
+        }
+      ]
+    },
+    {
       "id": "verify",
       "widgets": [
         {

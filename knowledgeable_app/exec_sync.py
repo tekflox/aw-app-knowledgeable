@@ -964,6 +964,30 @@ def policy_unresolved(graph_status: dict | None) -> list[str]:
     return [str(k) for k in value]
 
 
+def policy_unresolved_known(graph_status: dict | None) -> list[str]:
+    """The subset of the above that is ACCOUNTED FOR — read off the same
+    sentinel (exec-index-per-tool-policy.md §9's slice-3 escalation).
+
+    A name lands here when the upstream it routed through is unresolvable by
+    construction (`exec_policy.UNRESOLVABLE_UPSTREAMS` — the two
+    linked-workspace BYOD federations) or when a human acknowledged it from
+    the §7 page. Its arguments and result were still DROPPED; "known" is a
+    statement about the counter, never about the denial.
+
+    Subtracting this from `policy_unresolved` is what lets the doctor check go
+    green and mean it, instead of being red forever over two names no manifest
+    could ever attribute. An absent key is an empty list, same as above: that
+    is the normal shape of a sentinel stamped by a connector older than slice
+    4, and under-reporting "known" errs toward the check staying red, which is
+    the safe direction for this particular narrowing.
+    """
+    reported = (graph_status or {}).get("reported_counts") or {}
+    value = reported.get("policy_unresolved_known")
+    if not isinstance(value, list):
+        return []
+    return [str(k) for k in value]
+
+
 def scrub_degraded(status: dict) -> bool:
     """Whether a `scrub_status()` dict represents a degraded coverage
     guarantee — a vault secret with no argued pattern coverage, the coverage
@@ -982,11 +1006,24 @@ async def run_tick(
     dsn: str,
     source_tenant: str,
     enabled: bool,
+    policy_overrides: dict[tuple[str, str], tuple[bool, bool]] | None = None,
+    policy_overrides_error: str | None = None,
+    policy_acknowledged: dict[str, str] | None = None,
     max_runs: int = MAX_RUNS_PER_TICK,
     batch_bytes: int = BATCH_BYTES,
     now: datetime | None = None,
 ) -> dict:
     """One bounded sync tick.
+
+    The three ``policy_*`` arguments are the human-set half of the indexing
+    policy (slice 3), passed IN rather than read here: this module has no
+    ``ctx``, and the store they come from is the connector's state facade,
+    which the route owns. They default to absent because every other caller
+    of this function — the CLI door, the scheduled task — reaches it through
+    that route; a direct caller that skips them gets the manifest-and-floor
+    policy, which is slice 2's shipped behaviour and strictly the tighter of
+    the two (an override is the only layer that can WIDEN what a manifest
+    restricted).
 
     Refuses rather than guesses, in three places, because each one is a
     silent-wrong-answer if defaulted:
@@ -1020,13 +1057,24 @@ async def run_tick(
             max_runs=max_runs,
             batch_bytes=batch_bytes,
             now=now or datetime.now(timezone.utc),
+            policy_overrides=policy_overrides,
+            policy_overrides_error=policy_overrides_error,
+            policy_acknowledged=policy_acknowledged,
         )
     finally:
         lease.release(LEASE_NAME)
 
 
 async def _run_tick_locked(
-    *, dsn: str, source_tenant: str, max_runs: int, batch_bytes: int, now: datetime
+    *,
+    dsn: str,
+    source_tenant: str,
+    max_runs: int,
+    batch_bytes: int,
+    now: datetime,
+    policy_overrides: dict[tuple[str, str], tuple[bool, bool]] | None = None,
+    policy_overrides_error: str | None = None,
+    policy_acknowledged: dict[str, str] | None = None,
 ) -> dict:
     status, err = await client.get_exec_status()
     if err:
@@ -1043,7 +1091,26 @@ async def _run_tick_locked(
     # (exec-index-per-tool-policy.md §5): ~36 small JSON reads here, one dict
     # lookup per row after that, and no module-level cache to diverge between
     # workers (§12 risk 5).
-    policy = exec_policy.PolicyTable.from_workspace()
+    # Slice 3: the overrides and acknowledgements arrive from the connector's
+    # state facade via the route, read fresh for this tick — never cached at
+    # module level, because core runs multi-worker and a worker-local policy
+    # table is the WORKERS=N silent-divergence bug (§12 risk 5).
+    policy = exec_policy.PolicyTable.from_workspace(
+        overrides=policy_overrides,
+        acknowledged=policy_acknowledged,
+        overrides_error=policy_overrides_error,
+    )
+    if policy.status["overrides_error"]:
+        # A human override is the only layer above an app's own self-assertion
+        # (§6), so this tick enforced less than the operator configured. It
+        # cannot fail closed — an unreadable store does not say WHICH tools
+        # were restricted — so it is loud instead, here and on the sentinel.
+        log.warning(
+            "exec sync: the exec-policy override store could not be read (%s) — this "
+            "tick ran on manifest declarations and the floor alone; any human "
+            "override is NOT in effect for these rows",
+            policy.status["overrides_error"],
+        )
     if policy.status["scan_error"]:
         # Everything routed becomes unresolved, i.e. every argument is
         # dropped. Loud by construction (`policy_unresolved` fills up), but
@@ -1094,6 +1161,7 @@ async def _run_tick_locked(
                 watermark=watermark,
                 scrub=scrub_status_,
                 event_kinds_unreviewed=unreviewed,
+                policy_observed=policy.observed_identities(),
                 **policy.counters,
             )
 
@@ -1202,6 +1270,12 @@ async def _run_tick_locked(
         "watermark": new_watermark,
         "scrub": scrub_status_,
         "event_kinds_unreviewed": unreviewed,
+        # §7 row population source (c). Returned rather than written here:
+        # this module has no `ctx`, and the store belongs to the route. It is
+        # the one key the route POPS off the result before returning it —
+        # a few hundred `(app, tool)` pairs are a UI row list, not part of a
+        # tick's report.
+        "policy_observed": policy.observed_identities(),
         **policy.counters,
         **totals,
     }

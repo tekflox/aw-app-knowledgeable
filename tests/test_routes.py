@@ -16,7 +16,10 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from knowledgeable_app import (  # noqa: E402
+    exec_policy,
+    exec_policy_store,
     exec_scrub,
+    exec_sync,
     forwarding,
     pending_deletions,
     routes as routes_mod,
@@ -1002,3 +1005,395 @@ def test_the_retro_purge_does_not_validate_the_name_itself(exec_app_client, monk
     assert forwarded == ["aw__aw_secrets__write_secret"]
     assert body["ok"] is False
     assert "BARE tool name" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# exec-index-per-tool-policy.md §7 — the maintenance surface (slice 3).
+#
+# The half of the card Frederico asked for in his own words: a UI inside the
+# connector's settings where the effective table can be seen and maintained by
+# hand. Slices 1, 2 and 4 built a policy that enforces; none of them gave a
+# human any way to look at it or disagree with it.
+# ---------------------------------------------------------------------------
+
+
+async def _sentinel_with(**reported):
+    async def _get():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": reported,
+            },
+            None,
+        )
+    return _get
+
+
+def _policy_client(app_client, monkeypatch, tmp_path, tree=None):
+    """A client whose policy table reads a FIXTURE tree, never the real
+    `/opt/aw-workspace/apps` (§12 risk 10 / `tests/conftest.py`'s guard — a
+    test that reads the machine it runs on is green only here and red in CI,
+    and that has already reddened one release of this very module)."""
+    import json as _json
+
+    tc, ctx = app_client
+    ctx.state.lease = _FakeLease()
+    root = tree or (tmp_path / "apps")
+    kb = root / "kb"
+    kb.mkdir(parents=True, exist_ok=True)
+    (kb / "mcp.json").write_text(
+        _json.dumps({"mcpServers": {"kb": {"type": "http"}}}), encoding="utf-8")
+    (kb / "aw-app.json").write_text(
+        _json.dumps({
+            "id": "kb",
+            "contributes": {"mcp": {
+                "indexing": [
+                    {"tool": "update_knowledge_base", "call": False, "output": True,
+                     "reason": "arguments carry whole documents"},
+                    {"tool": "search_knowledge_base", "call": True, "output": True},
+                ],
+                "provides": ["search_knowledge_base", "list_documents"],
+            }},
+        }),
+        encoding="utf-8",
+    )
+    secrets_dir = root / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "mcp.json").write_text(
+        _json.dumps({"mcpServers": {"aw-secrets": {"type": "http"}}}), encoding="utf-8")
+    (secrets_dir / "aw-app.json").write_text(
+        _json.dumps({"id": "secrets"}), encoding="utf-8")
+    monkeypatch.setattr(exec_policy, "_apps_root", lambda: str(root))
+    return tc, ctx
+
+
+def test_exec_policy_table_renders_the_five_states(app_client, monkeypatch, tmp_path):
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+    body = tc.get("/exec-policy").json()
+    by_tool = {(r["app"], r["tool"]): r for r in body["rows"]}
+    assert by_tool[(None, "write_secret")]["state"] == "floor"
+    assert by_tool[(None, "write_secret")]["locked"] is True
+    assert by_tool[("kb", "update_knowledge_base")]["state"] == "declared_restricted"
+    assert by_tool[("kb", "search_knowledge_base")]["state"] == "declared_indexable"
+    assert by_tool[("kb", "list_documents")]["state"] == "never_declared"
+    # ...and the two that behave identically are still two different states.
+    assert (
+        by_tool[("kb", "search_knowledge_base")]["call"]
+        == by_tool[("kb", "list_documents")]["call"]
+        is True
+    )
+
+
+def test_put_override_rejects_write_secret(app_client, monkeypatch, tmp_path):
+    """**The route-level floor refusal** (§2, §3 of the card's scope). The
+    engine already wins against a lying override row — slice 4 pins that — but
+    the invariant has to hold at the EDGE too, so the store's contents can be
+    read at face value by a human. Nothing is written."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request(
+        "PUT", "/exec-policy/override",
+        json={"app": "secrets", "tool": "write_secret", "call": True,
+              "output": True, "note": "please index it"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["floor"] is True
+    assert "floor" in body["error"]
+    assert ctx.state.kv._store == {}, "nothing may reach the store"
+
+
+@pytest.mark.parametrize("tool", sorted(exec_scrub.SECRET_TOOL_NAMES))
+def test_put_override_rejects_every_floor_name(app_client, monkeypatch, tmp_path, tool):
+    tc, _ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request(
+        "PUT", "/exec-policy/override",
+        json={"app": "secrets", "tool": tool, "call": True, "output": True},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["floor"] is True
+
+
+def test_put_override_rejects_a_prefixed_spelling_of_a_floor_name(
+    app_client, monkeypatch, tmp_path
+):
+    """The 138-call defect was a name that did not match. A refusal keyed on
+    string equality would be the same bug wearing this slice's hat."""
+    tc, _ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request(
+        "PUT", "/exec-policy/override",
+        json={"app": "secrets", "tool": "mcp__aw-gateway__aw__aw_secrets__write_secret",
+              "call": True, "output": True},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["floor"] is True
+
+
+def test_override_round_trips_through_the_state_facade(app_client, monkeypatch, tmp_path):
+    """PUT -> the table reflects it -> DELETE -> it falls back to the manifest.
+
+    And it rides `ctx.state.kv`, never `ctx.config`: §6 and §10 both rule the
+    config blob out, because this app's own `POST /settings` has clobbered a
+    sibling config key before.
+    """
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+
+    resp = tc.request(
+        "PUT", "/exec-policy/override",
+        json={"app": "kb", "tool": "search_knowledge_base", "call": False,
+              "output": False, "note": "queries carry customer names"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["override"]["note"] == "queries carry customer names"
+
+    rows = {(r["app"], r["tool"]): r for r in tc.get("/exec-policy").json()["rows"]}
+    row = rows[("kb", "search_knowledge_base")]
+    assert row["state"] == "override"
+    assert (row["call"], row["output"]) == (False, False)
+    # What it overrode, shown beside it.
+    assert row["declared"] == {"call": True, "output": True}
+    assert row["override"]["actor"]
+
+    # Nowhere near the config blob.
+    assert ctx.config == {} or "exec_policy" not in str(ctx.config)
+    assert any("exec_policy" in k for k in ctx.state.kv._store)
+
+    resp = tc.request("DELETE", "/exec-policy/override",
+                      json={"app": "kb", "tool": "search_knowledge_base"})
+    assert resp.json() == {"ok": True, "cleared": True}
+    rows = {(r["app"], r["tool"]): r for r in tc.get("/exec-policy").json()["rows"]}
+    assert rows[("kb", "search_knowledge_base")]["state"] == "declared_indexable"
+
+
+def test_an_override_reaches_the_sync_tick(app_client, monkeypatch, tmp_path):
+    """The parameter slice 2 carried for exactly this moment. An override that
+    the page can show but the tick does not consult would be the §11 failure
+    in its purest form — a human edits a layer the system ignores."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    tc.request(
+        "PUT", "/exec-policy/override",
+        json={"app": "kb", "tool": "search_knowledge_base", "call": False,
+              "output": False, "note": "n"},
+    )
+    seen = {}
+
+    async def _capture(lease, **kwargs):
+        seen.update(kwargs)
+        return {"blocked": True, "reason": "captured"}
+
+    monkeypatch.setattr(exec_sync, "run_tick", _capture)
+    tc.post("/exec-sync/run", json={})
+    assert seen["policy_overrides"] == {("kb", "search_knowledge_base"): (False, False)}
+    assert seen["policy_overrides_error"] is None
+
+
+def test_the_tick_records_the_identities_it_observed(app_client, monkeypatch, tmp_path):
+    """§7 row population source (c) — and `policy_observed` is popped off the
+    result rather than returned to the caller: a few hundred `(app, tool)`
+    pairs are a UI row list, not part of a tick's report."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+
+    async def _tick(lease, **kwargs):
+        return {"blocked": False, "reason": None,
+                "policy_observed": [["kb", "search_graph"], [None, "Bash"]]}
+
+    monkeypatch.setattr(exec_sync, "run_tick", _tick)
+    result = tc.post("/exec-sync/run", json={}).json()
+    assert "policy_observed" not in result
+
+    rows = {(r["app"], r["tool"]): r for r in tc.get("/exec-policy").json()["rows"]}
+    assert "observed" in rows[("kb", "search_graph")]["listed_because"]
+    assert (None, "Bash") in rows
+
+
+def test_acknowledging_an_upstream_clears_the_doctor_without_permitting_it(
+    app_client, monkeypatch, tmp_path
+):
+    """**The escalation §9 left to this slice.** Two of this gateway's 40 live
+    upstream segments are BYOD linked-workspace federations with no
+    `apps/<slug>/mcp.json`; they fail closed correctly and will NEVER resolve,
+    so the doctor went red the first time a tick saw one and stayed red
+    forever. An always-red check detects nothing.
+
+    So: red before, green after acknowledging, and the name is still on the
+    full `policy_unresolved` list — which is what proves the acknowledgement
+    silenced a counter rather than opening a door.
+    """
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    _enable_exec_sync(ctx, monkeypatch)
+    name = "mcp__aw-gateway__aw__a_future_federation__x__browser_click"
+
+    async def _sentinel():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": {"policy_unresolved": [name]},
+            },
+            None,
+        )
+
+    monkeypatch.setattr(client, "get_exec_status", _sentinel)
+    before = tc.get("/exec-sync/status").json()
+    assert before["degraded"] is True
+    assert before["policy_unresolved_actionable"] == [name]
+    assert tc.get("/exec-sync/doctor").json()["ok"] is False
+
+    resp = tc.request(
+        "PUT", "/exec-policy/ack",
+        json={"upstream": "a_future_federation",
+              "reason": "BYOD linked-workspace federation — no apps/<slug>/mcp.json"},
+    )
+    assert resp.status_code == 200
+
+    # The sentinel is what the doctor reads, and only a TICK restamps it. So
+    # the next tick's own split is what turns the check green — simulated here
+    # by the sentinel now reporting the name as known, which is exactly what
+    # `PolicyTable.unresolved_split()` will put there.
+    async def _sentinel_after():
+        return (
+            {
+                "staleness": {"state": "fresh", "degraded": False, "age_seconds": 30},
+                "reported_counts": {
+                    "policy_unresolved": [name],
+                    "policy_unresolved_known": [name],
+                    "policy_unresolved_actionable": 0,
+                },
+            },
+            None,
+        )
+
+    monkeypatch.setattr(client, "get_exec_status", _sentinel_after)
+    after = tc.get("/exec-sync/status").json()
+    assert after["policy_unresolved_actionable"] == []
+    assert after["degraded"] is False
+    assert tc.get("/exec-sync/doctor").json()["ok"] is True
+    # Acknowledging is NOT permitting: the name is still reported as
+    # unresolved, which means its arguments and result were still dropped.
+    assert after["policy_unresolved"] == [name]
+    assert after["policy_unresolved_known"] == [name]
+
+
+def test_the_ack_reaches_the_tick_and_is_withdrawable(app_client, monkeypatch, tmp_path):
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    tc.request("PUT", "/exec-policy/ack",
+               json={"upstream": "a_future_federation", "reason": "byod"})
+    seen = {}
+
+    async def _capture(lease, **kwargs):
+        seen.update(kwargs)
+        return {"blocked": True, "reason": "captured"}
+
+    monkeypatch.setattr(exec_sync, "run_tick", _capture)
+    tc.post("/exec-sync/run", json={})
+    assert seen["policy_acknowledged"] == {"a_future_federation": "byod"}
+
+    resp = tc.request("DELETE", "/exec-policy/ack",
+                      json={"upstream": "a_future_federation"})
+    assert resp.json() == {"ok": True, "cleared": True}
+    tc.post("/exec-sync/run", json={})
+    assert seen["policy_acknowledged"] == {}
+
+
+def test_an_ack_without_a_reason_is_refused(app_client, monkeypatch, tmp_path):
+    """It silences an alarm, so why it is safe has to be readable by the next
+    person — §4's rule for a manifest opt-out, applied here."""
+    tc, _ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request("PUT", "/exec-policy/ack", json={"upstream": "x", "reason": ""})
+    assert resp.status_code == 400
+    assert "reason is required" in resp.json()["error"]
+
+
+def test_an_unreadable_override_store_degrades_the_doctor(
+    app_client, monkeypatch, tmp_path
+):
+    """A tick that could not read the override store enforced less than the
+    operator configured, and under a blacklist that cannot be inferred from
+    "zero overrides". Read live, so the answer does not depend on the sync
+    having run."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    _enable_exec_sync(ctx, monkeypatch)
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+    assert tc.get("/exec-sync/doctor").json()["ok"] is True
+
+    async def _degraded_get(name):
+        return None
+
+    monkeypatch.setattr(ctx.state.kv, "get", _degraded_get)
+    monkeypatch.setattr(exec_policy_store, "_facade_degraded", lambda: True)
+    body = tc.get("/exec-sync/status").json()
+    assert body["policy_overrides_unreadable"] == exec_policy_store.UNREACHABLE
+    assert body["degraded"] is True
+    assert tc.get("/exec-sync/doctor").json()["ok"] is False
+
+
+def test_the_policy_page_is_served_as_html(app_client, monkeypatch, tmp_path):
+    tc, _ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.get("/policy-ui")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "Exec-indexing policy" in resp.text
+
+
+def test_the_policy_page_uses_no_modals(app_client, monkeypatch, tmp_path):
+    """§12 risk 8 / the host's sandbox: the iframe is `allow-scripts
+    allow-forms allow-same-origin` and NOT `allow-modals`, so
+    `confirm()`/`prompt()`/`alert()` silently no-op. A confirmation that is a
+    dead button is worse than none, so every edit here is an inline row."""
+    from knowledgeable_app import policy_panel
+
+    for banned in ("confirm(", "prompt(", "alert("):
+        assert banned not in policy_panel.PANEL_HTML, (
+            f"{banned} silently no-ops inside this iframe — use an inline row"
+        )
+
+
+def test_the_policy_page_carries_no_credential(app_client, monkeypatch, tmp_path):
+    """It loads from the API origin, so relative fetches are same-origin and
+    the apex cookie authorises them. A page that carries a token in its markup
+    is a page that leaks one."""
+    from knowledgeable_app import policy_panel
+
+    for banned in ("X-Api-Key", "x-internal-secret", "Authorization", "Bearer "):
+        assert banned not in policy_panel.PANEL_HTML
+
+
+def test_the_policy_page_is_not_under_the_reserved_ui_prefix():
+    """Core serves app ESM bundles from `/ui` and would shadow the route —
+    which is why §7 names `/policy-ui` explicitly."""
+    import json as _json
+
+    spec = _json.loads(
+        (Path(__file__).resolve().parent.parent / "windows" / "main.json").read_text()
+    )
+    srcs = [
+        w["src"]
+        for region in spec["regions"]
+        for w in region["widgets"]
+        if w.get("type") == "iframe"
+    ]
+    assert srcs == ["/api/apps/knowledgeable/policy-ui"]
+    assert not any("/api/apps/knowledgeable/ui" in s for s in srcs)
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("GET", "/exec-policy", None),
+        ("PUT", "/exec-policy/override", {"app": "kb", "tool": "t", "call": True, "output": True}),
+        ("DELETE", "/exec-policy/override", {"app": "kb", "tool": "t"}),
+        ("PUT", "/exec-policy/ack", {"upstream": "u", "reason": "r"}),
+        ("DELETE", "/exec-policy/ack", {"upstream": "u"}),
+        ("GET", "/policy-ui", None),
+    ],
+)
+def test_every_policy_route_requires_identity(ungated_app_client, method, path, body):
+    """`auth_required: false` on this app's config means the framework gate
+    enforces nothing for the mount, so each route carries its own dependency
+    (see routes.py's module docstring). An unauthenticated caller must not be
+    able to read — let alone edit — what gets indexed."""
+    tc, _ctx = ungated_app_client
+    resp = tc.request(method, path, json=body)
+    assert resp.status_code == 401

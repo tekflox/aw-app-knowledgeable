@@ -22,13 +22,17 @@ deliberate operational step outside this repo (``POST
 from __future__ import annotations
 
 import hmac
+import logging
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from . import (
     bulk_ingest,
+    exec_policy,
+    exec_policy_store,
+    exec_policy_view,
     exec_sync,
     forwarding,
     fs_sync,
@@ -43,6 +47,8 @@ from . import (
 )
 from .mcp import client
 from .workspace_env import workspace_env
+
+log = logging.getLogger("aw_apps.knowledgeable.routes")
 
 SECRET_KEY = "service_secret"
 
@@ -400,12 +406,52 @@ def build_routes(ctx) -> FastAPI:
             "enabled": bool(ctx.config.get("exec_sync_enabled")),
         }
 
+    async def _policy_state() -> dict:
+        """The human-set half of the policy, read from the state facade.
+
+        Read PER CALL, never cached in this module (§12 risk 5): core runs
+        multi-worker, and a worker-local override table is the WORKERS=N
+        silent-divergence bug this estate has already catalogued — an operator
+        would restrict a tool on one worker and watch the other keep indexing
+        it, with nothing anywhere saying so.
+        """
+        overrides, overrides_error = await exec_policy_store.load_overrides(ctx.state.kv)
+        acknowledged, ack_error = await exec_policy_store.load_acknowledged(ctx.state.kv)
+        return {
+            "overrides": overrides,
+            "overrides_error": overrides_error,
+            "acknowledged": acknowledged,
+            "acknowledged_error": ack_error,
+        }
+
     @app.post("/exec-sync/run", dependencies=[Depends(_require_identity)])
     async def exec_sync_run(data: dict = Body(default={})) -> dict:
         kwargs = _exec_sync_kwargs()
         if data.get("max_runs") is not None:
             kwargs["max_runs"] = int(data["max_runs"])
-        return await exec_sync.run_tick(ctx.state.lease, **kwargs)
+        # Slice 3 — the override layer finally reaches the engine that has
+        # carried the parameter since slice 2, and the acknowledge registry
+        # reaches the counter split slice 4 built for it.
+        state = await _policy_state()
+        kwargs["policy_overrides"] = exec_policy_store.axes(state["overrides"])
+        kwargs["policy_overrides_error"] = state["overrides_error"]
+        kwargs["policy_acknowledged"] = exec_policy_store.ack_reasons(state["acknowledged"])
+        result = await exec_sync.run_tick(ctx.state.lease, **kwargs)
+        # §7 row population source (c): the identities this tick actually
+        # resolved, so the page is honest about the tools that really run here
+        # without inventing a dependency on a live gateway enumeration.
+        # Best-effort — this is a settings page's row list, not a policy
+        # input, so a failed write must not turn a good tick into a bad
+        # result.
+        observed = result.pop("policy_observed", None) or []
+        if observed:
+            try:
+                await exec_policy_store.record_observed(
+                    ctx.state.kv, [(app, tool) for app, tool in observed]
+                )
+            except Exception:  # noqa: BLE001 - cosmetic store, never the tick's verdict
+                log.warning("exec policy: could not record observed identities", exc_info=True)
+        return result
 
     async def _exec_sync_status_payload() -> dict:
         """The §8 doctor surface: the sentinel, its staleness verdict, the
@@ -442,6 +488,43 @@ def build_routes(ctx) -> FastAPI:
         # line rather than from a future incident — which is the whole
         # mitigation for fail-closed resolution being silent otherwise.
         payload["policy_unresolved"] = exec_sync.policy_unresolved(remote)
+        # Slice 3's half of §3.5, and the reason this slice exists for the
+        # doctor at all. Two of this gateway's 40 live upstream segments are
+        # linked-workspace BYOD federations with no `apps/<slug>/mcp.json`
+        # (`fredericowu`, `fredericowu_browser`): they fail closed correctly
+        # and they will NEVER resolve, so the check went red the first time a
+        # tick observed one and stayed red forever. **An always-red check
+        # detects nothing** — the same defect as a date-hardcoded test that
+        # goes red every day until it stops reading as an alarm, which cost
+        # this estate three commits of skipped image builds.
+        #
+        # So `degraded` now reads the ACTIONABLE names: everything unresolved
+        # minus what is accounted for, either by `exec_policy.
+        # UNRESOLVABLE_UPSTREAMS` or by a human acknowledging it from the §7
+        # page. `policy_unresolved` itself is left exactly as slice 2 shipped
+        # it — the full list, known names included — because narrowing a
+        # shipped surface silently is how an alarm quietly stops alarming;
+        # the narrowing is visible here, next to the thing it narrows.
+        #
+        # Derived from the two lists rather than read from
+        # `policy_unresolved_actionable` (a COUNT) because the doctor's
+        # `detail` has to NAME what to go and look at. Both lists are capped
+        # identically and `known` is a subset of `policy_unresolved`, so the
+        # subtraction is exact.
+        payload["policy_unresolved_known"] = exec_sync.policy_unresolved_known(remote)
+        known = set(payload["policy_unresolved_known"])
+        payload["policy_unresolved_actionable"] = [
+            name for name in payload["policy_unresolved"] if name not in known
+        ]
+        # A tick that could not read the override store ran with a weaker
+        # policy than the operator configured, and under a blacklist that
+        # cannot be inferred from "zero overrides" (§12 risk 11's lesson, one
+        # read path further out). Read LIVE rather than off the sentinel: the
+        # question is whether a human's override can be honoured right now,
+        # and the answer must not depend on the sync being enabled.
+        _ovr, overrides_error = await exec_policy_store.load_overrides(ctx.state.kv)
+        payload["policy_overrides"] = len(_ovr)
+        payload["policy_overrides_unreadable"] = overrides_error
         # §13.7's disk preflight, reported here as well as enforced on
         # `reset-watermark`: an operator about to run a backfill should be
         # able to see the verdict BEFORE the route refuses them, and the
@@ -468,7 +551,8 @@ def build_routes(ctx) -> FastAPI:
                 err or not remote or staleness.get("degraded")
                 or exec_sync.scrub_degraded(scrub)
                 or payload["event_kinds_unreviewed"]
-                or payload["policy_unresolved"]
+                or payload["policy_unresolved_actionable"]
+                or payload["policy_overrides_unreadable"]
             )
         )
         return payload
@@ -596,6 +680,180 @@ def build_routes(ctx) -> FastAPI:
             result=bool(data.get("result")),
         )
         return {"ok": err is None, "error": err, "result": result}
+
+    # ------------------------------------------------------------------
+    # exec-index-per-tool-policy.md §7 — the maintenance surface. Three
+    # override routes, the acknowledge pair §9 escalated to this slice, and
+    # the page itself.
+    #
+    # None of these touch the app-config blob (§6, §10): the store that can
+    # change what gets indexed does not ride a JSON blob `POST /settings`
+    # rewrites wholesale, because that route has clobbered a sibling key in
+    # this very app before. `exec_policy_store` is the only writer.
+    # ------------------------------------------------------------------
+
+    @app.get("/exec-policy", dependencies=[Depends(_require_identity)])
+    async def exec_policy_table() -> dict:
+        """The effective table, every row's state and source, and the
+        unresolved names — §7's whole payload.
+
+        Builds the policy table the same way a tick does
+        (`PolicyTable.from_workspace`), so what this page shows and what the
+        sync enforces come from one code path. The unresolved names come off
+        the freshness sentinel rather than from this build: a page load
+        resolves no names, so the only thing that has ever seen them is the
+        tick that stamped them.
+        """
+        state = await _policy_state()
+        observed, observed_error, observed_at = await exec_policy_store.load_observed(
+            ctx.state.kv
+        )
+        # Built exactly as `exec_sync._run_tick_locked` builds it, and called
+        # the same way it is there — synchronously. ~36 small JSON reads is
+        # microseconds (§5), which is why the tick does not thread it either;
+        # a threadpool hop here would be a second construction shape for no
+        # measured gain.
+        table = exec_policy.PolicyTable.from_workspace(
+            overrides=exec_policy_store.axes(state["overrides"]),
+            acknowledged=exec_policy_store.ack_reasons(state["acknowledged"]),
+            overrides_error=state["overrides_error"],
+        )
+        remote, err = await client.get_exec_status()
+        unresolved = exec_sync.policy_unresolved(remote)
+        unresolved_known = exec_sync.policy_unresolved_known(remote)
+        provides = exec_policy_view.display_only_provides()
+        payload = exec_policy_view.build(
+            table,
+            overrides=state["overrides"],
+            acknowledged=state["acknowledged"],
+            observed=observed,
+            observed_at=observed_at,
+            provides=provides,
+            unresolved=unresolved,
+            unresolved_known=unresolved_known,
+            store_errors={
+                "overrides": state["overrides_error"],
+                "acknowledgements": state["acknowledged_error"],
+                "observed": observed_error,
+                # Not a store error, but the same class of "this page is
+                # showing less than the truth": with no sentinel, the
+                # unresolved section is empty because we could not ask, not
+                # because nothing failed closed.
+                "sentinel": err,
+            },
+        )
+        return payload
+
+    @app.put("/exec-policy/override", dependencies=[Depends(_require_identity)])
+    async def exec_policy_put_override(request: Request, data: dict = Body(...)) -> dict:
+        """Set one ``(app, tool)`` override — the only layer above an app's own
+        self-assertion (§6: floor > override > manifest > default).
+
+        **Refuses the four floor names before the store ever sees the row.**
+        Slice 4 already pins that a lying override row loses to the floor in
+        the engine, which is the test that matters; this makes the invariant
+        hold at the EDGE too, so the store's contents can be read at face
+        value by a human — which is the entire premise of §7.
+        """
+        actor = _caller_actor(request)
+        try:
+            row = await exec_policy_store.put_override(
+                ctx.state.kv,
+                app=data.get("app"),
+                tool=data.get("tool"),
+                call=bool(data.get("call")),
+                output=bool(data.get("output")),
+                note=data.get("note") or "",
+                actor=actor,
+            )
+        except exec_policy_store.FloorRefusal as exc:
+            return JSONResponse({"ok": False, "error": str(exc), "floor": True}, status_code=400)
+        except exec_policy_store.BadIdentity as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        return {"ok": True, "override": row}
+
+    @app.delete("/exec-policy/override", dependencies=[Depends(_require_identity)])
+    async def exec_policy_delete_override(request: Request, data: dict = Body(...)) -> dict:
+        """Drop one override. The row falls back to its manifest declaration,
+        or to the blacklist default — which can be a WIDENING, so the page
+        states what it will fall back to before the button is pressed."""
+        app_slug, tool = data.get("app"), data.get("tool")
+        if not isinstance(app_slug, str) or not isinstance(tool, str) or not app_slug or not tool:
+            return JSONResponse({"ok": False, "error": "app and tool are required"}, status_code=400)
+        try:
+            existed = await exec_policy_store.delete_override(
+                ctx.state.kv, app=app_slug, tool=tool, actor=_caller_actor(request)
+            )
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        return {"ok": True, "cleared": existed}
+
+    @app.put("/exec-policy/ack", dependencies=[Depends(_require_identity)])
+    async def exec_policy_put_ack(request: Request, data: dict = Body(...)) -> dict:
+        """Accept one unresolvable upstream as known — §9's escalation.
+
+        **Acknowledging is not permitting.** Nothing here reaches
+        `allow_call`/`allow_output`: the upstream's names keep failing closed,
+        arguments and result still dropped. What changes is only the counting
+        — it leaves `policy_unresolved_actionable`, and the doctor can
+        therefore go green and mean it.
+
+        The two live cases are `fredericowu` and `fredericowu_browser`, BYOD
+        linked-workspace federations with no `apps/<slug>/mcp.json` to join
+        against. They are already in this code's own
+        `UNRESOLVABLE_UPSTREAMS`; this route is for the next one, which nobody
+        gets to patch the code for first.
+        """
+        try:
+            row = await exec_policy_store.put_acknowledgement(
+                ctx.state.kv,
+                upstream=data.get("upstream"),
+                reason=data.get("reason") or "",
+                actor=_caller_actor(request),
+            )
+        except exec_policy_store.BadIdentity as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        return {"ok": True, "acknowledged": row}
+
+    @app.delete("/exec-policy/ack", dependencies=[Depends(_require_identity)])
+    async def exec_policy_delete_ack(request: Request, data: dict = Body(...)) -> dict:
+        """Withdraw an acknowledgement: the upstream's names return to the
+        actionable bucket on the next tick. Reversible on purpose — a
+        judgement nobody can withdraw is not a reviewable one."""
+        upstream = data.get("upstream")
+        if not isinstance(upstream, str) or not upstream:
+            return JSONResponse({"ok": False, "error": "upstream is required"}, status_code=400)
+        try:
+            existed = await exec_policy_store.delete_acknowledgement(
+                ctx.state.kv, upstream=upstream, actor=_caller_actor(request)
+            )
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        return {"ok": True, "cleared": existed}
+
+    @app.get("/policy-ui", dependencies=[Depends(_require_identity)])
+    async def policy_ui() -> HTMLResponse:
+        """§7's maintenance page. HTML, served from this app, rendered in the
+        declarative window's `iframe` widget (`windows/main.json`).
+
+        **Deliberately not under `/ui`** — core serves app ESM bundles from
+        that prefix and would shadow this route (the same reason
+        aw-app-secrets' own panel is at `/panel`), which is why §7 names
+        `/policy-ui` explicitly.
+
+        Gated like every other route here. This app runs with
+        `auth_required: false` so the credential-less `GET /keys/{slot}` pull
+        is reachable, which means the framework gate enforces nothing for the
+        mount and each route carries its own dependency — see the module
+        docstring.
+        """
+        from .policy_panel import PANEL_HTML
+
+        return HTMLResponse(PANEL_HTML)
 
     # ------------------------------------------------------------------
     # MCP — Streamable HTTP, auto-discovered by aw-mcp-gateway's app-scan.

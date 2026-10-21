@@ -156,15 +156,24 @@ EMPTY_NAME_LABEL = "<empty>"
 #: :attr:`PolicyTable.counters`) and the unresolved side itself reports an
 #: *actionable* count that these do not enter.
 #:
-#: **What this registry is NOT, and what slice 3 still owes.** It does not
-#: touch ``policy_unresolved`` or the doctor check that reads it — those are
-#: slice 2's shipped surface and the acknowledge path is slice 3's to build
-#: (§9: "give the UI a way to acknowledge a row as attributable to nothing,
-#: on purpose", or have core expose the gateway's non-app upstreams so they
-#: can be attributed properly). Until then the doctor still degrades
-#: permanently on these two names. This registry is the data slice 3's UI
-#: needs and the guard that keeps slice 4's own counters readable; it is
-#: deliberately not a silent fix to somebody else's surface.
+#: **Slice 3 built the human half of this, and the two are the same
+#: mechanism.** This dict is the registry of upstreams THIS CODE knows can
+#: never be attributed; ``acknowledged`` (``PolicyTable(acknowledged=...)``,
+#: filled from the connector's state facade by ``exec_policy_store``) is the
+#: registry of upstreams A HUMAN has looked at and accepted from the §7
+#: maintenance page. :meth:`PolicyTable.unresolved_split` reads the UNION,
+#: because the distinction between "the coder knew" and "an operator decided"
+#: matters for provenance and not at all for counting. Acknowledging is NOT
+#: permitting: an acknowledged upstream's names still fail closed, still drop
+#: their arguments and result, and still appear on the page — they simply stop
+#: being added to a number whose whole job is to say "something NEW happened".
+#:
+#: Slice 3 also made the doctor read the actionable count rather than the full
+#: ``policy_unresolved`` list (``routes._exec_sync_status_payload``), which is
+#: what finally stops it going permanently red on the two names below. That
+#: was deliberately left to this slice rather than done from inside slice 2's
+#: counter property: narrowing a shipped surface silently is how an alarm
+#: quietly stops alarming.
 #:
 #: Entries are upstream SEGMENTS as the gateway spells them (already
 #: sanitised — dash→underscore), not app slugs: there is no app.
@@ -485,6 +494,8 @@ class PolicyTable:
         "_apps",
         "_scan_error",
         "_manifest_errors",
+        "_acknowledged",
+        "_overrides_error",
         "_cache",
         "_unresolved",
         "_denied_calls",
@@ -501,6 +512,8 @@ class PolicyTable:
         apps: Iterable[str] = (),
         scan_error: str | None = None,
         manifest_errors: Mapping[str, str] | None = None,
+        acknowledged: Mapping[str, str] | None = None,
+        overrides_error: str | None = None,
     ) -> None:
         self._upstreams = dict(upstreams or {})
         self._declared = dict(declared or {})
@@ -525,6 +538,27 @@ class PolicyTable:
         #: precedence is implemented and testable (including the test that
         #: matters: an override row that LIES about a floor tool).
         self._overrides = dict(overrides or {})
+        #: ``{upstream: reason}`` a human accepted from the §7 page as
+        #: attributable to nothing, on purpose — merged with
+        #: :data:`UNRESOLVABLE_UPSTREAMS` for CLASSIFICATION only. Nothing
+        #: here reaches :meth:`_resolve`, so an acknowledged upstream's names
+        #: fail closed exactly as hard as before it was acknowledged. That
+        #: separation is the whole design of the feature: the operator is
+        #: silencing a counter, not opening a door, and the only way to keep
+        #: those two things from ever being confused is for the permit path
+        #: not to exist.
+        self._acknowledged = dict(acknowledged or {})
+        #: Why the override store could not be read, if it could not be. Under
+        #: a blacklist an empty override map is a legitimate everyday state
+        #: (nobody has overridden anything), so "could not read" must NOT be
+        #: spelled the same way — the same lesson, in the same direction, as
+        #: :func:`_declared_entries`'s second return value. It cannot fail
+        #: closed the way a manifest read can (an unreadable store does not
+        #: say WHICH tools a human had restricted, so there is nothing to
+        #: deny), so it is loud instead: reported on the sentinel as
+        #: ``policy_overrides_unreadable`` and degrading the doctor. The floor
+        #: is untouched by it either way, being hard-coded (§2).
+        self._overrides_error = overrides_error
         self._apps = sorted(apps)
         self._scan_error = scan_error
         self._cache: dict[str, Decision] = {}
@@ -544,6 +578,9 @@ class PolicyTable:
         cls,
         root: str | None = None,
         overrides: Mapping[tuple[str, str], tuple[bool, bool]] | None = None,
+        *,
+        acknowledged: Mapping[str, str] | None = None,
+        overrides_error: str | None = None,
     ) -> "PolicyTable":
         """Build the table from the installed tree — §5's materialisation.
 
@@ -578,7 +615,17 @@ class PolicyTable:
             entries = sorted(os.listdir(root))
         except OSError as exc:
             log.warning("exec policy: cannot read %s — %s", root, type(exc).__name__)
-            return cls(scan_error=f"apps root unreadable: {type(exc).__name__}")
+            # Overrides and acknowledgements still ride along: they come from
+            # the state facade, not from this tree, and the §7 page has to be
+            # able to show what a human said even when the tree it would be
+            # said ABOUT is unreadable. They change nothing about enforcement
+            # in this state — every routed name is unresolved and denied.
+            return cls(
+                overrides=overrides,
+                acknowledged=acknowledged,
+                overrides_error=overrides_error,
+                scan_error=f"apps root unreadable: {type(exc).__name__}",
+            )
         for slug in entries:
             app_dir = os.path.join(root, slug)
             if not os.path.isdir(app_dir):
@@ -606,6 +653,8 @@ class PolicyTable:
             apps=apps,
             scan_error=scan_error,
             manifest_errors=manifest_errors,
+            acknowledged=acknowledged,
+            overrides_error=overrides_error,
         )
 
     def _cached(self, name: str | None) -> Decision:
@@ -663,8 +712,12 @@ class PolicyTable:
         split on :data:`UNRESOLVABLE_UPSTREAMS`.
 
         ``known`` is the standing condition: a name routed through an
-        upstream that is unresolvable by construction, which no manifest can
-        ever attribute. ``actionable`` is everything else — an uninstalled
+        upstream that is unresolvable by construction (:data:`UNRESOLVABLE_
+        UPSTREAMS`) **or one a human acknowledged** from the §7 page — the
+        union, because "the coder knew" and "an operator decided" differ in
+        provenance and not at all in what they mean for a counter. Neither
+        lifts the denial; see :data:`UNRESOLVABLE_UPSTREAMS`. ``actionable``
+        is everything else — an uninstalled
         app, a fourth gateway spelling, a third-party ``mcp__`` server, a
         row with no name at all. That second list is the one where a NEW
         entry means something changed and somebody should look.
@@ -701,10 +754,83 @@ class PolicyTable:
             is_known = (
                 not degraded
                 and not broken_manifest
-                and upstream in UNRESOLVABLE_UPSTREAMS
+                and upstream in self.known_upstreams()
             )
             (known if is_known else actionable).append(name)
         return actionable, known
+
+    def known_upstreams(self) -> dict[str, str]:
+        """``{upstream: reason}`` for every upstream whose unresolvability is
+        accounted for — the built-in registry plus what a human acknowledged.
+
+        The built-in entries win a collision: a hard-coded reason is a
+        statement this code can defend, and an acknowledgement that happened
+        to name the same upstream adds nothing to it.
+        """
+        return {**self._acknowledged, **UNRESOLVABLE_UPSTREAMS}
+
+    # --- read-only views, for the §7 maintenance page -------------------
+    #
+    # None of these feed a decision; they exist so the page can enumerate
+    # rows (§7's "row population") without a second scan of the tree or a
+    # second copy of the precedence rules.
+
+    def apps(self) -> list[str]:
+        return list(self._apps)
+
+    @property
+    def manifest_errors(self) -> dict[str, str]:
+        return dict(self._manifest_errors)
+
+    @property
+    def overrides_error(self) -> str | None:
+        return self._overrides_error
+
+    def declared_identities(self) -> list[tuple[str, str]]:
+        """``(app, tool)`` for every manifest ``indexing`` entry — §7 row
+        population source (a)."""
+        return sorted(self._declared)
+
+    def declared_axes(self, app: str, tool: str) -> tuple[bool, bool] | None:
+        """What the MANIFEST says about one identity, independently of what
+        currently wins. The page shows this beside an override so an operator
+        can see exactly what they are overriding — §11 again: the source
+        column is load-bearing, and "you are overriding something" is only
+        reviewable if the thing is visible."""
+        return self._declared.get((app, tool))
+
+    def override_identities(self) -> list[tuple[str, str]]:
+        """``(app, tool)`` for every override row this table was built with."""
+        return sorted(self._overrides)
+
+    def observed_identities(self) -> list[tuple[str | None, str]]:
+        """``(app, tool)`` for every identity this table actually RESOLVED
+        while the tick ran — §7 row population source (c), and the only one
+        that is honest about what runs in this workspace rather than what a
+        manifest claims.
+
+        The filter is "has an identity to key a row on", NOT "resolved
+        successfully", and the difference is a row an operator genuinely needs:
+        a tool denied because its own app's ``aw-app.json`` could not be read
+        (``_resolve`` step 4b) is ``unresolved`` AND attributed, so it has a
+        real ``(app, tool)`` and belongs in the table with its
+        ``manifest_error`` pointing at the file to fix. What is excluded is the
+        case with no identity at all — an unattributable spelling or an empty
+        name, which is exactly why §7 gives those their own section showing
+        their RAW spellings instead.
+
+        The floor's own observations are included: a ``write_secret`` that
+        actually ran is worth saying so, and the page renders it locked either
+        way.
+        """
+        return sorted(
+            {
+                (d.app, d.tool)
+                for d in self._cache.values()
+                if d.tool and (d.app or d.state != STATE_UNRESOLVED)
+            },
+            key=lambda pair: (pair[0] or "", pair[1]),
+        )
 
     def _resolve(self, name: str) -> Decision:
         """§3's resolution order, in order. The ordering IS the contract."""
@@ -721,39 +847,83 @@ class PolicyTable:
             # 5. Routed and attributable to nothing -> FAIL CLOSED.
             if not slug:
                 return Decision(False, False, STATE_UNRESOLVED, None, tool, upstream)
-            # 4. Routed and attributed: override, then declaration, then the
-            #    blacklist default (§6: floor > override > manifest >
-            #    default).
-            axes = self._overrides.get((slug, tool))
-            if axes is not None:
-                return Decision(axes[0], axes[1], STATE_OVERRIDE, slug, tool, upstream)
-            # 4b. The app is installed and attributable, but its manifest
-            #     could not be read — so its declarations are UNKNOWN, not
-            #     absent, and falling through to the blacklist default would
-            #     turn a declared `output: false` into permission to index.
-            #     Checked AFTER the override lookup on purpose: §6 puts a
-            #     human override above the manifest, and a corrupt manifest
-            #     does not invalidate what a human said about this tool.
-            if slug in self._manifest_errors:
-                return Decision(False, False, STATE_UNRESOLVED, slug, tool, upstream)
-            axes = self._declared.get((slug, tool))
-            if axes is not None:
-                return Decision(axes[0], axes[1], self._declared_state(axes), slug, tool, upstream)
-            return Decision(True, True, STATE_NEVER_DECLARED, slug, tool, upstream)
-        # 6. Bare name: the intersection of every declaration and override
-        #    that names this tool, whichever app owns it. Any restriction
-        #    restricts — ambiguity tightens, never widens. Known consequence
-        #    (§11): one app's opt-out can restrict a same-named tool from
-        #    another app when a call arrives unattributed.
+            # 4. Routed and attributed.
+            return self._attributed(slug, tool, upstream)
         if not tool:
             # A row with no name at all is not a harness tool, it is a row
             # nothing can attribute. Fails closed with the rest of §3.5.
             return Decision(False, False, STATE_UNRESOLVED, None, tool)
+        # 6. Bare name.
+        return self._bare(tool)
+
+    def _attributed(self, slug: str, tool: str, upstream: str | None) -> Decision:
+        """§3 step 4 / §6's precedence for a tool that IS attributed to an
+        installed app: override, then declaration, then the blacklist default
+        (floor > override > manifest > default; the floor is checked by both
+        callers before they get here).
+
+        One copy, two callers — :meth:`_resolve` (an observed name, during a
+        tick) and :meth:`effective` (an ``(app, tool)`` identity, for the §7
+        page). §12 risk 6's rule applied one level up from segmentation: a
+        second copy of the precedence order is how the page starts telling an
+        operator something the tick does not do, and §11 names that exact
+        failure — "if the source column ever lies, humans will edit the wrong
+        layer and conclude the system ignores them".
+        """
+        axes = self._overrides.get((slug, tool))
+        if axes is not None:
+            return Decision(axes[0], axes[1], STATE_OVERRIDE, slug, tool, upstream)
+        # The app is installed and attributable, but its manifest could not be
+        # read — so its declarations are UNKNOWN, not absent, and falling
+        # through to the blacklist default would turn a declared
+        # `output: false` into permission to index. Checked AFTER the override
+        # lookup on purpose: §6 puts a human override above the manifest, and
+        # a corrupt manifest does not invalidate what a human said about one
+        # tool.
+        if slug in self._manifest_errors:
+            return Decision(False, False, STATE_UNRESOLVED, slug, tool, upstream)
+        axes = self._declared.get((slug, tool))
+        if axes is not None:
+            return Decision(axes[0], axes[1], self._declared_state(axes), slug, tool, upstream)
+        return Decision(True, True, STATE_NEVER_DECLARED, slug, tool, upstream)
+
+    def _bare(self, tool: str) -> Decision:
+        """§3 step 6: the intersection of every declaration AND override that
+        names this bare tool, whichever app owns it. Any restriction restricts
+        — ambiguity tightens, never widens. Known consequence (§11): one app's
+        opt-out can restrict a same-named tool from another app when a call
+        arrives unattributed.
+        """
         matches = self._by_tool.get(tool)
         if not matches:
             return Decision(True, True, STATE_NEVER_DECLARED, None, tool)
         axes = (all(m[0] for m in matches), all(m[1] for m in matches))
         return Decision(axes[0], axes[1], self._declared_state(axes), None, tool)
+
+    def effective(self, app: str | None, tool: str) -> Decision:
+        """The decision for an ``(app, tool)`` IDENTITY rather than an observed
+        name — what §7's maintenance page renders one row from.
+
+        Deliberately not routed through :meth:`decide`: that one parses a
+        gateway spelling and tallies a tick's counters, and a page refresh is
+        neither a row nor an observation. It is the same precedence though,
+        because it is literally the same two methods (:meth:`_attributed`,
+        :meth:`_bare`) the tick uses — see :meth:`_attributed`'s docstring for
+        why that matters more here than anywhere else in this module.
+
+        ``app=None`` means an unattributed/bare identity (a harness tool like
+        ``Bash``), which takes the intersection path exactly as a bare observed
+        name does. The floor is checked FIRST, as everywhere (§2): a floor row
+        renders locked whatever any override or declaration claims about it.
+        """
+        tool = exec_scrub.tool_name_segment(tool)
+        if tool in exec_scrub.SECRET_TOOL_NAMES:
+            return Decision(False, False, STATE_FLOOR, None, tool)
+        if not tool:
+            return Decision(False, False, STATE_UNRESOLVED, None, "")
+        if app:
+            return self._attributed(app, tool, None)
+        return self._bare(tool)
 
     @staticmethod
     def _declared_state(axes: tuple[bool, bool]) -> str:
@@ -770,7 +940,9 @@ class PolicyTable:
             "upstreams": len(self._upstreams),
             "declarations": len(self._declared),
             "overrides": len(self._overrides),
+            "acknowledged": len(self._acknowledged),
             "scan_error": self._scan_error,
+            "overrides_error": self._overrides_error,
             "manifest_errors": len(self._manifest_errors),
         }
 
@@ -827,4 +999,13 @@ class PolicyTable:
             "policy_unresolved_results": self._unresolved_results,
             "policy_scan_error": self._scan_error,
             "policy_manifest_unreadable": dict(sorted(self._manifest_errors.items())),
+            # Slice 3. A human's override is the ONLY layer above an app's
+            # self-assertion (§6), so a tick that could not read the override
+            # store ran with a weaker policy than the operator configured —
+            # and under a blacklist "no overrides" is a legitimate everyday
+            # state, so this cannot be inferred from the count being zero.
+            # It is reported rather than fail-closed because an unreadable
+            # store does not say WHICH tools a human restricted; there is
+            # nothing to deny, only something to say out loud.
+            "policy_overrides_unreadable": self._overrides_error,
         }
