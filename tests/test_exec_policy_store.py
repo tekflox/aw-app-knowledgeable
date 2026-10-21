@@ -28,7 +28,31 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import asyncio  # noqa: E402
+
 from knowledgeable_app import exec_policy, exec_policy_store, exec_scrub  # noqa: E402
+
+
+def _run(coro):
+    """Drive a coroutine from a sync test — the convention every async-touching
+    suite in this repo already uses (`test_bulk_ingest.py`, `test_client.py`,
+    `test_forwarding.py`, `test_fs_sync.py`).
+
+    **Not a style preference: `pytest-asyncio` is not a CI dependency.** The
+    release workflow installs exactly `pytest jsonschema fastapi httpx uvicorn`
+    (aw-marketplace `.github/workflows/app-release.yml`), so an
+    `@pytest.mark.asyncio` test there is an unknown mark on a coroutine nobody
+    awaits — skipped with a warning on the pytest CI resolves, and a hard error
+    on pytest 9. This file shipped that way for one commit and CI went GREEN on
+    36 tests that never executed a single assertion.
+
+    That is §12 risk 10 one layer out, and the reason it survived review is
+    worth recording: the "CI replica" run that was supposed to catch it had
+    `PYTHONPATH` pointing at the workspace venv, which carries `pytest-asyncio`
+    — so the replica was not a replica. A CI check run with any ambient
+    `PYTHONPATH` is not evidence about CI.
+    """
+    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
 
 
 class _Kv:
@@ -77,30 +101,27 @@ FLOOR_SPELLINGS = [
 
 
 @pytest.mark.parametrize("spelling", FLOOR_SPELLINGS)
-@pytest.mark.asyncio
-async def test_put_override_refuses_every_floor_spelling(kv, spelling):
+def test_put_override_refuses_every_floor_spelling(kv, spelling):
     with pytest.raises(exec_policy_store.FloorRefusal):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app="secrets", tool=spelling, call=True, output=True,
             note="let me index it", actor="test",
-        )
+        ))
     assert kv.store == {}, "nothing may reach the store when the floor refused"
 
 
 @pytest.mark.parametrize("tool", sorted(exec_scrub.SECRET_TOOL_NAMES))
-@pytest.mark.asyncio
-async def test_put_override_refuses_all_four_floor_names(kv, tool):
+def test_put_override_refuses_all_four_floor_names(kv, tool):
     """All four, not just `write_secret` — the floor is a set, and a test that
     only pinned one name is how the other three would be free to drift."""
     with pytest.raises(exec_policy_store.FloorRefusal):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app="secrets", tool=tool, call=False, output=False,
             note="even a redundant one", actor="test",
-        )
+        ))
 
 
-@pytest.mark.asyncio
-async def test_floor_refusal_beats_shape_validation(kv):
+def test_floor_refusal_beats_shape_validation(kv):
     """A floor name that is ALSO malformed must be refused as a floor name.
 
     The order in `_check_identity` is deliberate: if the shape check ran
@@ -109,22 +130,21 @@ async def test_floor_refusal_beats_shape_validation(kv):
     be a floor row. The refusal has to be the FIRST thing that happens.
     """
     with pytest.raises(exec_policy_store.FloorRefusal):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app="secrets", tool="mcp__aw-gateway__aw__aw_secrets__read_secret",
             call=True, output=True, note="", actor="test",
-        )
+        ))
 
 
-@pytest.mark.asyncio
-async def test_spread_secret_is_not_a_floor_name(kv):
+def test_spread_secret_is_not_a_floor_name(kv):
     """Segment EQUALITY, never `endswith` — `spread_secret` ends with
     `read_secret` and is an ordinary tool. The whole module exists because a
     name-matching detail failed open; this is the mirror case, where it must
     not fail closed on something it does not own."""
-    row = await exec_policy_store.put_override(
+    row = _run(exec_policy_store.put_override(
         kv, app="some-app", tool="spread_secret", call=True, output=True,
         note="", actor="test",
-    )
+    ))
     assert row["tool"] == "spread_secret"
 
 
@@ -133,38 +153,35 @@ async def test_spread_secret_is_not_a_floor_name(kv):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("tool", ["aw__kb__search_graph", "kb.search_graph"])
-@pytest.mark.asyncio
-async def test_put_override_requires_a_bare_segment(kv, tool):
+def test_put_override_requires_a_bare_segment(kv, tool):
     with pytest.raises(exec_policy_store.BadIdentity):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app="kb", tool=tool, call=False, output=False, note="x", actor="test",
-        )
+        ))
 
 
 @pytest.mark.parametrize("app", [None, "", "   ", 7])
-@pytest.mark.asyncio
-async def test_put_override_requires_an_app(kv, app):
+def test_put_override_requires_an_app(kv, app):
     """§3 step 6 / §11: an app-less row would restrict every same-named tool
     in the estate through the bare-name intersection. That widening is granted
     deliberately to an unattributable OBSERVED call, never to a form."""
     with pytest.raises(exec_policy_store.BadIdentity):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app=app, tool="search_graph", call=False, output=False,
             note="x", actor="test",
-        )
+        ))
 
 
 # ---------------------------------------------------------------------------
 # Round-trip, and the provenance §7 renders.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_override_round_trips_with_provenance(kv):
-    written = await exec_policy_store.put_override(
+def test_override_round_trips_with_provenance(kv):
+    written = _run(exec_policy_store.put_override(
         kv, app="kb", tool="search_graph", call=False, output=True,
         note="queries carry customer names", actor="identity:fred",
-    )
-    loaded, error = await exec_policy_store.load_overrides(kv)
+    ))
+    loaded, error = _run(exec_policy_store.load_overrides(kv))
     assert error is None
     assert loaded[("kb", "search_graph")] == {
         "app": "kb",
@@ -178,86 +195,78 @@ async def test_override_round_trips_with_provenance(kv):
     assert exec_policy_store.axes(loaded) == {("kb", "search_graph"): (False, True)}
 
 
-@pytest.mark.asyncio
-async def test_put_override_replaces_in_place(kv):
-    await exec_policy_store.put_override(
+def test_put_override_replaces_in_place(kv):
+    _run(exec_policy_store.put_override(
         kv, app="kb", tool="search_graph", call=False, output=False, note="a", actor="x",
-    )
-    await exec_policy_store.put_override(
+    ))
+    _run(exec_policy_store.put_override(
         kv, app="kb", tool="search_graph", call=True, output=False, note="b", actor="y",
-    )
-    loaded, _ = await exec_policy_store.load_overrides(kv)
+    ))
+    loaded, _ = _run(exec_policy_store.load_overrides(kv))
     assert len(loaded) == 1
     assert loaded[("kb", "search_graph")]["call"] is True
     assert loaded[("kb", "search_graph")]["note"] == "b"
 
 
-@pytest.mark.asyncio
-async def test_other_overrides_survive_a_write_and_a_delete(kv):
-    await exec_policy_store.put_override(
+def test_other_overrides_survive_a_write_and_a_delete(kv):
+    _run(exec_policy_store.put_override(
         kv, app="kb", tool="search_graph", call=False, output=False, note="a", actor="x",
-    )
-    await exec_policy_store.put_override(
+    ))
+    _run(exec_policy_store.put_override(
         kv, app="notion", tool="add_kanban_comment", call=False, output=True,
         note="b", actor="x",
-    )
-    await exec_policy_store.delete_override(kv, app="kb", tool="search_graph", actor="x")
-    loaded, _ = await exec_policy_store.load_overrides(kv)
+    ))
+    _run(exec_policy_store.delete_override(kv, app="kb", tool="search_graph", actor="x"))
+    loaded, _ = _run(exec_policy_store.load_overrides(kv))
     assert list(loaded) == [("notion", "add_kanban_comment")]
 
 
-@pytest.mark.asyncio
-async def test_delete_reports_whether_there_was_one(kv):
-    assert await exec_policy_store.delete_override(
-        kv, app="kb", tool="nope", actor="x") is False
-    await exec_policy_store.put_override(
-        kv, app="kb", tool="search_graph", call=True, output=True, note="", actor="x")
-    assert await exec_policy_store.delete_override(
-        kv, app="kb", tool="search_graph", actor="x") is True
+def test_delete_reports_whether_there_was_one(kv):
+    assert _run(exec_policy_store.delete_override(
+        kv, app="kb", tool="nope", actor="x")) is False
+    _run(exec_policy_store.put_override(
+        kv, app="kb", tool="search_graph", call=True, output=True, note="", actor="x"))
+    assert _run(exec_policy_store.delete_override(
+        kv, app="kb", tool="search_graph", actor="x")) is True
 
 
 # ---------------------------------------------------------------------------
 # §12 risk 11, one read path further out: "could not read" is not "empty".
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_empty_store_with_a_healthy_facade_is_not_an_error(kv, monkeypatch):
+def test_empty_store_with_a_healthy_facade_is_not_an_error(kv, monkeypatch):
     """The state every workspace starts in, and most will stay in. It must not
     look like a degradation, or the doctor is red from day one — the very
     defect this slice was dispatched to remove."""
     monkeypatch.setattr(exec_policy_store, "_facade_degraded", lambda: False)
-    loaded, error = await exec_policy_store.load_overrides(kv)
+    loaded, error = _run(exec_policy_store.load_overrides(kv))
     assert (loaded, error) == ({}, None)
 
 
-@pytest.mark.asyncio
-async def test_a_degraded_facade_is_reported_not_flattened(monkeypatch):
+def test_a_degraded_facade_is_reported_not_flattened(monkeypatch):
     """A miss while Redis is unreachable must NOT read as "a human restricted
     nothing". Under a blacklist those are opposite claims: the second one says
     every tool is indexable on both axes."""
     monkeypatch.setattr(exec_policy_store, "_facade_degraded", lambda: True)
-    loaded, error = await exec_policy_store.load_overrides(_Kv(fail=True))
+    loaded, error = _run(exec_policy_store.load_overrides(_Kv(fail=True)))
     assert loaded == {}
     assert error == exec_policy_store.UNREACHABLE
 
 
-@pytest.mark.asyncio
-async def test_a_raising_kv_is_reported(monkeypatch):
-    loaded, error = await exec_policy_store.load_overrides(_Kv(raise_on=True))
+def test_a_raising_kv_is_reported(monkeypatch):
+    loaded, error = _run(exec_policy_store.load_overrides(_Kv(raise_on=True)))
     assert (loaded, error) == ({}, "OSError")
 
 
-@pytest.mark.asyncio
-async def test_a_malformed_blob_is_reported_not_flattened(kv):
+def test_a_malformed_blob_is_reported_not_flattened(kv):
     """Same direction as a parse error in `_declared_entries`: a value that is
     not the shape this module writes is a failure, not an empty policy."""
     kv.store[exec_policy_store.OVERRIDES_KV_NAME] = ["not", "a", "dict"]
-    loaded, error = await exec_policy_store.load_overrides(kv)
+    loaded, error = _run(exec_policy_store.load_overrides(kv))
     assert (loaded, error) == ({}, exec_policy_store.MALFORMED)
 
 
-@pytest.mark.asyncio
-async def test_a_stored_axis_that_is_not_literally_true_denies(kv):
+def test_a_stored_axis_that_is_not_literally_true_denies(kv):
     """`is True`, never truthiness — the same coercion direction
     `_declared_entries` applies to a manifest. Every coercion in a security
     default tightens."""
@@ -265,14 +274,13 @@ async def test_a_stored_axis_that_is_not_literally_true_denies(kv):
         "version": 1,
         "rows": [{"app": "kb", "tool": "search_graph", "call": "true", "output": 1}],
     }
-    loaded, error = await exec_policy_store.load_overrides(kv)
+    loaded, error = _run(exec_policy_store.load_overrides(kv))
     assert error is None
     assert loaded[("kb", "search_graph")]["call"] is False
     assert loaded[("kb", "search_graph")]["output"] is False
 
 
-@pytest.mark.asyncio
-async def test_a_write_refuses_rather_than_discarding_an_unread_blob(monkeypatch):
+def test_a_write_refuses_rather_than_discarding_an_unread_blob(monkeypatch):
     """The sharp one. A read-modify-write on a blob that could not be read
     would REPLACE it — deleting every other override in it. Losing a human's
     opt-out silently is the exact failure this whole card exists because of,
@@ -280,13 +288,13 @@ async def test_a_write_refuses_rather_than_discarding_an_unread_blob(monkeypatch
     monkeypatch.setattr(exec_policy_store, "_facade_degraded", lambda: True)
     kv = _Kv(fail=True)
     with pytest.raises(RuntimeError, match="could not be read"):
-        await exec_policy_store.put_override(
+        _run(exec_policy_store.put_override(
             kv, app="kb", tool="search_graph", call=False, output=False,
             note="x", actor="test",
-        )
+        ))
     assert kv.puts == 0
     with pytest.raises(RuntimeError, match="could not be read"):
-        await exec_policy_store.delete_override(kv, app="kb", tool="search_graph", actor="t")
+        _run(exec_policy_store.delete_override(kv, app="kb", tool="search_graph", actor="t"))
     assert kv.puts == 0
 
 
@@ -294,14 +302,13 @@ async def test_a_write_refuses_rather_than_discarding_an_unread_blob(monkeypatch
 # Acknowledgements — §9's escalation. Acknowledging is NOT permitting.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_acknowledgement_round_trips(kv):
-    row = await exec_policy_store.put_acknowledgement(
+def test_acknowledgement_round_trips(kv):
+    row = _run(exec_policy_store.put_acknowledgement(
         kv, upstream="fredericowu_browser",
         reason="BYOD linked-workspace federation — no apps/<slug>/mcp.json exists",
         actor="identity:fred",
-    )
-    loaded, error = await exec_policy_store.load_acknowledged(kv)
+    ))
+    loaded, error = _run(exec_policy_store.load_acknowledged(kv))
     assert error is None
     assert loaded["fredericowu_browser"]["reason"] == row["reason"]
     assert exec_policy_store.ack_reasons(loaded) == {
@@ -309,47 +316,43 @@ async def test_acknowledgement_round_trips(kv):
     }
 
 
-@pytest.mark.asyncio
-async def test_acknowledgement_requires_a_reason(kv):
+def test_acknowledgement_requires_a_reason(kv):
     """§4's rule applied here: an opt-out nobody can review is rot, and this
     one silences an alarm."""
     with pytest.raises(exec_policy_store.BadIdentity, match="reason is required"):
-        await exec_policy_store.put_acknowledgement(
-            kv, upstream="whatever", reason="   ", actor="test")
+        _run(exec_policy_store.put_acknowledgement(
+            kv, upstream="whatever", reason="   ", actor="test"))
 
 
-@pytest.mark.asyncio
-async def test_acknowledgement_refuses_a_whole_tool_name(kv):
+def test_acknowledgement_refuses_a_whole_tool_name(kv):
     """An upstream is one sanitised segment. Accepting a whole tool name would
     silence one spelling and leave the upstream's other names red, which reads
     as the acknowledgement not working."""
     with pytest.raises(exec_policy_store.BadIdentity):
-        await exec_policy_store.put_acknowledgement(
-            kv, upstream="mcp__aw-gateway__aw__fredericowu__x", reason="r", actor="t")
+        _run(exec_policy_store.put_acknowledgement(
+            kv, upstream="mcp__aw-gateway__aw__fredericowu__x", reason="r", actor="t"))
 
 
-@pytest.mark.asyncio
-async def test_acknowledgement_is_withdrawable(kv):
-    await exec_policy_store.put_acknowledgement(
-        kv, upstream="ghost", reason="gone", actor="t")
-    assert await exec_policy_store.delete_acknowledgement(
-        kv, upstream="ghost", actor="t") is True
-    loaded, _ = await exec_policy_store.load_acknowledged(kv)
+def test_acknowledgement_is_withdrawable(kv):
+    _run(exec_policy_store.put_acknowledgement(
+        kv, upstream="ghost", reason="gone", actor="t"))
+    assert _run(exec_policy_store.delete_acknowledgement(
+        kv, upstream="ghost", actor="t")) is True
+    loaded, _ = _run(exec_policy_store.load_acknowledged(kv))
     assert loaded == {}
-    assert await exec_policy_store.delete_acknowledgement(
-        kv, upstream="ghost", actor="t") is False
+    assert _run(exec_policy_store.delete_acknowledgement(
+        kv, upstream="ghost", actor="t")) is False
 
 
-@pytest.mark.asyncio
-async def test_an_acknowledged_upstream_is_still_denied(kv, tmp_path):
+def test_an_acknowledged_upstream_is_still_denied(kv, tmp_path):
     """**The test that matters for this feature.** Acknowledging must change
     the COUNTING and nothing else. If it ever lifts a denial, the operator
     pressing "stop telling me about this" has silently opened the fail-closed
     path that §3.5 exists to keep shut.
     """
-    await exec_policy_store.put_acknowledgement(
-        kv, upstream="fredericowu", reason="BYOD federation", actor="t")
-    acknowledged, _ = await exec_policy_store.load_acknowledged(kv)
+    _run(exec_policy_store.put_acknowledgement(
+        kv, upstream="fredericowu", reason="BYOD federation", actor="t"))
+    acknowledged, _ = _run(exec_policy_store.load_acknowledged(kv))
     table = exec_policy.PolicyTable(
         upstreams={"kb": "kb"},
         acknowledged=exec_policy_store.ack_reasons(acknowledged),
@@ -369,14 +372,13 @@ async def test_an_acknowledged_upstream_is_still_denied(kv, tmp_path):
 # Observed identities — §7 row population source (c).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_observed_identities_union_across_ticks(kv):
+def test_observed_identities_union_across_ticks(kv):
     """A union, not a replacement: one tick sees one bounded slice of runs, so
     replacing would make the page's row list flicker with whatever the last
     ten minutes happened to contain."""
-    await exec_policy_store.record_observed(kv, [("kb", "search_graph"), (None, "Bash")])
-    await exec_policy_store.record_observed(kv, [("notion", "add_kanban_comment")])
-    rows, error, at = await exec_policy_store.load_observed(kv)
+    _run(exec_policy_store.record_observed(kv, [("kb", "search_graph"), (None, "Bash")]))
+    _run(exec_policy_store.record_observed(kv, [("notion", "add_kanban_comment")]))
+    rows, error, at = _run(exec_policy_store.load_observed(kv))
     assert error is None
     assert at
     assert set(rows) == {
@@ -384,8 +386,7 @@ async def test_observed_identities_union_across_ticks(kv):
     }
 
 
-@pytest.mark.asyncio
-async def test_observed_is_capped(kv, monkeypatch):
+def test_observed_is_capped(kv, monkeypatch):
     monkeypatch.setattr(exec_policy_store, "OBSERVED_CAP", 3)
     merged = exec_policy_store.merge_observed(
         [("a", "t1"), ("a", "t2")], [("a", "t3"), ("a", "t4")]
@@ -393,30 +394,27 @@ async def test_observed_is_capped(kv, monkeypatch):
     assert len(merged) == 3
 
 
-@pytest.mark.asyncio
-async def test_observed_not_recorded_when_the_store_is_unreadable(monkeypatch):
+def test_observed_not_recorded_when_the_store_is_unreadable(monkeypatch):
     """Same never-replace-an-unread-blob rule. Here the cost of refusing is
     only a stale settings page, which is why it logs rather than raising."""
     monkeypatch.setattr(exec_policy_store, "_facade_degraded", lambda: True)
     kv = _Kv(fail=True)
-    await exec_policy_store.record_observed(kv, [("kb", "search_graph")])
+    _run(exec_policy_store.record_observed(kv, [("kb", "search_graph")]))
     assert kv.puts == 0
 
 
-@pytest.mark.asyncio
-async def test_observed_timestamp_distinguishes_never_run_from_nothing_there(kv):
+def test_observed_timestamp_distinguishes_never_run_from_nothing_there(kv):
     """An empty list has two meanings — the sync has never run
     (`exec_sync_enabled` ships false), or it ran and saw nothing. The page
     must not present those alike, so `at` is returned beside the rows."""
-    rows, error, at = await exec_policy_store.load_observed(kv)
+    rows, error, at = _run(exec_policy_store.load_observed(kv))
     assert (rows, error, at) == ([], None, "")
-    await exec_policy_store.record_observed(kv, [("kb", "search_graph")])
-    _rows, _error, at = await exec_policy_store.load_observed(kv)
+    _run(exec_policy_store.record_observed(kv, [("kb", "search_graph")]))
+    _rows, _error, at = _run(exec_policy_store.load_observed(kv))
     assert at
 
 
-@pytest.mark.asyncio
-async def test_a_dashed_upstream_is_normalised_to_what_the_gateway_spells(kv):
+def test_a_dashed_upstream_is_normalised_to_what_the_gateway_spells(kv):
     """An operator reasonably types the dashed name of a linked workspace.
     The acknowledgement is matched against `Decision.upstream`, which is
     always the SANITISED form, so storing the dashed string would create a row
@@ -427,9 +425,9 @@ async def test_a_dashed_upstream_is_normalised_to_what_the_gateway_spells(kv):
     that copy of the gateway's transform lives (§12 risk 1), never a second
     `replace('-', '_')`.
     """
-    await exec_policy_store.put_acknowledgement(
-        kv, upstream="fredericowu-browser", reason="BYOD federation", actor="t")
-    loaded, _ = await exec_policy_store.load_acknowledged(kv)
+    _run(exec_policy_store.put_acknowledgement(
+        kv, upstream="fredericowu-browser", reason="BYOD federation", actor="t"))
+    loaded, _ = _run(exec_policy_store.load_acknowledged(kv))
     assert list(loaded) == ["fredericowu_browser"]
 
     table = exec_policy.PolicyTable(
@@ -442,5 +440,5 @@ async def test_a_dashed_upstream_is_normalised_to_what_the_gateway_spells(kv):
         "a dashed acknowledgement must still silence the real observed name"
     )
     # ...and the dashed spelling withdraws what it created.
-    assert await exec_policy_store.delete_acknowledgement(
-        kv, upstream="fredericowu-browser", actor="t") is True
+    assert _run(exec_policy_store.delete_acknowledgement(
+        kv, upstream="fredericowu-browser", actor="t")) is True
