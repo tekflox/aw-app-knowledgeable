@@ -766,6 +766,27 @@ def build_routes(ctx) -> FastAPI:
         the engine, which is the test that matters; this makes the invariant
         hold at the EDGE too, so the store's contents can be read at face
         value by a human — which is the entire premise of §7.
+
+        **Nothing is coerced here. The body is passed through verbatim and
+        the store validates it** — and that is the whole correction after QA's
+        review, because this handler is where the pattern broke three times.
+        Under a blacklist, ambiguity must TIGHTEN; every defect on this card
+        has been an ambiguous or malformed input defaulting to *permit*:
+
+        1. `_declared_entries` returned `{}` on an unreadable manifest, and
+           under a blacklist `{}` means "this app opted out of nothing";
+        2. a degraded policy table classified its unresolved names as
+           *known*, i.e. expected and not worth reporting;
+        3. and here: `bool(data.get("call"))` turned a client's `"false"`
+           into `True`, storing the exact opposite of a human's stated intent
+           — while `tool=data.get("tool")` went to a floor check that read the
+           RAW string and a write that stored a normalised one.
+
+        `_declared_entries` gets this right *inside* its loop ("every coercion
+        here tightens"); the route boundary did not inherit it. A boundary
+        that coerces is a boundary that decides, and this one has no business
+        deciding what a malformed request meant. It forwards; the store
+        refuses.
         """
         actor = _caller_actor(request)
         try:
@@ -773,8 +794,8 @@ def build_routes(ctx) -> FastAPI:
                 ctx.state.kv,
                 app=data.get("app"),
                 tool=data.get("tool"),
-                call=bool(data.get("call")),
-                output=bool(data.get("output")),
+                call=data.get("call"),
+                output=data.get("output"),
                 note=data.get("note") or "",
                 actor=actor,
             )
@@ -790,9 +811,18 @@ def build_routes(ctx) -> FastAPI:
     async def exec_policy_delete_override(request: Request, data: dict = Body(...)) -> dict:
         """Drop one override. The row falls back to its manifest declaration,
         or to the blacklist default — which can be a WIDENING, so the page
-        states what it will fall back to before the button is pressed."""
-        app_slug, tool = data.get("app"), data.get("tool")
-        if not isinstance(app_slug, str) or not isinstance(tool, str) or not app_slug or not tool:
+        states what it will fall back to before the button is pressed.
+
+        The required-fields check reads the NORMALISED values, so the two
+        verbs agree on what counts as empty and on what a row is called — a
+        `"   "` is a missing tool here rather than a request that reports
+        `cleared: false` and leaves the operator guessing. `delete_override`
+        normalises again internally for the same reason `put_override` does:
+        one notion of an identity, whichever door you come through.
+        """
+        app_slug = exec_policy_store.normalise_tool(data.get("app"))
+        tool = exec_policy_store.normalise_tool(data.get("tool"))
+        if not app_slug or not tool:
             return JSONResponse({"ok": False, "error": "app and tool are required"}, status_code=400)
         try:
             existed = await exec_policy_store.delete_override(

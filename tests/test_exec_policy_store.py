@@ -442,3 +442,156 @@ def test_a_dashed_upstream_is_normalised_to_what_the_gateway_spells(kv):
     # ...and the dashed spelling withdraws what it created.
     assert _run(exec_policy_store.delete_acknowledgement(
         kv, upstream="fredericowu-browser", actor="t")) is True
+
+
+# ---------------------------------------------------------------------------
+# QA's blocking finding: the guard and the write read DIFFERENT strings.
+#
+# `PUT {"tool": " write_secret "}` returned 200 and stored an override row
+# asserting that `write_secret` is indexable on BOTH axes. The floor check
+# segmented the RAW string (`" write_secret "` is not one of the four) and
+# the write stored `tool.strip()`. One request, two normalisations.
+#
+# What makes it worse than "pollutes the store": the row was INVISIBLE. The
+# §7 view renders `write_secret` as a locked `floor` row and floor precedence
+# wins, so the store held a lie no human could see or delete from the page
+# built for that purpose. It was inert only because `PolicyTable` evaluates
+# the floor before the store — and §2's whole claim is that the data must not
+# be able to say otherwise.
+#
+# These are deliberately adversarial rather than minimal, and they assert on
+# WHAT REACHED THE STORE, not on the exception type alone: a refusal with a
+# write that happened anyway is precisely the shape of this finding.
+# ---------------------------------------------------------------------------
+
+#: Padding shapes, each of which evaded the floor before the fix. The last
+#: three are not reachable by padding the bare name: a padded PREFIXED name
+#: segments to a padded segment (`"…__write_secret "` -> `"write_secret "`),
+#: and padding can sit INSIDE the name right after the final separator. The
+#: probe that only tried the four bare names plus one clean prefixed spelling
+#: found none of them.
+FLOOR_PADDING_SHAPES = [
+    " write_secret ",
+    "write_secret\n",
+    "\twrite_secret",
+    " write_secret ",          # non-breaking space — str.strip() takes it
+    "  read_secret\r\n",
+    "mcp__aw-gateway__aw__aw_secrets__write_secret ",
+    " mcp__aw-gateway__aw__aw_secrets__write_secret",
+    " aw-gateway.aw__aw_secrets__read_secret\n",
+    "mcp__aw-gateway__aw__aw_secrets__ delete_secret",
+    "mcp__workspace-gateway__aw__aw_secrets__collect_secret\t",
+]
+
+
+@pytest.mark.parametrize("spelling", FLOOR_PADDING_SHAPES)
+def test_padded_floor_names_are_refused_and_nothing_is_written(kv, spelling):
+    with pytest.raises(exec_policy_store.FloorRefusal):
+        _run(exec_policy_store.put_override(
+            kv, app="secrets", tool=spelling, call=True, output=True,
+            note="let me index it", actor="test",
+        ))
+    # The assertion that matters. An exception with a write behind it is the
+    # defect, not the fix.
+    assert kv.store == {}, f"{spelling!r} refused but something reached the store"
+    assert kv.puts == 0
+
+
+@pytest.mark.parametrize("spelling", FLOOR_PADDING_SHAPES)
+def test_the_floor_check_and_the_write_normalise_identically(spelling):
+    """The root cause, pinned directly rather than through its symptom: the
+    value the guard inspects must be the value that would be stored."""
+    normalised = exec_policy_store.normalise_tool(spelling)
+    segment = exec_policy_store.normalise_tool(
+        exec_scrub.tool_name_segment(normalised)
+    )
+    assert segment in exec_scrub.SECRET_TOOL_NAMES, (
+        f"{spelling!r} normalises to a segment the floor does not recognise"
+    )
+
+
+def test_a_padded_write_and_a_padded_delete_agree_on_the_key(kv):
+    """The mirror half. Before the fix `delete_override` did no normalisation
+    at all — it compared the raw string. That LOOKED like stripping, because a
+    delete of the exact `write_secret` cleared a row a padded put had created,
+    but the reason was that the WRITE stripped, not that the delete did. With
+    the writer normalising, a non-normalising delete could not clear a row a
+    padded request made: the two verbs would disagree about what a row is
+    called."""
+    _run(exec_policy_store.put_override(
+        kv, app=" kb ", tool=" search_graph ", call=False, output=False,
+        note="", actor="t",
+    ))
+    stored = [(r["app"], r["tool"]) for r in kv.store[exec_policy_store.OVERRIDES_KV_NAME]["rows"]]
+    assert stored == [("kb", "search_graph")]
+    assert _run(exec_policy_store.delete_override(
+        kv, app=" kb ", tool=" search_graph ", actor="t")) is True
+    assert kv.store[exec_policy_store.OVERRIDES_KV_NAME]["rows"] == []
+
+
+def test_the_segmenter_is_case_sensitive_and_that_is_correct(kv):
+    """`WRITE_SECRET` is NOT a floor name, deliberately, and this is pinned so
+    nobody "fixes" it by lowercasing.
+
+    Tool identities in this estate are case-sensitive — `API-retrieve-a-page`
+    is live — and `SECRET_TOOL_NAMES` holds the lowercase spellings the
+    gateway actually emits. So `WRITE_SECRET` is a different name, stored as
+    its own ordinary row: visible on the page, deletable, and never consulted
+    for the real `write_secret` decision, which hits the floor first. It is a
+    phantom row, not a floor bypass. Lowercasing here would instead make the
+    store disagree with the engine about what a tool is called, which is the
+    bug this whole section exists to delete.
+    """
+    row = _run(exec_policy_store.put_override(
+        kv, app="secrets", tool="WRITE_SECRET", call=True, output=True,
+        note="", actor="t",
+    ))
+    assert row["tool"] == "WRITE_SECRET"
+    table = exec_policy.PolicyTable(
+        upstreams={"aw_secrets": "secrets"},
+        overrides={("secrets", "WRITE_SECRET"): (True, True)},
+    )
+    decision = table.decide("mcp__aw-gateway__aw__aw_secrets__write_secret")
+    assert decision.state == exec_policy.STATE_FLOOR
+    assert (decision.allow_call, decision.allow_output) == (False, False)
+
+
+# ---------------------------------------------------------------------------
+# QA's second finding: `bool("false")` is True.
+#
+# The third fail-open on this card, and the one with a live victim: a human
+# restricting a tool got the exact opposite of their intent, silently, on a
+# row that DOES render. Rejected rather than coerced — a client sending
+# "false" has a bug the route should surface, not paper over.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["false", "true", "0", "1", "", None, 0, 1, [], {}, 1.0])
+@pytest.mark.parametrize("axis", ["call", "output"])
+def test_a_non_boolean_axis_is_refused_and_nothing_is_written(kv, axis, bad):
+    axes = {"call": True, "output": True}
+    axes[axis] = bad
+    with pytest.raises(exec_policy_store.BadIdentity, match="must be a JSON boolean"):
+        _run(exec_policy_store.put_override(
+            kv, app="kb", tool="search_graph", note="", actor="t", **axes))
+    assert kv.store == {}, f"{axis}={bad!r} refused but something reached the store"
+
+
+@pytest.mark.parametrize("call,output", [(True, True), (True, False), (False, True), (False, False)])
+def test_real_booleans_are_stored_verbatim(kv, call, output):
+    row = _run(exec_policy_store.put_override(
+        kv, app="kb", tool="search_graph", call=call, output=output,
+        note="", actor="t"))
+    assert (row["call"], row["output"]) == (call, output)
+    stored = kv.store[exec_policy_store.OVERRIDES_KV_NAME]["rows"][0]
+    assert (stored["call"], stored["output"]) == (call, output)
+
+
+def test_a_floor_name_with_a_malformed_axis_refuses_as_a_FLOOR_name(kv):
+    """Order matters: the most important thing about a bad request naming
+    `write_secret` is that it named `write_secret`. A `BadIdentity` about the
+    axis would tell the caller to fix the wrong thing."""
+    with pytest.raises(exec_policy_store.FloorRefusal):
+        _run(exec_policy_store.put_override(
+            kv, app="secrets", tool=" write_secret ", call="false", output="false",
+            note="", actor="t"))
+    assert kv.store == {}

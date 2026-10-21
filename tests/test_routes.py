@@ -1427,3 +1427,141 @@ def test_caller_actor_still_prefers_the_gateway_headers():
         "aw_identity": {"sub": "workspace-api-key"},
     }
     assert routes_mod._caller_actor(Request(scope)) == "coder run=abc123"
+
+
+# ---------------------------------------------------------------------------
+# QA's two findings, pinned at the ROUTE — the layer that actually broke.
+#
+# Both are the same pattern, and it is now three for three on this card:
+# every ambiguous or malformed input to this subsystem defaulted to PERMIT.
+# `_declared_entries` returning `{}` on an unreadable manifest, the degraded
+# table classifying its unresolved names as known, and these two. Under a
+# blacklist, ambiguity must TIGHTEN — `_declared_entries` gets that right
+# inside its loop; the route handler did not inherit it.
+#
+# Asserted on WHAT REACHED THE STORE, not only on the status code: an HTTP
+# 400 with a write that happened anyway is exactly what the blocking finding
+# was.
+# ---------------------------------------------------------------------------
+
+def _overrides_in_store(ctx):
+    blob = ctx.state.kv._store.get("exec_policy.overrides")
+    return [(r["app"], r["tool"]) for r in (blob or {}).get("rows", [])]
+
+
+@pytest.mark.parametrize("spelling", [
+    " write_secret ",
+    "write_secret\n",
+    "\twrite_secret",
+    "  read_secret\r\n",
+    "mcp__aw-gateway__aw__aw_secrets__write_secret ",
+    " mcp__aw-gateway__aw__aw_secrets__write_secret",
+    " aw-gateway.aw__aw_secrets__read_secret\n",
+    "mcp__aw-gateway__aw__aw_secrets__ delete_secret",
+    "mcp__workspace-gateway__aw__aw_secrets__collect_secret\t",
+])
+def test_put_override_refuses_padded_floor_names_and_writes_nothing(
+    app_client, monkeypatch, tmp_path, spelling
+):
+    """**QA's blocking finding.** `PUT {"tool": " write_secret "}` used to
+    return 200 and store an override claiming `write_secret` is indexable on
+    both axes — a row the §7 page could never show or delete, because it
+    renders `write_secret` as a locked floor row."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request("PUT", "/exec-policy/override", json={
+        "app": "secrets", "tool": spelling, "call": True, "output": True,
+        "note": "let me index it"})
+    assert resp.status_code == 400
+    assert resp.json()["floor"] is True
+    assert _overrides_in_store(ctx) == [], (
+        f"{spelling!r} was refused with HTTP 400 but something reached the store"
+    )
+
+
+def test_the_invisible_row_scenario_cannot_be_reproduced(
+    app_client, monkeypatch, tmp_path
+):
+    """The finding end to end, as a human would hit it: try to sneak a floor
+    override past with padding, then confirm the store is clean AND the page
+    still shows the floor row locked — i.e. there is no row that exists in the
+    store but not on the page."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    monkeypatch.setattr(client, "get_exec_status", _fresh_sentinel)
+    tc.request("PUT", "/exec-policy/override", json={
+        "app": "secrets", "tool": " write_secret ", "call": True, "output": True})
+
+    body = tc.get("/exec-policy").json()
+    assert _overrides_in_store(ctx) == []
+    assert body["counts"]["override"] == 0
+    assert body["table"]["overrides"] == 0
+    floor = [r for r in body["rows"] if r["tool"] == "write_secret"]
+    assert len(floor) == 1
+    assert floor[0]["state"] == "floor" and floor[0]["locked"] is True
+    assert floor[0]["override"] is None
+    # Every row the store holds is a row the page renders — the property the
+    # bug violated.
+    rendered = {(r["app"], r["tool"]) for r in body["rows"] if r["override"]}
+    assert rendered == set(_overrides_in_store(ctx))
+
+
+def test_a_padded_put_and_a_padded_delete_agree_through_the_routes(
+    app_client, monkeypatch, tmp_path
+):
+    """The mirror half QA asked me to check. Before the fix `delete_override`
+    compared the RAW string and did no normalisation — it only looked like it
+    stripped because the WRITE stripped."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request("PUT", "/exec-policy/override", json={
+        "app": " kb ", "tool": " search_knowledge_base ", "call": False,
+        "output": False, "note": "padded on purpose"})
+    assert resp.status_code == 200
+    assert _overrides_in_store(ctx) == [("kb", "search_knowledge_base")]
+    # Both spellings clear it; neither leaves a ghost.
+    assert tc.request("DELETE", "/exec-policy/override", json={
+        "app": " kb ", "tool": " search_knowledge_base "}).json()["cleared"] is True
+    assert _overrides_in_store(ctx) == []
+
+
+def test_a_whitespace_only_identity_is_a_missing_one(app_client, monkeypatch, tmp_path):
+    tc, _ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    assert tc.request("PUT", "/exec-policy/override", json={
+        "app": "kb", "tool": "   ", "call": True, "output": True}).status_code == 400
+    resp = tc.request("DELETE", "/exec-policy/override", json={"app": " ", "tool": "  "})
+    assert resp.status_code == 400
+    assert "required" in resp.json()["error"]
+
+
+@pytest.mark.parametrize("bad", ["false", "true", "0", "1", "", None, 0, 1, []])
+@pytest.mark.parametrize("axis", ["call", "output"])
+def test_put_override_rejects_a_non_boolean_axis_and_writes_nothing(
+    app_client, monkeypatch, tmp_path, axis, bad
+):
+    """**QA's second finding.** The route used to do `bool(data.get("call"))`,
+    and `bool("false")` is `True` — so a human restricting a tool stored the
+    exact opposite of their intent, silently, on a row that DOES render. The
+    route no longer coerces anything; the store validates and refuses."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    body = {"app": "kb", "tool": "search_knowledge_base", "call": True, "output": True}
+    body[axis] = bad
+    resp = tc.request("PUT", "/exec-policy/override", json=body)
+    assert resp.status_code == 400
+    assert "must be a JSON boolean" in resp.json()["error"]
+    assert _overrides_in_store(ctx) == [], (
+        f"{axis}={bad!r} refused with HTTP 400 but something reached the store"
+    )
+
+
+@pytest.mark.parametrize("call,output", [(True, True), (True, False), (False, True), (False, False)])
+def test_real_booleans_reach_the_store_verbatim(
+    app_client, monkeypatch, tmp_path, call, output
+):
+    """The other half of "do not coerce": a genuine `false` must still store
+    `False`, or the fix would have traded a silent wrong answer for a route
+    that cannot restrict anything."""
+    tc, ctx = _policy_client(app_client, monkeypatch, tmp_path)
+    resp = tc.request("PUT", "/exec-policy/override", json={
+        "app": "kb", "tool": "search_knowledge_base", "call": call, "output": output})
+    assert resp.status_code == 200
+    stored = ctx.state.kv._store["exec_policy.overrides"]["rows"][0]
+    assert (stored["call"], stored["output"]) == (call, output)
+    assert (resp.json()["override"]["call"], resp.json()["override"]["output"]) == (call, output)

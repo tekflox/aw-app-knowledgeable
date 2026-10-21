@@ -94,6 +94,65 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# --- normalisation: ONE place per identity kind ------------------------------
+#
+# **Why these exist as named functions rather than inline `.strip()` calls.**
+# Slice 3 shipped two bugs of exactly one shape, a day apart: an
+# acknowledgement typed `fredericowu-browser` stored a key that could never
+# match the observed `fredericowu_browser`, and — the blocking one — a
+# `PUT` of `" write_secret "` had the FLOOR CHECK read the raw string while
+# the STORE WRITE wrote the stripped one. One request, two normalisations, so
+# the guard and the thing it guards were looking at different strings and the
+# floor let a lie through.
+#
+# The rule that prevents the next instance: a value is normalised ONCE, at
+# the top of the path that accepts it, and every consumer downstream — the
+# guard, the write, the delete, the lookup key — uses that same value. Not
+# "each site strips"; one site normalises.
+#
+# **Two functions, not one, and the difference is load-bearing.** A tool name
+# and an upstream segment are different identity kinds with different
+# transforms, and using the wrong one silently corrupts data:
+#
+# * an UPSTREAM is matched against `Decision.upstream`, which the gateway
+#   always spells dash→underscore, so it gets `sanitise_server_key`;
+# * a TOOL is matched against `tool_name_segment` of a real observed name,
+#   where dashes are REAL — `API-retrieve-a-page`, `query-data-source` and 7
+#   more are live in this estate's installed manifests. Running the upstream
+#   transform over a tool name would turn `API-retrieve-a-page` into
+#   `API_retrieve_a_page` and reintroduce the never-matches bug in the other
+#   direction.
+#
+# So: same discipline, same place, deliberately not the same transform.
+
+
+def normalise_tool(value: Any) -> str:
+    """The ONE normalisation for a tool identity: surrounding whitespace only.
+
+    Whitespace-only because a tool's identity is its terminal segment as the
+    gateway spells it, and that spelling is case- and dash-sensitive. A
+    non-string answers `""`, which every caller then rejects — a type error is
+    not something to coerce into a name.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
+def normalise_upstream(value: Any) -> str:
+    """The ONE normalisation for an upstream segment: strip, then the
+    gateway's own dash→underscore transform via
+    :func:`exec_policy.sanitise_server_key` — the single named place that copy
+    of the gateway's rule lives (§12 risk 1).
+
+    An operator reasonably types the dashed name of a linked workspace
+    (`fredericowu-browser`); the acknowledgement is matched against
+    `Decision.upstream`, which is always the sanitised form, so storing the
+    dashed string would create a row that can never match: the alarm stays
+    red, the page shows the acknowledgement, and the two disagree with nothing
+    saying why. A silently ineffective control is worse than a missing one.
+    """
+    return exec_policy.sanitise_server_key(value.strip()) if isinstance(value, str) else ""
+
+
 def _facade_degraded() -> bool:
     """Whether ``ctx.state.kv`` is currently degraded in THIS worker.
 
@@ -156,6 +215,22 @@ class BadIdentity(ValueError):
 def _check_identity(app: Any, tool: Any) -> tuple[str, str]:
     """Validate an override's identity, refusing the floor FIRST.
 
+    **Normalised ONCE, at the top, and the SAME value is what gets checked and
+    what gets returned for storage.** That sentence is the fix for the
+    blocking defect QA found: this function used to segment the RAW string for
+    the floor check and return ``tool.strip()`` for the write, so
+    ``" write_secret "`` segmented to ``" write_secret "`` (not a floor name,
+    waved through) and was then stored as ``write_secret`` — an override row
+    asserting that ``write_secret`` is indexable on both axes.
+
+    What made that worse than it reads: the row was **invisible**. The §7 view
+    renders ``write_secret`` as a locked ``floor`` row and floor precedence
+    wins, so the store held a lie that no human could see or delete from the
+    page built for exactly that purpose. It was inert only because
+    ``PolicyTable`` happens to evaluate the floor before the store — and the
+    whole reason the floor is "not expressible as data" (§2) is that the data
+    must not be able to say otherwise.
+
     Three refusals, in this order, and the order is the point:
 
     1. **The floor** (§2) — before any shape check, so no amount of creative
@@ -163,7 +238,10 @@ def _check_identity(app: Any, tool: Any) -> tuple[str, str]:
        ``exec_scrub.tool_name_segment``, not string equality, because a
        prefixed ``…aw__aw_secrets__write_secret`` IS ``write_secret`` and the
        138-call defect was precisely a name that did not match (§12 risk 6 —
-       one segmentation function, never two).
+       one segmentation function, never two). The segment is normalised too,
+       not just the input: ``"mcp__…__write_secret "`` segments to
+       ``"write_secret "``, which is a second evasion shape the padded-bare
+       one does not cover.
     2. **Bare segment only** (§4) — the same rule the marketplace validator
        enforces on a manifest entry. A prefixed spelling in a manifest can
        never be enshrined; it must not be enshrinable here either, or the
@@ -175,27 +253,59 @@ def _check_identity(app: Any, tool: Any) -> tuple[str, str]:
        granted deliberately to an unattributable observed call, not to a
        human filling in a form.
     """
-    tool_str = tool if isinstance(tool, str) else ""
-    segment = exec_scrub.tool_name_segment(tool_str)
+    # ONE normalisation. Everything below — the floor check, the shape checks,
+    # and the value returned for storage — reads `tool`, never the raw input.
+    tool = normalise_tool(tool)
+    app = normalise_tool(app)
+    # Normalised on BOTH sides of the segmentation: the input may be padded
+    # (`" write_secret "`) and so may the terminal segment of a padded
+    # prefixed name (`"mcp__…__write_secret "` -> `"write_secret "`). Those
+    # are two different evasion shapes and the probe that only tried bare
+    # names found neither.
+    segment = normalise_tool(exec_scrub.tool_name_segment(tool))
     if segment in exec_scrub.SECRET_TOOL_NAMES:
         raise FloorRefusal(
             f"{segment!r} is one of the four secret-store tools: their arguments and "
             "results are never indexable, by a hard-coded floor that no manifest "
             "entry and no override can lift (design §2). Nothing was stored."
         )
-    if not isinstance(tool, str) or not tool.strip():
+    if not tool:
         raise BadIdentity("tool is required")
     if "__" in tool or "." in tool:
         raise BadIdentity(
             f"tool {tool!r} must be a bare terminal segment — no '__' and no '.' "
             "(design §4, the same rule the manifest validator enforces)"
         )
-    if not isinstance(app, str) or not app.strip():
+    if not app:
         raise BadIdentity(
             "app is required — an override names one app's tool, never every "
             "same-named tool in the estate (design §3 step 6, §11)"
         )
-    return app.strip(), tool.strip()
+    return app, tool
+
+
+def _check_axis(name: str, value: Any) -> bool:
+    """An axis must be a real boolean. **Rejected, never coerced.**
+
+    ``bool("false")`` is ``True``, so coercing turned a human restricting a
+    tool into the exact opposite of their intent, silently, on a row that does
+    render — the third fail-open on this card and the one with a live victim.
+
+    Refusing rather than tightening-on-ambiguity is the deliberate choice
+    here, and it is not a departure from "ambiguity tightens": a client that
+    sends ``"false"`` has a bug, and a route that quietly reads it as
+    ``False`` would hide that bug while happening to do the safe thing this
+    time. Surfacing it costs one 400 and fixes the caller. ``1``/``0`` are
+    rejected for the same reason — in Python they are ints, and an API that
+    accepts them teaches callers a shape the schema does not promise.
+    """
+    if not isinstance(value, bool):
+        raise BadIdentity(
+            f"{name} must be a JSON boolean (true/false), got {value!r} "
+            f"({type(value).__name__}). Not coerced on purpose: bool(\"false\") is "
+            "True, which would store the opposite of what you asked for."
+        )
+    return value
 
 
 async def load_overrides(kv) -> tuple[dict[tuple[str, str], dict], str | None]:
@@ -248,6 +358,11 @@ async def put_override(
     the retry they would make anyway.
     """
     app, tool = _check_identity(app, tool)
+    # Validated AFTER the identity, so a floor refusal still wins over a
+    # malformed axis: the most important thing about a bad request naming
+    # `write_secret` is that it named `write_secret`.
+    call = _check_axis("call", call)
+    output = _check_axis("output", output)
     rows, error = await _load_rows(kv, OVERRIDES_KV_NAME)
     if error:
         # Refuse rather than write: a read-modify-write on a blob that could
@@ -262,8 +377,8 @@ async def put_override(
     row = {
         "app": app,
         "tool": tool,
-        "call": bool(call),
-        "output": bool(output),
+        "call": call,
+        "output": output,
         "note": str(note or ""),
         "actor": actor,
         "at": _now(),
@@ -285,7 +400,19 @@ async def delete_override(kv, *, app: str, tool: str, actor: str) -> bool:
     """Drop one override, returning whether there was one. The row falls back
     to whatever the manifest says, or to the blacklist default — which can be
     a WIDENING, so the §7 page says so on the confirm row rather than treating
-    a delete as housekeeping."""
+    a delete as housekeeping.
+
+    **Normalised with the same function the writer uses**, which it previously
+    was not. Measured during the fix for QA's finding: `delete_override` did
+    no normalisation at all and compared the raw string. That looked like it
+    stripped — a `DELETE` of the exact `write_secret` cleared the row while a
+    padded one did not — but the reason was that the WRITE had stripped, not
+    that the delete did. With the writer now storing a normalised key, a
+    delete that did not normalise would be unable to clear a row a padded
+    request created: the two verbs would disagree about what a row is called,
+    which is the same defect as the one above wearing the other verb.
+    """
+    app, tool = normalise_tool(app), normalise_tool(tool)
     rows, error = await _load_rows(kv, OVERRIDES_KV_NAME)
     if error:
         raise RuntimeError(
@@ -341,22 +468,6 @@ def ack_reasons(acknowledged: dict[str, dict]) -> dict[str, str]:
     return {k: row["reason"] for k, row in acknowledged.items()}
 
 
-def _ack_key(upstream: str) -> str:
-    """Normalise a typed upstream to the segment the GATEWAY spells.
-
-    Through ``exec_policy.sanitise_server_key`` — the one named place that
-    copy of the gateway's transform lives (§12 risk 1) — rather than a second
-    ``replace('-', '_')`` here. The acknowledgement is matched against
-    ``Decision.upstream``, which is always the sanitised form, so an operator
-    who reasonably types the dashed name of a linked workspace
-    (``fredericowu-browser``) would otherwise store a row that can never
-    match anything: the alarm stays red, the page shows the acknowledgement,
-    and the two disagree with nothing saying why. A silently ineffective
-    control is worse than a missing one.
-    """
-    return exec_policy.sanitise_server_key(upstream.strip())
-
-
 async def put_acknowledgement(kv, *, upstream: str, reason: str, actor: str) -> dict:
     """Accept one unresolvable upstream. A reason is REQUIRED, for the same
     reason §4 requires one on a manifest opt-out: an acknowledgement nobody
@@ -379,7 +490,7 @@ async def put_acknowledgement(kv, *, upstream: str, reason: str, actor: str) -> 
         raise RuntimeError(
             f"the acknowledgement store could not be read ({error}) — refusing to write"
         )
-    upstream = _ack_key(upstream)
+    upstream = normalise_upstream(upstream)
     row = {"upstream": upstream, "reason": reason.strip(), "actor": actor, "at": _now()}
     kept = [r for r in rows if r.get("upstream") != upstream]
     kept.append(row)
@@ -400,7 +511,7 @@ async def delete_acknowledgement(kv, *, upstream: str, actor: str) -> bool:
         )
     # Same normalisation as the writer, or a dashed spelling could never
     # withdraw what it created.
-    upstream = _ack_key(upstream)
+    upstream = normalise_upstream(upstream)
     kept = [r for r in rows if r.get("upstream") != upstream]
     if len(kept) == len(rows):
         return False
