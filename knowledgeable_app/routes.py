@@ -117,7 +117,19 @@ def _caller_actor(request: Request) -> str:
     if agent or run_id:
         return f"{agent or 'agent:?'} run={run_id or '?'}"
     identity = request.scope.get("aw_identity")
-    return f"identity:{identity}" if identity else "unknown"
+    if not identity:
+        return "unknown"
+    # `aw_identity` is the verified CLAIMS, which for a real caller is a dict
+    # (`{"sub": "...", "api_key": True}` for the workspace key, the signed-in
+    # subject for a browser session). Interpolating it whole rendered a Python
+    # dict repr into the audit trail — and, once §7's policy page shipped, into
+    # the "override by …" line a human reads to decide whether to trust a row.
+    # §11 calls that source/provenance column load-bearing; a repr is not a
+    # person. The subject is the part that identifies anyone, so that is what
+    # is recorded. Free text either way, so no stored row changes meaning.
+    if isinstance(identity, dict):
+        identity = identity.get("sub") or identity.get("email") or "?"
+    return f"identity:{identity}"
 
 
 def _require_identity(request: Request) -> None:

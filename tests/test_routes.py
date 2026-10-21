@@ -1397,3 +1397,33 @@ def test_every_policy_route_requires_identity(ungated_app_client, method, path, 
     tc, _ctx = ungated_app_client
     resp = tc.request(method, path, json=body)
     assert resp.status_code == 401
+
+
+def test_caller_actor_records_the_subject_not_a_dict_repr():
+    """`aw_identity` is the verified CLAIMS dict. Interpolating it whole put a
+    Python dict repr into the audit trail and, once §7's page shipped, into the
+    "override by …" line a human reads to decide whether to trust a row — the
+    column §11 calls load-bearing. A repr is not a person."""
+    from starlette.requests import Request
+
+    def _actor(identity):
+        scope = {"type": "http", "headers": [], "aw_identity": identity}
+        return routes_mod._caller_actor(Request(scope))
+
+    assert _actor({"sub": "workspace-api-key", "api_key": True}) == "identity:workspace-api-key"
+    assert _actor({"email": "fredericowu@gmail.com"}) == "identity:fredericowu@gmail.com"
+    assert _actor("plain-subject") == "identity:plain-subject"
+    assert _actor(None) == "unknown"
+
+
+def test_caller_actor_still_prefers_the_gateway_headers():
+    """Unchanged: a gateway-forwarded agent call carries who/which-run, and
+    that beats the authenticated identity for the audit trail."""
+    from starlette.requests import Request
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-aw-caller-agent", b"coder"), (b"x-aw-caller-run-id", b"abc123")],
+        "aw_identity": {"sub": "workspace-api-key"},
+    }
+    assert routes_mod._caller_actor(Request(scope)) == "coder run=abc123"
