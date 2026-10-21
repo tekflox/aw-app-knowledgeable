@@ -9,10 +9,8 @@ description: >-
   create_node/create_link graph tools, the fs-sync pending-deletion queue
   (list_pending_deletions/approve_pending_deletions/decline_pending_deletions),
   and the execution-history projection (search_execution_graph/
-  exec_run_detail). NOT the same thing as the aw-app-kb app's
-  search_knowledge_base/search_skills (a different app, a different store,
-  a different MCP server) — load this skill whenever a task needs
-  aw-knowledgeable specifically, by name or via one of the tool names above.
+  exec_run_detail). Load this skill whenever a task needs to search or
+  curate this workspace's knowledge graph, or needs any tool named above.
 ---
 
 # aw-knowledgeable — the Knowledgeable Connector's own tool surface
@@ -24,18 +22,6 @@ Cypher of its own — every tool call here is a REST call to that service.
 MCP Gateway aggregates this app's tools under the prefix
 **`aw__aw_knowledgeable__<tool>`** (or `mcp__aw-gateway__aw__aw_knowledgeable__<tool>`
 depending on how the gateway is mounted in your session).
-
-## Not the generic Knowledge Base app
-
-This workspace also has a separate app, **aw-app-kb**, contributing its own
-`search_knowledge_base` / `search_skills` / `update_knowledge_base` tools over
-a *different* store (workspace docs, skills, notes). That app is unrelated to
-this one — different backend, different data, different MCP server
-(`aw__kb__*`, not `aw__aw_knowledgeable__*`). This skill is scoped to
-**aw-knowledgeable only**: the 13 tools below, all backed by the Neo4j graph
-service this connector talks to. Don't reach for `aw__kb__*` tools when a
-task says "aw-knowledgeable" — they are two unrelated systems that happen to
-sound alike.
 
 ## How the underlying service works, in one paragraph
 
@@ -115,6 +101,3 @@ populated if the connector's exec-history sync is enabled.
 4. **Treat `approve_pending_deletions` as irreversible.** Call
    `list_pending_deletions` first, and always pass the exact `expected_count`
    you computed from that list.
-5. **This is not aw-app-kb.** If a request is about workspace docs/skills
-   rather than the Neo4j knowledge graph, that's a different app's tools —
-   not this skill.

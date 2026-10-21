@@ -42,7 +42,7 @@
       {
         "id": "aw-knowledgeable",
         "path": "skills/aw-knowledgeable/SKILL.md",
-        "description": "How to use the 13 MCP tools this app exposes for fredericowu/aw-knowledgeable \u2014 knowledge_search and the lower-level graph/retrieval tools, the fs-sync pending-deletion queue, and the execution-history projection. NOT the aw-app-kb app's search_knowledge_base/search_skills, a different app and a different store."
+        "description": "How to use the 13 MCP tools this app exposes for fredericowu/aw-knowledgeable — knowledge_search and the lower-level graph/retrieval tools, the fs-sync pending-deletion queue, and the execution-history projection."
       }
     ],
     "windows": [
