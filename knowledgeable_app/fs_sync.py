@@ -1144,6 +1144,7 @@ async def _run_tick_locked(
     catchup_marked, catchup_failed = await _run_catchup(db, journal, workspace_slug, mark_budget)
 
     created = updated = unchanged = failed = 0
+    pending_restored = 0  # §22 — undecided marks cleared by file reappearance
     upload_remaining = upload_budget
 
     for relpath in sorted(found):
@@ -1182,6 +1183,56 @@ async def _run_tick_locked(
                 {"relpath": relpath},
             )
             row["restore_suppressed"] = 0
+
+        if row["pending_delete"]:
+            # §22 — the mark is still UNDECIDED (no human declined it, or
+            # the branch above would have cleared `restore_suppressed`
+            # instead) and the file is back on disk: clear it, on every
+            # §17.1 claimant at this path, not just the one `external_id`
+            # names. This is the gap that let 37 docs sit queued on
+            # 2026-10-21, 24 of them with their file present — nothing
+            # cleared an undecided mark, so §1.2's "file came back"
+            # restore trigger was never actually wired up.
+            #
+            # Deliberately NOT `_apply_restore`, and deliberately NO
+            # `restore_suppressed`: suppression encodes "a human declined;
+            # keep the doc even though its file is gone" (§18.2), so it
+            # buys the path one free disappearance cycle. Here the trigger
+            # is hard disk evidence the file is PRESENT, so detection must
+            # stay fully armed — a later genuine disappearance is marked
+            # again through the ordinary ≥2-scans clock.
+            #
+            # Placement is load-bearing: this runs BEFORE the `digest ==
+            # last_synced` short-circuit below, because unchanged-content
+            # reappearance is exactly the incident class above and never
+            # reaches the upload path.
+            #
+            # The response's `count` is deliberately discarded — see the
+            # success branch below for why 0 is still success.
+            _, err = await client.restore_by_path(
+                relpath, workspace_slug, bucket=bulk_ingest.BUCKET,
+            )
+            if err:
+                # Leave the journal row exactly as it was and retry next
+                # tick — the file is still present then, so this
+                # self-heals without a second mechanism. Never fall
+                # through: uploading into a still-marked document would
+                # leave the server's `pending_delete` standing over fresh
+                # content.
+                log.warning("fs_sync: restore-by-path failed for %s: %s", relpath, err)
+                continue
+            # `count == 0` is success too: the server was already restored
+            # through another channel (a human declined, §18.4's catch-up
+            # got there first), and the goal state — no mark anywhere —
+            # holds either way.
+            await run_in_threadpool(
+                db.execute, TABLE,
+                "UPDATE {table} SET pending_delete = 0, missing_scans = 0 WHERE relpath = :relpath",
+                {"relpath": relpath},
+            )
+            row["pending_delete"] = 0
+            row["missing_scans"] = 0
+            pending_restored += 1
 
         if row["missing_scans"]:
             # The path reappeared — the ≥2-consecutive-scans counter must
@@ -1339,6 +1390,7 @@ async def _run_tick_locked(
         "gc_removed": gc_removed,
         "catchup_marked": catchup_marked,
         "restore_reconciled": restore_reconciled,
+        "pending_restored": pending_restored,
         "pulled": pull_result["pulled"],
         "authored_written": pull_result["authored_written"],
         "remote_rev_only": pull_result["remote_rev_only"],

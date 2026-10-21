@@ -559,11 +559,15 @@ def test_acceptance_4_reappearance_resets_the_counter_nothing_approved_document_
 ):
     """`random/=auto:5` — mark lands at the fixed threshold (2, unrelated
     to the policy's own `min_missing_scans`), but approval needs 5. The
-    file reappears while `missing_scans` is still short of 5: the found-
-    loop's existing reset (pre-§21 behaviour) takes it back to 0, so even
-    though the row is still `pending_delete=1`, the pass's own `missing_
-    scans >= rule.min` check excludes it — nothing approved, nothing
-    deleted from the graph."""
+    file reappears while `missing_scans` is still short of 5: nothing
+    approved, nothing deleted from the graph.
+
+    §22 strengthened this acceptance rather than changing it: the found-
+    loop's `missing_scans` reset still happens, and the undecided mark is
+    now also CLEARED outright on reappearance — so the row is excluded
+    from the auto-approve pass twice over (no longer `pending_delete`, and
+    `missing_scans` back under `rule.min`) instead of only by the counter.
+    """
     root = bulk_ingest.kb_root()
     _write(root, "notion/keep.md", "keep me")
     _write(root, "random/back.md", "I'm back")  # the file reappeared on disk
@@ -575,7 +579,11 @@ def test_acceptance_4_reappearance_resets_the_counter_nothing_approved_document_
     async def fail_pending(bucket=None):
         raise AssertionError("missing_scans(0) < rule.min(5) must never reach the server")
 
+    async def fake_restore(source_path, workspace_slug, *, bucket=None):
+        return {"source_path": source_path, "restored": ["doc-5"], "count": 1}, None
+
     monkeypatch.setattr(client, "get_documents_pending_delete", fail_pending)
+    monkeypatch.setattr(client, "restore_by_path", fake_restore)
 
     result = _run(fs_sync.run_tick(
         db, lease, workspace_slug="aw", delete_policy="random/=auto:5", valve_latched=False,
@@ -583,8 +591,11 @@ def test_acceptance_4_reappearance_resets_the_counter_nothing_approved_document_
 
     assert result["blocked"] is False
     assert result["auto_approved"] == 0
+    assert result["pending_restored"] == 1  # §22
     row = next(r for r in _journal_rows(db) if r["relpath"] == "random/back.md")
-    assert row["missing_scans"] == 0  # the pre-§21 reset, unaffected by this amendment
+    assert row["missing_scans"] == 0  # the pre-§21 reset, still there
+    assert row["pending_delete"] == 0  # §22 — the undecided mark is gone too
+    assert row["restore_suppressed"] == 0  # and NOT suppressed
 
 
 # ---------------------------------------------------------------------------

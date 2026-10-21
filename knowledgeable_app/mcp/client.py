@@ -268,6 +268,33 @@ async def mark_delete_by_path(
     return await _post_json("/api/documents/mark-delete-by-path", body, params=params)
 
 
+async def restore_by_path(
+    source_path: str, workspace_slug: str, *, bucket: str
+) -> tuple[dict | None, str | None]:
+    """POST /api/documents/restore-by-path (docs/design/aw-knowledgeable-
+    fs-sync.md §22) — the undo of ``mark_delete_by_path`` above, and a
+    fan-out for the same §17.1 reason: it clears the pending-delete mark on
+    EVERY document claiming ``{tenant, bucket, source_path}`` with
+    ``workspace_slug = $slug OR workspace_slug IS NULL``, so a path whose
+    file came back on disk leaves no §17.1 loser still marked. Idempotent
+    server-side — a claimant that is not `pending_delete` is skipped, so a
+    re-run restores 0 and causes no feed churn. Service-only, no `force`
+    variant. Response is ``{source_path, restored: [ids], count}``.
+
+    fs-sync's found-loop is the one caller: a human declining in the
+    approval UI still goes through the by-id ``POST /{id}/restore``.
+
+    `bucket` travels as a query param, same as every other write in this
+    module — this route is ``require_bucket_write``-gated too, and an
+    omitted bucket 400s as ambiguous the moment a second writable bucket
+    exists (memory `fs-sync-writes-need-an-explicit-bucket`: that exact
+    omission already broke `put_document_by_path` and
+    `mark_delete_by_path` in production)."""
+    params: dict = {"bucket": bucket}
+    body: dict = {"source_path": source_path, "workspace_slug": workspace_slug}
+    return await _post_json("/api/documents/restore-by-path", body, params=params)
+
+
 async def mark_delete(
     node_id: str, *, bucket: str, reason: str | None = None
 ) -> tuple[dict | None, str | None]:

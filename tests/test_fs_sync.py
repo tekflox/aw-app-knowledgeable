@@ -1666,6 +1666,228 @@ def test_restore_suppression_clears_on_reappearance_then_re_marks_after_normal_t
     assert mark_calls == ["notion/declined.md"]
 
 
+# ---------------------------------------------------------------------------
+# §22 — an UNDECIDED `pending_delete` mark auto-clears when the file turns
+# up on disk again. Distinct from §18.2 above: that one reacts to a human's
+# decline arriving on the feed, this one to the disk itself.
+# ---------------------------------------------------------------------------
+
+
+def test_undecided_pending_mark_clears_on_reappearance_with_unchanged_content(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The live 2026-10-21 incident class, exactly: 24 docs stuck
+    `pending_delete` whose file was present again with UNCHANGED content.
+    Unchanged content never reaches the upload path, so the restore has to
+    fire from the found-loop itself — and without setting
+    `restore_suppressed`, because the trigger here is disk evidence the
+    file is back, not a human decision to keep a missing one."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    digest = hashlib.sha256(b"came back unchanged").hexdigest()
+    _write(root, "notion/stale-mark.md", "came back unchanged")
+    _seed_uploaded(db, "notion/stale-mark.md", sha256=digest, last_synced_hash=digest,
+                   external_id="doc-24", missing_scans=2, pending_delete=1)
+
+    restore_calls = []
+
+    async def fake_restore(source_path, workspace_slug, *, bucket=None):
+        restore_calls.append((source_path, workspace_slug, bucket))
+        return {"source_path": source_path, "restored": ["doc-24"], "count": 1}, None
+
+    # §17.4's one-time catch-up re-issues the by-path MARK for every row
+    # already `pending_delete=1`, and runs BEFORE the found-loop — so on
+    # this one tick the server is marked and then restored again. Faked
+    # here rather than left to hit a real HTTP call, and asserted below:
+    # the end state is what matters, and the catch-up never runs twice.
+    mark_calls = []
+
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
+        mark_calls.append(source_path)
+        return {"marked": ["doc-24"], "count": 1}, None
+
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+    monkeypatch.setattr(client, "restore_by_path", fake_restore)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["pending_restored"] == 1
+    assert mark_calls == ["notion/stale-mark.md"], "§17.4 catch-up, once, before the loop"
+    assert restore_calls == [("notion/stale-mark.md", "aw", bulk_ingest.BUCKET)], (
+        "bucket must travel explicitly — the route is require_bucket_write-gated"
+    )
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/stale-mark.md")
+    assert row["pending_delete"] == 0
+    assert row["missing_scans"] == 0
+    assert row["restore_suppressed"] == 0, (
+        "§22 — no suppression: detection must stay fully armed, the file is PRESENT"
+    )
+    assert result["unchanged"] == 1, "the row still falls through to the normal unchanged path"
+
+
+def test_undecided_pending_mark_survives_a_failed_restore_and_clears_on_the_next_tick(
+    _workspace_home, db, lease, monkeypatch
+):
+    """A failed restore must leave the journal row exactly as it was — the
+    file is still present next tick, so the retry is the whole recovery
+    mechanism and no second one is needed."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    digest = hashlib.sha256(b"back again").hexdigest()
+    _write(root, "notion/flaky-restore.md", "back again")
+    _seed_uploaded(db, "notion/flaky-restore.md", sha256=digest, last_synced_hash=digest,
+                   external_id="doc-7", missing_scans=2, pending_delete=1)
+
+    outcomes = [(None, "503 Service Unavailable"), ({"restored": ["doc-7"], "count": 1}, None)]
+    calls = []
+
+    async def flaky_restore(source_path, workspace_slug, *, bucket=None):
+        calls.append(source_path)
+        return outcomes.pop(0)
+
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
+        return {"marked": ["doc-7"], "count": 1}, None
+
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+    monkeypatch.setattr(client, "restore_by_path", flaky_restore)
+
+    first = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert first["blocked"] is False
+    assert first["pending_restored"] == 0
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/flaky-restore.md")
+    assert row["pending_delete"] == 1, "a failed restore must not clear the journal flag"
+    assert row["missing_scans"] == 2, "nor touch the rest of the row"
+
+    second = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+    assert second["blocked"] is False
+    assert second["pending_restored"] == 1
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/flaky-restore.md")
+    assert row["pending_delete"] == 0
+    assert row["missing_scans"] == 0
+    assert calls == ["notion/flaky-restore.md"] * 2
+
+
+def test_a_restore_suppressed_row_takes_the_18_2_path_and_never_calls_restore_by_path(
+    _workspace_home, db, lease, monkeypatch
+):
+    """§18.2 vs §22: a row a human already declined is `pending_delete=0,
+    restore_suppressed=1` — the server mark is already gone, so calling the
+    new seam would be a pointless write. Only the suppression clears."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    digest = hashlib.sha256(b"declined then back").hexdigest()
+    _write(root, "notion/declined.md", "declined then back")
+    _seed_uploaded(db, "notion/declined.md", sha256=digest, last_synced_hash=digest,
+                   external_id="doc-9", missing_scans=3, pending_delete=0, restore_suppressed=1)
+
+    restore_calls = []
+
+    async def fake_restore(source_path, workspace_slug, *, bucket=None):
+        restore_calls.append(source_path)
+        return {"restored": [], "count": 0}, None
+
+    monkeypatch.setattr(client, "restore_by_path", fake_restore)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert restore_calls == [], "a declined row's server mark is already cleared — no server call"
+    assert result["pending_restored"] == 0
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/declined.md")
+    assert row["restore_suppressed"] == 0
+    assert row["pending_delete"] == 0
+
+
+def test_undecided_pending_mark_clears_then_the_normal_upload_flow_still_runs_the_same_tick(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The restore is a prelude, not a short-circuit: a pending row whose
+    file came back WITH a content change restores first and then takes the
+    ordinary §20.2 quiet-window/upload path in the same tick."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _write(root, "notion/edited-return.md", "new body")
+    digest = hashlib.sha256(b"new body").hexdigest()
+    old = time.time() - 600
+    _seed_uploaded(db, "notion/edited-return.md", sha256=digest, last_synced_hash="old-hash",
+                   external_id="doc-11", missing_scans=2, pending_delete=1,
+                   pending_hash=digest, pending_since=old, dirty_since=old)
+
+    restore_calls = []
+    uploads = []
+
+    async def fake_restore(source_path, workspace_slug, *, bucket=None):
+        restore_calls.append(source_path)
+        return {"restored": ["doc-11"], "count": 1}, None
+
+    async def fake_put(filename, raw, *, bucket, source_path, workspace_slug,
+                       base_hash=None, title=None):
+        uploads.append((source_path, base_hash))
+        return {"id": "doc-11", "rev": 3, "content_hash": digest, "outcome": "updated"}, None
+
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
+        return {"marked": ["doc-11"], "count": 1}, None
+
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+    monkeypatch.setattr(client, "restore_by_path", fake_restore)
+    monkeypatch.setattr(client, "put_document_by_path", fake_put)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert result["pending_restored"] == 1
+    assert result["updated"] == 1
+    assert restore_calls == ["notion/edited-return.md"]
+    assert uploads == [("notion/edited-return.md", "old-hash")]
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/edited-return.md")
+    assert row["pending_delete"] == 0
+    assert row["restore_suppressed"] == 0
+    assert row["last_synced_hash"] == digest
+
+
+def test_a_pending_row_whose_file_is_still_missing_is_not_restored(
+    _workspace_home, db, lease, monkeypatch
+):
+    """The new block is keyed on the found-loop, i.e. on the file actually
+    being on disk. A still-missing pending row keeps going through
+    `_mark_missing_as_deleted`'s flow untouched — already marked, so it is
+    not re-marked either."""
+    root = bulk_ingest.kb_root()
+    _write(root, "notion/keep.md", "keep me")
+    _seed_uploaded(db, "notion/still-gone.md", external_id="doc-13",
+                   missing_scans=2, pending_delete=1)
+
+    restore_calls = []
+    mark_calls = []
+
+    async def fake_restore(source_path, workspace_slug, *, bucket=None):
+        restore_calls.append(source_path)
+        return {"restored": [], "count": 0}, None
+
+    async def fake_mark(source_path, workspace_slug, *, bucket=None, reason=None):
+        mark_calls.append(source_path)
+        return {"marked": [], "count": 0}, None
+
+    monkeypatch.setattr(client, "restore_by_path", fake_restore)
+    monkeypatch.setattr(client, "mark_delete_by_path", fake_mark)
+
+    result = _run(fs_sync.run_tick(db, lease, workspace_slug="aw"))
+
+    assert result["blocked"] is False
+    assert restore_calls == []
+    assert result["pending_restored"] == 0
+    # The one mark that does go out is §17.4's one-time catch-up re-issue,
+    # NOT the live-miss pass: an already-pending row is never re-marked
+    # there (`not row["pending_delete"]`), and the new §22 block never
+    # fired at all because the file is not on disk.
+    assert mark_calls == ["notion/still-gone.md"]
+    assert result["catchup_marked"] == 1
+    assert result["deleted_marked"] == 0
+    row = next(r for r in _journal_rows(db) if r["relpath"] == "notion/still-gone.md")
+    assert row["pending_delete"] == 1
+
+
 def test_gc_removes_a_dead_pending_delete_row_absent_from_a_full_sync_paths_enumeration(
     _workspace_home, db, lease, monkeypatch
 ):
