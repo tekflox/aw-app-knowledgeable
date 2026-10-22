@@ -412,6 +412,56 @@ def test_compose_include_code_true_still_requires_query():
     assert _FakeForwardAsyncClient._CALLS == []
 
 
+def test_compose_code_only_happy_path_never_touches_the_kg_leg():
+    """`code_only=True` must skip the KG leg entirely — a KG-client call
+    would pop from an empty queue and raise `IndexError`, so an empty
+    `_FakeKgAsyncClient._QUEUE` is itself the assertion that it was never
+    touched."""
+    _FakeForwardAsyncClient._QUEUE.append(_ok_tools_call("codegraph answer"))
+
+    text, is_error = _run(forwarding.compose_knowledge_search(
+        {"query": "where is RRF fusion implemented", "include_code": True, "code_only": True}
+    ))
+    assert is_error is False
+    body = json.loads(text)
+    assert body["knowledge"] is None
+    assert body["code"]["status"] == "ok"
+    assert "codegraph answer" in body["code"]["result"]
+    assert body["code"]["source"] == "codegraph"
+    assert _FakeKgAsyncClient._CALLS == []
+
+
+def test_compose_code_only_codegraph_unavailable():
+    _FakeForwardAsyncClient._QUEUE.append(httpx.ConnectError("refused"))
+
+    text, is_error = _run(forwarding.compose_knowledge_search(
+        {"query": "where is RRF fusion implemented", "include_code": True, "code_only": True}
+    ))
+    assert is_error is False
+    body = json.loads(text)
+    assert body["knowledge"] is None
+    assert body["code"]["status"] == "unavailable"
+    assert "codegraph app not installed or not responding" in body["code"]["reason"]
+    assert _FakeKgAsyncClient._CALLS == []
+
+
+def test_compose_code_only_without_include_code_is_ignored():
+    """`code_only` with no `include_code` must stay byte-identical legacy
+    (design §2a/§6.5) — the forwarder is never touched, the KG leg runs
+    exactly as it would with no knobs at all."""
+    _FakeKgAsyncClient._QUEUE.append(_FakeKgResponse(200, {"chunks": [], "answer": None}))
+    direct_text, direct_err = _run(client.knowledge_search({"query": "sushi"}))
+
+    _FakeKgAsyncClient._QUEUE.append(_FakeKgResponse(200, {"chunks": [], "answer": None}))
+    composed_text, composed_err = _run(forwarding.compose_knowledge_search(
+        {"query": "sushi", "code_only": True}
+    ))
+
+    assert composed_err is direct_err
+    assert composed_text == direct_text
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
 def test_compose_kg_error_short_circuits_before_touching_code():
     """A KG-side error must still surface as an error — the code leg's
     result (if any) is irrelevant once the knowledge answer itself failed."""

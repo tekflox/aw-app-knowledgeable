@@ -247,7 +247,14 @@ async def compose_knowledge_search(args: dict) -> tuple[str, bool]:
     ``codegraph_explore`` call concurrently (``asyncio.gather``, design §7 —
     the code leg must never extend the existing KG timeout envelope), and
     composes ``{knowledge, code}`` — the code answer never lands inside
-    ``chunks``/``citations`` (P6 no-fusion semantics, design §2/§5)."""
+    ``chunks``/``citations`` (P6 no-fusion semantics, design §2/§5).
+
+    ``code_only`` (docs/design/search-knowledge-codegraph-p6-worker.md §2a),
+    honored only when ``include_code`` is true, skips the KG leg entirely —
+    a caller that only wants the code perspective would otherwise drag a
+    full fused search into single-worker production aw-knowledgeable for
+    nothing. ``code_only`` without ``include_code`` is ignored, same
+    byte-identical-legacy rule as every other knob here."""
     import asyncio
 
     from .mcp import client
@@ -259,6 +266,19 @@ async def compose_knowledge_search(args: dict) -> tuple[str, bool]:
     if not query:
         return "query is required", True
     code_query = (args.get("code_query") or query).strip()
+
+    if args.get("code_only"):
+        code_result = await forward("codegraph", "codegraph_explore", {"query": code_query})
+        response = {
+            "knowledge": None,
+            "code": {
+                **code_result,
+                "source": "codegraph",
+                "tool": "codegraph_explore",
+                "mentions": [],
+            },
+        }
+        return json.dumps(response, indent=2, ensure_ascii=False), False
 
     (kg_data, kg_err), code_result = await asyncio.gather(
         client.knowledge_search_data(args),

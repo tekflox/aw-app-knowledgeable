@@ -1578,7 +1578,12 @@ TOOLS_SCHEMA = [
             "or `citations` — the knowledge graph and the code graph are "
             "disjoint key spaces, so a code result standing in for KG evidence "
             "would be fabricated comparability. Omitting `include_code` keeps "
-            "the response byte-identical to today."
+            "the response byte-identical to today. "
+            "`code_only` (default false, only meaningful with `include_code`) "
+            "skips the knowledge-graph leg entirely — `knowledge` comes back "
+            "null and only the code graph is queried. Use this when you want "
+            "just the code perspective: it avoids a redundant fused KG search "
+            "for an answer you are going to discard."
         ),
         "inputSchema": {
             "type": "object",
@@ -1599,6 +1604,16 @@ TOOLS_SCHEMA = [
                         "Only used when `include_code` is true. The code-side "
                         "question, when it should differ from `query` (e.g. a "
                         "symbol name vs. a natural-language ask). Defaults to `query`."
+                    ),
+                },
+                "code_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false. Only meaningful when `include_code` is "
+                        "true — skips the knowledge-graph leg entirely, returning "
+                        "`knowledge: null` and just the `code` section. Ignored "
+                        "(and the response stays byte-identical to legacy) when "
+                        "`include_code` is absent or false."
                     ),
                 },
                 "mode": {
