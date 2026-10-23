@@ -231,10 +231,16 @@
         "description": "The Postgres DSN the exec sync reads AP-MT runs from, e.g. postgresql://postgres:\u2026@aw-remote-host-postgres:5432/agents_platform_multitenant (reachable BY NAME; 127.0.0.1 is refused from app containers). Stored in the workspace secret store like `service_secret`, never in plain app config \u2014 a DSN carries a password. This connector holds the Postgres credential and the service secret, and deliberately NEVER holds the Neo4j password: scrubbing and loading are connector-side for exactly that reason (\u00a74), and this side never speaks Bolt.",
         "x-reason": "read-only access to AP-MT runs for the execution-history projection"
       },
+      "source_callback_url": {
+        "type": "string",
+        "default": "",
+        "title": "Knowledge Sources — callback URL",
+        "description": "docs/design/knowledgeable-knowledge-sources-registry.md §4b. The base URL aw-knowledgeable POSTs back to for this workspace's `POST /source-query` fan-out leg (e.g. this connector's own public edge URL). Pushed on every sources_sync tick alongside the forward_upstreams inventory — empty is not a configuration error: the sync still runs, and the workspace's row lands `reachable=false, reason=\"no callback_url configured\"` on the server, visibly rather than silently."
+      },
       "forward_upstreams": {
         "type": "array",
         "title": "Forwardable upstreams",
-        "description": "docs/design/knowledgeable-connector-tool-forwarder.md. Each entry is {id, transport, app_slug, tools (tool allow-list, each with a per-tool argument allow-list), probe {tool, ttl_ok_s, ttl_fail_s, timeout_s}, timeout_s} \u2014 a forwarded `knowledge_search(include_code=true)` call reaches `http://127.0.0.1:$AW_PORT/api/apps/<app_slug>/mcp` with `X-Api-Key=$AW_WORKSPACE_API_KEY`, under this connector's own authorization, never the caller's. `transport` must be `app-mcp` (the only kind in v1 \u2014 any other installed app's own self-registered /mcp route; a non-app upstream is a new transport kind and deliberately a code change, aw-mcp-gateway's job instead). An unlisted tool or argument is rejected by name at the boundary, never silently dropped \u2014 `projectPath` is deliberately absent from codegraph's own arg allow-list below, since it would otherwise be a filesystem-read primitive over repos/**. Ships with codegraph as the default first entry so this path is exercised, not dormant.",
+        "description": "docs/design/knowledgeable-connector-tool-forwarder.md. Each entry is {id, transport, app_slug, tools (tool allow-list, each with a per-tool argument allow-list), probe {tool, ttl_ok_s, ttl_fail_s, timeout_s}, timeout_s, query_tool} \u2014 a forwarded `knowledge_search(include_code=true)` call reaches `http://127.0.0.1:$AW_PORT/api/apps/<app_slug>/mcp` with `X-Api-Key=$AW_WORKSPACE_API_KEY`, under this connector's own authorization, never the caller's. `transport` must be `app-mcp` (the only kind in v1 \u2014 any other installed app's own self-registered /mcp route; a non-app upstream is a new transport kind and deliberately a code change, aw-mcp-gateway's job instead). An unlisted tool or argument is rejected by name at the boundary, never silently dropped \u2014 `projectPath` is deliberately absent from codegraph's own arg allow-list below, since it would otherwise be a filesystem-read primitive over repos/**. `query_tool` ({tool, arg}, optional \u2014 docs/design/knowledgeable-knowledge-sources-registry.md \u00a74b) names which allow-listed tool and argument `POST /source-query` uses to answer a generic natural-language query for this upstream; absent entries fall back to the codegraph default. Ships with codegraph as the default first entry so this path is exercised, not dormant.",
         "default": [
           {
             "id": "codegraph",
@@ -269,7 +275,11 @@
               "ttl_fail_s": 15,
               "timeout_s": 5
             },
-            "timeout_s": 10
+            "timeout_s": 10,
+            "query_tool": {
+              "tool": "codegraph_explore",
+              "arg": "query"
+            }
           }
         ],
         "items": {

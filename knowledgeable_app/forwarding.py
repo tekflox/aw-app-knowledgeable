@@ -56,6 +56,16 @@ _config_resolver: Callable[[], dict] = lambda: {}
 #: Per-worker availability cache: upstream_id -> (ok, reason, checked_at).
 _availability_cache: dict[str, tuple[bool, str | None, float]] = {}
 
+#: docs/design/knowledgeable-knowledge-sources-registry.md §4b — which
+#: allow-listed tool answers a generic natural-language query for an
+#: upstream whose registry entry carries no explicit ``query_tool``. Shipped
+#: as codegraph's own default in ``aw-app.json`` too; this is the fallback
+#: for an older saved config that predates the field, not a second source of
+#: truth. Additive and ignored by ``compose_knowledge_search`` (which still
+#: hardcodes its own codegraph call below) — `POST /source-query` (routes.py)
+#: is the only caller.
+DEFAULT_QUERY_TOOL = {"tool": "codegraph_explore", "arg": "query"}
+
 
 def configure(config_resolver: Callable[[], dict]) -> None:
     """Installed once from ``plugin.activate``; every function below reads
@@ -93,6 +103,20 @@ def _find_upstream(upstream_id: str) -> dict | None:
         if entry.get("id") == upstream_id:
             return entry
     return None
+
+
+def query_tool_for(upstream_id: str) -> dict:
+    """``{tool, arg}`` for ``POST /source-query`` (routes.py) — the
+    entry's own ``query_tool`` if it declares one, else
+    :data:`DEFAULT_QUERY_TOOL`. Never ``None``: an unknown ``upstream_id``
+    still gets a tool name to try, and ``forward()`` is what actually
+    rejects it (by upstream, not by this helper guessing wrong)."""
+    entry = _find_upstream(upstream_id)
+    query_tool = (entry or {}).get("query_tool") or {}
+    return {
+        "tool": query_tool.get("tool") or DEFAULT_QUERY_TOOL["tool"],
+        "arg": query_tool.get("arg") or DEFAULT_QUERY_TOOL["arg"],
+    }
 
 
 def _aw_port() -> str:

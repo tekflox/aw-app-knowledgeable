@@ -15,7 +15,15 @@ import logging
 import os
 from contextlib import suppress
 
-from . import forwarding, ingest_key_push, label_key_push, mcp_config, playground_key_push, routes as routes_mod
+from . import (
+    forwarding,
+    ingest_key_push,
+    label_key_push,
+    mcp_config,
+    playground_key_push,
+    routes as routes_mod,
+    sources_sync,
+)
 from .mcp import client
 
 log = logging.getLogger("aw_apps.knowledgeable")
@@ -33,6 +41,11 @@ class KnowledgeableAppPlugin:
         # read-fresh-every-call rule as `client.configure` above, so a saved
         # `forward_upstreams` edit takes effect on the next tool call.
         forwarding.configure(lambda: ctx.config or {})
+        # Knowledge Sources C2 (docs/design/knowledgeable-knowledge-sources-
+        # registry.md §4b) — the registry push loop's own config + manifest
+        # resolution, same read-fresh-every-tick rule as `forwarding.configure`
+        # above.
+        sources_sync.configure(lambda: ctx.config or {}, ctx.package_dir)
 
         ctx.routes.register(routes_mod.build_routes(ctx))
 
@@ -60,10 +73,16 @@ class KnowledgeableAppPlugin:
         # label_key_push.py's module docstring.
         self._label_key_task = asyncio.create_task(label_key_push.run_forever())
 
+        # Knowledge Sources C2 — the WorkspaceSkillSync-twin push loop
+        # (sources_sync.py's own docstring): delta immediately then every
+        # ~180s, reconcile unconditionally every ~360s.
+        self._sources_sync_delta_task = asyncio.create_task(sources_sync.run_delta_forever())
+        self._sources_sync_reconcile_task = asyncio.create_task(sources_sync.run_reconcile_forever())
+
         log.info(
             "aw-app-knowledgeable activated: mcp server=%s, tools=%s, base_url=%s, secret=%s, "
             "playground-key re-assert every %ss, ingest-key re-assert every %ss, "
-            "label-key re-assert every %ss",
+            "label-key re-assert every %ss, sources-sync delta every %ss / reconcile every %ss",
             sorted(doc["mcpServers"]),
             len(client.TOOLS_SCHEMA),
             client.base_url(),
@@ -71,10 +90,18 @@ class KnowledgeableAppPlugin:
             playground_key_push.PUSH_INTERVAL_S,
             ingest_key_push.PUSH_INTERVAL_S,
             label_key_push.PUSH_INTERVAL_S,
+            sources_sync.DELTA_INTERVAL_S,
+            sources_sync.RECONCILE_INTERVAL_S,
         )
 
     async def deactivate(self) -> None:
-        for attr in ("_playground_key_task", "_ingest_key_task", "_label_key_task"):
+        for attr in (
+            "_playground_key_task",
+            "_ingest_key_task",
+            "_label_key_task",
+            "_sources_sync_delta_task",
+            "_sources_sync_reconcile_task",
+        ):
             task = getattr(self, attr, None)
             if task is not None:
                 task.cancel()

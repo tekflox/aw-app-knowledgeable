@@ -260,6 +260,46 @@ def build_routes(ctx) -> FastAPI:
         return {"api_key": value}
 
     # ------------------------------------------------------------------
+    # docs/design/knowledgeable-knowledge-sources-registry.md §4b — the
+    # fan-out's reverse leg. Mirror image of `GET /keys/{slot}` above: no
+    # `_require_identity` (production aw-knowledgeable holds neither a
+    # workspace session nor the workspace API key, only the shared
+    # `X-Internal-Secret`), so this route verifies that secret itself.
+    # ------------------------------------------------------------------
+
+    @app.post("/source-query")
+    async def source_query(request: Request, data: dict = Body(default={})):
+        """Resolve one ``source_id`` against this workspace's
+        ``forward_upstreams`` registry and answer a generic natural-language
+        query through it — the Connector's half of aw-knowledgeable's
+        ``POST /api/knowledge/sources/query`` fan-out (C1).
+
+        Every allow-list, timeout, cap and probe-cache behavior lives in
+        ``forwarding.forward()``, unchanged by this route: aw-knowledgeable
+        receives exactly what a local ``knowledge_search(include_code=true)``
+        caller already receives, through the one enforcement core. The
+        response is returned verbatim — ``{status: "ok", result, elapsed_ms}``
+        or ``{status: "unavailable", reason, elapsed_ms}`` — which is also
+        the envelope shape C1's fan-out already knows how to read.
+        """
+        provided = request.headers.get("x-internal-secret", "")
+        expected = ctx.secrets.read(SECRET_KEY) or ""
+        if not provided or not expected or not hmac.compare_digest(expected, provided):
+            return JSONResponse({"detail": "unauthorized"}, status_code=403)
+
+        source_id = (data.get("source_id") or "").strip()
+        if not source_id:
+            return JSONResponse({"detail": "source_id is required"}, status_code=400)
+        query = (data.get("query") or "").strip()
+        if not query:
+            return JSONResponse({"detail": "query is required"}, status_code=400)
+        code_query = (data.get("code_query") or "").strip()
+
+        query_tool = forwarding.query_tool_for(source_id)
+        value = code_query or query
+        return await forwarding.forward(source_id, query_tool["tool"], {query_tool["arg"]: value})
+
+    # ------------------------------------------------------------------
     # §13 — the KB bulk-ingest driver. Both doors (the `knowledgeable-ingest`
     # CLI command and the contributed scheduled task, which just runs that
     # same CLI command) reach the engine through these routes, never by

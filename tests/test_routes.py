@@ -411,6 +411,175 @@ def test_pull_key_503s_on_a_vault_miss(app_client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# POST /source-query — the fan-out's reverse leg (docs/design/
+# knowledgeable-knowledge-sources-registry.md §4b). Mirror image of
+# GET /keys/{slot} above: this route verifies X-Internal-Secret itself,
+# never _require_identity.
+# ---------------------------------------------------------------------------
+
+
+def test_source_query_requires_the_internal_secret(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.post("/source-query", json={"source_id": "codegraph", "query": "x"})
+    assert resp.status_code == 403
+
+
+def test_source_query_rejects_a_wrong_secret(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "codegraph", "query": "x"},
+        headers={"x-internal-secret": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
+def test_source_query_403s_when_no_service_secret_is_configured_yet(app_client):
+    tc, _ = app_client
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "codegraph", "query": "x"},
+        headers={"x-internal-secret": "anything"},
+    )
+    assert resp.status_code == 403
+
+
+def test_source_query_requires_source_id_and_query(app_client):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    headers = {"x-internal-secret": "shh"}
+
+    resp = tc.post("/source-query", json={"query": "x"}, headers=headers)
+    assert resp.status_code == 400
+    assert "source_id" in resp.json()["detail"]
+
+    resp = tc.post("/source-query", json={"source_id": "codegraph"}, headers=headers)
+    assert resp.status_code == 400
+    assert "query" in resp.json()["detail"]
+
+
+def test_source_query_unknown_source_is_an_unavailable_envelope_not_an_error(app_client):
+    """Mirrors `forward()`'s own contract — an unknown upstream is a 200
+    envelope `{status: "unavailable", reason}`, never a 404/500."""
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "not-a-real-source", "query": "x"},
+        headers={"x-internal-secret": "shh"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "unavailable"
+    assert "no forward_upstreams entry" in body["reason"]
+
+
+def test_source_query_forwards_to_the_default_query_tool(app_client, monkeypatch):
+    """A registry entry with no explicit `query_tool` falls back to the
+    codegraph default — same `forward()` call, same allow-lists, same
+    everything a local `include_code=true` caller already gets."""
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    ctx.config = {
+        "forward_upstreams": [
+            {
+                "id": "codegraph",
+                "transport": "app-mcp",
+                "app_slug": "codegraph",
+                "tools": {"codegraph_explore": {"args": ["query", "maxFiles"]}},
+                "timeout_s": 10,
+            }
+        ]
+    }
+
+    captured = {}
+
+    async def fake_forward(upstream_id, tool, args):
+        captured.update(upstream_id=upstream_id, tool=tool, args=args)
+        return {"status": "ok", "result": "3847 files indexed", "elapsed_ms": 12}
+
+    monkeypatch.setattr(routes_mod.forwarding, "forward", fake_forward)
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "codegraph", "query": "how does auth work"},
+        headers={"x-internal-secret": "shh"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "result": "3847 files indexed", "elapsed_ms": 12}
+    assert captured == {
+        "upstream_id": "codegraph",
+        "tool": "codegraph_explore",
+        "args": {"query": "how does auth work"},
+    }
+
+
+def test_source_query_honours_an_explicit_query_tool_override(app_client, monkeypatch):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    ctx.config = {
+        "forward_upstreams": [
+            {
+                "id": "other-app",
+                "transport": "app-mcp",
+                "app_slug": "other-app",
+                "tools": {"ask": {"args": ["question"]}},
+                "query_tool": {"tool": "ask", "arg": "question"},
+                "timeout_s": 10,
+            }
+        ]
+    }
+    captured = {}
+
+    async def fake_forward(upstream_id, tool, args):
+        captured.update(upstream_id=upstream_id, tool=tool, args=args)
+        return {"status": "ok", "result": "ok", "elapsed_ms": 1}
+
+    monkeypatch.setattr(routes_mod.forwarding, "forward", fake_forward)
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "other-app", "query": "anything"},
+        headers={"x-internal-secret": "shh"},
+    )
+    assert resp.status_code == 200
+    assert captured == {"upstream_id": "other-app", "tool": "ask", "args": {"question": "anything"}}
+
+
+def test_source_query_code_query_overrides_query_for_the_forwarded_call(app_client, monkeypatch):
+    tc, ctx = app_client
+    ctx.secrets.write("service_secret", "shh")
+    ctx.config = {
+        "forward_upstreams": [
+            {
+                "id": "codegraph",
+                "transport": "app-mcp",
+                "app_slug": "codegraph",
+                "tools": {"codegraph_explore": {"args": ["query"]}},
+                "timeout_s": 10,
+            }
+        ]
+    }
+    captured = {}
+
+    async def fake_forward(upstream_id, tool, args):
+        captured.update(args=args)
+        return {"status": "ok", "result": "ok", "elapsed_ms": 1}
+
+    monkeypatch.setattr(routes_mod.forwarding, "forward", fake_forward)
+    tc.post(
+        "/source-query",
+        json={
+            "source_id": "codegraph",
+            "query": "how does auth work",
+            "code_query": "AuthMiddleware",
+        },
+        headers={"x-internal-secret": "shh"},
+    )
+    assert captured["args"] == {"query": "AuthMiddleware"}
+
+
+# ---------------------------------------------------------------------------
 # `_require_identity` — every OTHER route must still 401 an anonymous
 # caller even with `auth_required: false` on the whole mount (routes.py's
 # module docstring). `app_client` above overrides this dependency for every
@@ -478,6 +647,19 @@ def test_identity_is_still_required_for_mcp(ungated_app_client):
     tc, _ = ungated_app_client
     assert tc.get("/mcp").status_code == 401
     assert tc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 401
+
+
+def test_source_query_needs_no_identity_at_all(ungated_app_client):
+    """Same deliberate exception as `GET /keys/{slot}` — reachable with only
+    the shared `X-Internal-Secret`, no workspace identity at all."""
+    tc, ctx = ungated_app_client
+    ctx.secrets.write("service_secret", "shh")
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "codegraph", "query": "x"},
+        headers={"x-internal-secret": "shh"},
+    )
+    assert resp.status_code == 200
 
 
 def test_pull_key_needs_no_identity_at_all(ungated_app_client):
