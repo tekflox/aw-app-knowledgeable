@@ -1001,7 +1001,14 @@ def test_reset_watermark_clears_the_frontier_and_refuses_without_a_source_tenant
     It refuses without `exec_sync_source_tenant` for the same reason
     `run_tick` does: the sentinel is per source tenant, and guessing it
     would stamp the wrong one — which reads as a clean reset and syncs
-    nothing."""
+    nothing.
+
+    The disk preflight (§13.7) is injected rather than read off the real
+    host: `exec_sync.free_disk_bytes` is monkeypatched to an invented
+    above-floor figure, the same seam `test_exec_sync.py`'s own
+    `disk_preflight` tests use, so this route's pass path is deterministic
+    on any machine regardless of how full its disk actually is (memory
+    exec-sync-test-defect-reset-watermark-route-test-reads-the-real-host-disk-instead-of-injecting-a-free-space-figure)."""
     tc, ctx = exec_app_client
     posted: list[dict] = []
 
@@ -1025,6 +1032,7 @@ def test_reset_watermark_clears_the_frontier_and_refuses_without_a_source_tenant
 
     _enable_exec_sync(ctx, monkeypatch)
     monkeypatch.setattr(client, "put_exec_sync_state", _put_state)
+    monkeypatch.setattr(exec_sync, "free_disk_bytes", lambda: (40 * 1024**3, None))
     body = tc.post("/exec-sync/reset-watermark", json={}).json()
     assert body["ok"] is True
     assert body["watermark"] is None
@@ -1034,6 +1042,35 @@ def test_reset_watermark_clears_the_frontier_and_refuses_without_a_source_tenant
     # The reason is recorded on the sentinel so an operator reading a null
     # watermark can tell a deliberate reset from a lost sentinel.
     assert "backfill" in posted[0]["last_error"]
+
+
+def test_reset_watermark_refuses_below_the_disk_floor_and_stamps_nothing(
+    exec_app_client, monkeypatch
+):
+    """Mirror of the accept path above: below §13.7's 25 GB floor the route
+    must refuse, say why, and never reach `put_exec_sync_state` — this is
+    the branch the host-reading version of this test could never exercise
+    on a machine that happened to have room, which is exactly how it stayed
+    hidden until the host itself dropped under the floor."""
+    tc, ctx = exec_app_client
+    posted: list[dict] = []
+
+    async def _put_state(*, source_tenant, watermark, counts=None, last_error=None):
+        posted.append({"source_tenant": source_tenant})
+        return True, None
+
+    _enable_exec_sync(ctx, monkeypatch)
+    monkeypatch.setattr(client, "put_exec_sync_state", _put_state)
+    monkeypatch.setattr(exec_sync, "free_disk_bytes", lambda: (3 * 1024**3, None))
+
+    body = tc.post("/exec-sync/reset-watermark", json={}).json()
+    assert body["ok"] is False
+    assert "3.0 GB free" in body["error"]
+    assert str(exec_sync.MIN_FREE_DISK_GB) in body["error"]
+    assert body["disk"]["ok"] is False
+    assert body["disk"]["free_gb"] == 3.0
+    assert body["disk"]["min_free_gb"] == exec_sync.MIN_FREE_DISK_GB
+    assert posted == [], "it stamped a sentinel despite the disk refusal"
 
 
 def test_exec_sync_doctor_is_ok_when_nothing_is_degraded(exec_app_client, monkeypatch):
