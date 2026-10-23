@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "knowledgeable",
   "name": "Knowledgeable Connector",
-  "version": "0.72.0",
+  "version": "0.73.0",
   "description": "Ingestion + retrieval MCP connector for aw-knowledgeable (fredericowu/aw-knowledgeable), the standalone Neo4j knowledge-graph service \u2014 7 tools mapped onto its API: upload_document, create_node, create_link, get_graph, list_documents, search_nodes (lexical name matching, for the link picker), search_graph (lexical/semantic/tree retrieval with the \u00a712 knobs \u2014 beam_width, min_score, related_vias, bucket). This app is a thin HTTP client; it has no Neo4j driver and no knowledge of aw-knowledgeable's own tenant-isolation seam. Per docs/design/aw-knowledgeable-infra.md \u00a710 (decision D2): the tenant a call lands in comes from THIS app's own shared service secret, never from the calling agent's self-asserted headers.",
   "icon": "share-2",
   "tier": "inprocess",
@@ -234,8 +234,8 @@
       "source_callback_url": {
         "type": "string",
         "default": "",
-        "title": "Knowledge Sources — callback URL",
-        "description": "docs/design/knowledgeable-knowledge-sources-registry.md §4b. The base URL aw-knowledgeable POSTs back to for this workspace's `POST /source-query` fan-out leg (e.g. this connector's own public edge URL). Pushed on every sources_sync tick alongside the forward_upstreams inventory — empty is not a configuration error: the sync still runs, and the workspace's row lands `reachable=false, reason=\"no callback_url configured\"` on the server, visibly rather than silently."
+        "title": "Knowledge Sources \u2014 callback URL",
+        "description": "docs/design/knowledgeable-knowledge-sources-registry.md \u00a74b. The base URL aw-knowledgeable POSTs back to for this workspace's `POST /source-query` fan-out leg (e.g. this connector's own public edge URL). Pushed on every sources_sync tick alongside the forward_upstreams inventory \u2014 empty is not a configuration error: the sync still runs, and the workspace's row lands `reachable=false, reason=\"no callback_url configured\"` on the server, visibly rather than silently."
       },
       "forward_upstreams": {
         "type": "array",
