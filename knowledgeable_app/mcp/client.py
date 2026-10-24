@@ -1268,12 +1268,14 @@ async def knowledge_search_data(args: dict) -> tuple[dict | None, str | None]:
     if args.get("collection"):
         params["collection"] = args["collection"]
 
-    # Generous headroom over the server's own `budget_ms` (itself clamped
-    # at 25000) — this connector's own timeout must never be the thing that
-    # cuts the request before the server's own declared degradation gets a
-    # chance to run.
-    budget_ms = body.get("budget_ms") or 20000
-    timeout = min(45.0, max(30.0, budget_ms / 1000.0 + 10.0))
+    # Generous headroom over the server's own `budget_ms` (itself clamped at
+    # 180000 as of card 4035bf3b-9510-8150) — this connector's own timeout
+    # must never be the thing that cuts the request before the server's own
+    # declared degradation gets a chance to run. No upper cap: a cap here
+    # silently reintroduced the exact bug the card fixed once, cutting the
+    # request before a raised server-side ceiling could ever be reached.
+    budget_ms = body.get("budget_ms") or 180000
+    timeout = max(30.0, budget_ms / 1000.0 + 10.0)
 
     return await _post_json("/api/knowledge/search", body, params=params, timeout=timeout)
 
@@ -1695,11 +1697,13 @@ TOOLS_SCHEMA = [
                 "budget_ms": {
                     "type": "integer",
                     "description": (
-                        "Wall-clock budget for the whole pipeline. Default 20000, server-"
-                        "capped at 25000 — stay under this, the production tunnel edge "
-                        "cuts requests around 30s regardless. Past budget, synthesis is "
-                        "skipped and the fused retrieval is still returned, declared in "
-                        "`clamped` — never a timeout, never a 500."
+                        "Wall-clock budget for the whole pipeline. Default and server-cap "
+                        "180000 (3 min) — this connector call is NOT subject to the "
+                        "browser/tunnel's ~30s edge cut, it reaches aw-knowledgeable "
+                        "directly over the local network. Past budget, synthesis (and, if "
+                        "it can't be admitted first, the planner) is skipped and the fused "
+                        "retrieval is still returned, declared in `clamped` — never a "
+                        "timeout, never a 500."
                     ),
                 },
                 "synthesize": {
