@@ -1304,6 +1304,42 @@ async def knowledge_search(args: dict) -> tuple[str, bool]:
     return _as_text(data), False
 
 
+async def knowledge_sources(args: dict) -> tuple[str, bool]:
+    """POST /api/knowledge/sources/query — the per-workspace external-sources
+    fan-out (docs/design/knowledgeable-sources-mcp-tool.md), mirroring AP-MT's
+    own ``_knowledge_sources_tool``
+    (agents-platform-multitenant/backend/app/core/tools/knowledgeable.py)
+    field-by-field so the retriever's existing system prompt keeps describing
+    the right arguments.
+
+    Returned verbatim via ``_as_text`` — never fused with knowledge-graph
+    chunks. Zero registered sources is ``{"sources": [], "reason": ...}``
+    with no error flag, not an exception path (the route's own contract).
+    """
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "query is required", True
+
+    body: dict = {"query": query, "budget_ms": args.get("budget_ms") or 15000}
+    if args.get("code_query"):
+        body["code_query"] = args["code_query"]
+    if args.get("workspace_slugs"):
+        body["workspace_slugs"] = args["workspace_slugs"]
+    if args.get("source_ids"):
+        body["source_ids"] = args["source_ids"]
+
+    # Same headroom rule `knowledge_search_data` follows: the server clamps
+    # budget at 20s and per-source at 10s (aw-knowledgeable's sources.py), so
+    # this connector's own timeout must never be the thing that cuts the
+    # request short. No upper cap.
+    timeout = max(30.0, body["budget_ms"] / 1000.0 + 10.0)
+
+    data, err = await _post_json("/api/knowledge/sources/query", body, timeout=timeout)
+    if err:
+        return f"knowledge_sources failed: {err}", True
+    return _as_text(data), False
+
+
 def _as_text(data) -> str:
     import json
 
@@ -1721,6 +1757,60 @@ TOOLS_SCHEMA = [
                 "collection": {
                     "type": "string",
                     "description": "Source-path folder prefix to stay inside, full depth, e.g. 'notion/kanban/done/'.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "knowledge_sources",
+        "description": (
+            "Ask this workspace's registered external knowledge sources a question "
+            "through aw-knowledgeable's external-sources fan-out (no per-workspace "
+            "URL — the connector's own credential selects the tenant). query: "
+            "required, the question as asked. code_query: optional code-side "
+            "phrasing (a symbol, file or function name) when it should differ from "
+            "query. workspace_slugs / source_ids: optional narrowing; omitted asks "
+            "every enabled source. budget_ms: wall-clock budget, default 15000 "
+            "(service caps at 20000). Returns the raw envelope {\"sources\": "
+            "[{workspace_slug, source_id, app_slug, status, result|reason}, ...]} "
+            "— one section per source, never fused with knowledge-graph chunks. "
+            "Zero registered sources is a normal {\"sources\": []} answer, not an "
+            "error."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The question to ask every registered external source. Required.",
+                },
+                "code_query": {
+                    "type": "string",
+                    "description": (
+                        "Optional code-side phrasing (a symbol, file or function name) "
+                        "when it should differ from `query`."
+                    ),
+                },
+                "workspace_slugs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional narrowing to specific workspace slugs. Omit to ask "
+                        "every workspace this tenant has registered."
+                    ),
+                },
+                "source_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional narrowing to specific source ids. Omit to ask every enabled source.",
+                },
+                "budget_ms": {
+                    "type": "integer",
+                    "description": (
+                        "Wall-clock budget for the whole fan-out. Default 15000; the "
+                        "service itself caps at 20000."
+                    ),
                 },
             },
             "required": ["query"],

@@ -32,6 +32,10 @@ _DISPATCH = {
     # `include_code` absent/false delegates straight to `client.knowledge_search`
     # unchanged; no other dispatch row changes.
     "knowledge_search": forwarding.compose_knowledge_search,
+    # docs/design/knowledgeable-sources-mcp-tool.md — 1:1 HTTP mapping onto
+    # /api/knowledge/sources/query, composes nothing, so it dispatches
+    # straight to client.py like every other non-composed tool above.
+    "knowledge_sources": client.knowledge_sources,
     # §9 step 4 (docs/design/execution-history-in-production-neo4j.md) — the
     # agent-facing surface over the exec subgraph the sync engine's own calls
     # in client.py already populate. Same dispatch shape as every read-only
