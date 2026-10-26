@@ -170,7 +170,7 @@ def test_status_forward_upstreams_reports_a_configured_entry(app_client, monkeyp
                 "transport": "app-mcp",
                 "app_slug": "codegraph",
                 "tools": {"codegraph_status": {"args": []}},
-                "probe": {"tool": "codegraph_status", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 5},
+                "probe": {"tool": "codegraph_status", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 120},
                 "timeout_s": 10,
             }
         ]

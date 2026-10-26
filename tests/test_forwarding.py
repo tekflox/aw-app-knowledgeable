@@ -34,7 +34,7 @@ CODEGRAPH_ENTRY = {
         "codegraph_explore": {"args": ["query", "maxFiles"]},
         "codegraph_status": {"args": []},
     },
-    "probe": {"tool": "codegraph_status", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 5},
+    "probe": {"tool": "codegraph_status", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 120},
     "timeout_s": 10,
 }
 

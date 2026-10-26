@@ -273,7 +273,7 @@
               "tool": "codegraph_status",
               "ttl_ok_s": 60,
               "ttl_fail_s": 15,
-              "timeout_s": 5
+              "timeout_s": 120
             },
             "timeout_s": 10,
             "query_tool": {
