@@ -232,6 +232,310 @@ def test_forward_result_is_truncated_past_cap(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# transport dispatch + the app-mcp-json transport
+# (docs/design/knowledgeable-forwarder-declared-mcp-transport.md)
+# ---------------------------------------------------------------------------
+
+
+SIGNOZ_ENTRY = {
+    "id": "signoz",
+    "transport": "app-mcp-json",
+    "app_slug": "signoz-connector",
+    "server": "signoz-query",
+    "tools": {
+        "signoz_list_services": {"args": ["timeRange", "limit"]},
+        "signoz_search_logs": {"args": ["searchText", "service", "severity", "timeRange", "limit"]},
+        "signoz_search_traces": {"args": ["service", "operation", "error", "timeRange", "limit"]},
+    },
+    "probe": {"tool": "signoz_list_services", "ttl_ok_s": 60, "ttl_fail_s": 15, "timeout_s": 120},
+    "timeout_s": 10,
+    "query_tool": {"tool": "signoz_search_logs", "arg": "searchText"},
+}
+
+DECLARED_URL = "https://signoz-mcp.example.test/mcp"
+
+
+class _FakeDeclaredResponse:
+    """Unlike ``_FakeForwardResponse`` this also carries ``headers``/``text``
+    — the declared transport reads the ``Mcp-Session-Id`` response header and
+    has to be able to parse an SSE body, neither of which the loopback
+    ``app-mcp`` path ever touches."""
+
+    def __init__(self, status_code=200, json_body=None, text=None, headers=None):
+        self.status_code = status_code
+        self._json = json_body
+        self.text = text if text is not None else json.dumps(json_body or {})
+        self.headers = headers or {"content-type": "application/json"}
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("not json")
+        return self._json
+
+
+def _declared_init(session_id=None):
+    headers = {"content-type": "application/json"}
+    if session_id:
+        headers["mcp-session-id"] = session_id
+    return _FakeDeclaredResponse(200, {
+        "jsonrpc": "2.0", "id": 1,
+        "result": {"protocolVersion": "2024-11-05", "serverInfo": {"name": "signoz-mcp-server"}},
+    }, headers=headers)
+
+
+def _declared_notification_ack():
+    return _FakeDeclaredResponse(202, {}, text="")
+
+
+def _declared_tools_call(text="signoz says hi", is_error=False):
+    return _FakeDeclaredResponse(200, {
+        "jsonrpc": "2.0", "id": 2,
+        "result": {"content": [{"type": "text", "text": text}], "isError": is_error},
+    })
+
+
+def _declared_tools_call_sse(text="signoz over sse"):
+    body = {
+        "jsonrpc": "2.0", "id": 2,
+        "result": {"content": [{"type": "text", "text": text}], "isError": False},
+    }
+    return _FakeDeclaredResponse(
+        200, None,
+        text="event: message\ndata: " + json.dumps(body) + "\n\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+def _declared_handshake(final):
+    """The three responses one successful declared call consumes."""
+    return [_declared_init(), _declared_notification_ack(), final]
+
+
+@pytest.fixture
+def declared(tmp_path, monkeypatch):
+    """Point the resolver at a throwaway apps root and register the signoz
+    entry alongside codegraph — returns a writer for the rendered
+    ``apps/<slug>/mcp.json`` so each test declares the state it is about."""
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path))
+    forwarding.configure(lambda: {"forward_upstreams": [CODEGRAPH_ENTRY, SIGNOZ_ENTRY]})
+
+    def _write(slug="signoz-connector", doc=None, enabled=True):
+        if doc is None:
+            doc = {"mcpServers": {"signoz-query": {
+                "enabled": enabled, "type": "http", "url": DECLARED_URL,
+                "headers": {"SIGNOZ-API-KEY": "declared-signoz-key"},
+            }}}
+        app_dir = tmp_path / slug
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "mcp.json").write_text(json.dumps(doc), encoding="utf-8")
+        return app_dir / "mcp.json"
+
+    return _write
+
+
+def test_declared_happy_path_runs_the_full_handshake(declared):
+    declared()
+    _FakeForwardAsyncClient._QUEUE.extend(_declared_handshake(_declared_tools_call("12 services")))
+
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {"timeRange": "1h"}))
+    assert result["status"] == "ok", result
+    assert "12 services" in result["result"]
+
+    calls = _FakeForwardAsyncClient._CALLS
+    assert [c["json"]["method"] for c in calls] == [
+        "initialize", "notifications/initialized", "tools/call",
+    ]
+    assert all(c["url"] == DECLARED_URL for c in calls)
+    assert calls[2]["json"]["params"] == {
+        "name": "signoz_list_services", "arguments": {"timeRange": "1h"},
+    }
+    # Declared headers, plus the content negotiation a streamable-HTTP MCP
+    # endpoint requires.
+    for call in calls:
+        assert call["headers"]["SIGNOZ-API-KEY"] == "declared-signoz-key"
+        assert call["headers"]["Accept"] == "application/json, text/event-stream"
+
+
+def test_declared_never_sends_the_workspace_api_key(declared):
+    """The header invariant, asserted rather than assumed (design §5): the
+    workspace key travels to 127.0.0.1 only. On this transport the connector
+    sends exactly what the app declared — a hostile-but-declared endpoint
+    receives only its own credential."""
+    declared()
+    _FakeForwardAsyncClient._QUEUE.extend(_declared_handshake(_declared_tools_call()))
+    _run(forwarding.forward("signoz", "signoz_search_logs", {"searchText": "oops"}))
+
+    assert _FakeForwardAsyncClient._CALLS, "no outbound request was made"
+    for call in _FakeForwardAsyncClient._CALLS:
+        headers = call["headers"] or {}
+        assert "X-Api-Key" not in headers
+        assert not any(k.lower() == "x-api-key" for k in headers)
+        assert "test-key" not in json.dumps(headers)  # the fixture's AW_WORKSPACE_API_KEY
+
+
+def test_declared_parses_an_sse_response_body(declared):
+    declared()
+    _FakeForwardAsyncClient._QUEUE.extend(_declared_handshake(_declared_tools_call_sse()))
+    result = _run(forwarding.forward("signoz", "signoz_search_logs", {"searchText": "x"}))
+    assert result["status"] == "ok", result
+    assert "signoz over sse" in result["result"]
+
+
+def test_declared_honours_the_session_id_within_one_call(declared):
+    """A session the server issues is carried on the remaining two requests
+    of this call, and never cached for the next one."""
+    declared()
+    _FakeForwardAsyncClient._QUEUE.extend([
+        _declared_init(session_id="sess-1"), _declared_notification_ack(), _declared_tools_call(),
+    ])
+    _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    calls = _FakeForwardAsyncClient._CALLS
+    assert "Mcp-Session-Id" not in calls[0]["headers"]
+    assert calls[1]["headers"]["Mcp-Session-Id"] == "sess-1"
+    assert calls[2]["headers"]["Mcp-Session-Id"] == "sess-1"
+
+    # Second call: fresh handshake, no leaked session.
+    forwarding._availability_cache.clear()
+    _FakeForwardAsyncClient._CALLS = []
+    _FakeForwardAsyncClient._QUEUE.extend(_declared_handshake(_declared_tools_call()))
+    _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert "Mcp-Session-Id" not in _FakeForwardAsyncClient._CALLS[0]["headers"]
+
+
+def test_declared_app_not_installed(declared):
+    """No rendered mcp.json at all — the app is not installed, said in those
+    words rather than as a connection error from a URL we never had."""
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "app 'signoz-connector' is not installed (no rendered mcp.json)"
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_server_key_absent_is_named(declared):
+    declared(doc={"mcpServers": {"something-else": {"enabled": True, "type": "http", "url": DECLARED_URL}}})
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "app 'signoz-connector' declares no MCP server 'signoz-query'"
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_disabled_reports_not_configured_yet(declared):
+    """This card's known blocker state, made legible: mcp_template.py renders
+    `enabled: false` for a server whose ${config.x} placeholder is unresolved,
+    so "nobody filled in query_mcp_url yet" must arrive as a declared reason,
+    never as an empty success or a mystery 401."""
+    declared(enabled=False)
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == (
+        "upstream 'signoz-query' of app 'signoz-connector' is declared but "
+        "disabled — not configured yet"
+    )
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_non_http_type_is_named(declared):
+    declared(doc={"mcpServers": {"signoz-query": {
+        "enabled": True, "type": "stdio", "command": "signoz-mcp",
+    }}})
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert "declares type 'stdio', not 'http'" in result["reason"]
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_non_http_url_is_named(declared):
+    declared(doc={"mcpServers": {"signoz-query": {
+        "enabled": True, "type": "http", "url": "file:///etc/passwd",
+    }}})
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert "no usable http(s) url" in result["reason"]
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+@pytest.mark.parametrize("bad_slug", ["../../etc", "Signoz", "", "sig noz", "-signoz", "a" * 65])
+def test_declared_rejects_an_invalid_app_slug_by_name(declared, bad_slug):
+    """The path-traversal guard (design §3.1) — rejected before the slug is
+    ever joined into the apps root."""
+    forwarding.configure(lambda: {"forward_upstreams": [{**SIGNOZ_ENTRY, "app_slug": bad_slug}]})
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == f"invalid app_slug '{bad_slug}' for an app-mcp-json upstream"
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_unknown_transport_is_named_and_never_falls_back_to_loopback():
+    """A silent fallback to `app-mcp` would dial a loopback route a Tier-2 app
+    cannot have and then report "app not installed" — the exact misdiagnosis
+    this transport exists to end."""
+    forwarding.configure(lambda: {"forward_upstreams": [{**SIGNOZ_ENTRY, "transport": "gateway"}]})
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "unknown transport 'gateway' for upstream 'signoz' — not forwarded"
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_unlisted_tool_rejected_by_name(declared):
+    """The allow-list is the only per-tool gate anywhere on this path — the
+    upstream server exposes ~43 tools, 12 of them mutating."""
+    declared()
+    result = _run(forwarding.forward("signoz", "signoz_delete_alert", {}))
+    assert result["status"] == "unavailable"
+    assert "signoz_delete_alert" in result["reason"]
+    assert "not allow-listed" in result["reason"]
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+@pytest.mark.parametrize("arg", ["filter", "selectFields", "start", "end", "offset", "minDuration"])
+def test_declared_unlisted_argument_rejected_by_name(declared, arg):
+    """`filter` is the `projectPath` analog — a raw query-expression
+    passthrough. These are deliberately absent from the allow-list, so they
+    are rejected by name and never reach the network."""
+    declared()
+    result = _run(forwarding.forward("signoz", "signoz_search_logs", {"searchText": "x", arg: "y"}))
+    assert result["status"] == "unavailable"
+    assert arg in result["reason"]
+    assert "not allow-listed" in result["reason"]
+    assert _FakeForwardAsyncClient._CALLS == []
+
+
+def test_declared_handshake_timeout_is_one_deadline(declared):
+    """One `asyncio.timeout` across the whole sequence — the entry's budget
+    is total, not per-request."""
+    declared()
+    _FakeForwardAsyncClient._QUEUE.append(httpx.TimeoutException("timed out"))
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "timed out after 10s"
+
+
+def test_declared_initialize_http_error_is_reported(declared):
+    declared()
+    _FakeForwardAsyncClient._QUEUE.append(_FakeDeclaredResponse(401, {}))
+    result = _run(forwarding.forward("signoz", "signoz_list_services", {}))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "signoz-connector/signoz-query initialize failed: HTTP 401"
+
+
+def test_declared_tool_level_error_is_reported_verbatim(declared):
+    declared()
+    _FakeForwardAsyncClient._QUEUE.extend(
+        _declared_handshake(_declared_tools_call("key service.name not found", is_error=True)))
+    result = _run(forwarding.forward("signoz", "signoz_search_logs", {"service": "ghost"}))
+    assert result["status"] == "unavailable"
+    assert "key service.name not found" in result["reason"]
+
+
+def test_declared_query_tool_is_search_logs_on_searchtext():
+    """`POST /source-query`'s generic natural-language leg for this upstream."""
+    forwarding.configure(lambda: {"forward_upstreams": [CODEGRAPH_ENTRY, SIGNOZ_ENTRY]})
+    assert forwarding.query_tool_for("signoz") == {
+        "tool": "signoz_search_logs", "arg": "searchText",
+    }
+
+
+# ---------------------------------------------------------------------------
 # status_block() — GET /status's forward_upstreams block
 # ---------------------------------------------------------------------------
 
@@ -249,6 +553,54 @@ def test_status_block_reports_unavailable_with_reason():
     rows = _run(forwarding.status_block())
     assert rows[0]["available"] is False
     assert "codegraph app not installed" in rows[0]["reason"]
+
+
+def test_status_block_reports_the_declared_disabled_reason(declared):
+    """Acceptance for this card while the sibling config card is open: the
+    signoz upstream is LISTED on /status with the declared reason, which is
+    what "declared unavailable-reason, never an empty success" means in
+    practice. Only codegraph touches the network here — signoz fails at
+    resolution, before any request."""
+    declared(enabled=False)
+    _FakeForwardAsyncClient._QUEUE.append(_ok_tools_call("ok"))
+
+    rows = _run(forwarding.status_block())
+    assert [r["id"] for r in rows] == ["codegraph", "signoz"]
+    assert rows[0]["available"] is True
+    assert rows[1]["available"] is False
+    assert rows[1]["reason"] == (
+        "upstream 'signoz-query' of app 'signoz-connector' is declared but "
+        "disabled — not configured yet"
+    )
+
+
+def test_status_block_probes_entries_concurrently(monkeypatch):
+    """Probe timeouts are deliberately generous (120s, so a slow-not-dead
+    probe doesn't poison the negative cache); serially that budget is
+    additive and two cold entries stack to four minutes on one GET /status.
+    Both probes must be in flight at the same moment."""
+    in_flight = {"now": 0, "max": 0}
+
+    class _SlowClient(_FakeForwardAsyncClient):
+        async def post(self, url, json=None, headers=None):
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+            await asyncio.sleep(0.05)
+            in_flight["now"] -= 1
+            return _ok_tools_call("ok")
+
+    monkeypatch.setattr(forwarding, "httpx", type("M", (), {
+        "AsyncClient": _SlowClient,
+        "HTTPError": httpx.HTTPError,
+        "TimeoutException": httpx.TimeoutException,
+    }))
+    forwarding.configure(lambda: {"forward_upstreams": [
+        CODEGRAPH_ENTRY, {**CODEGRAPH_ENTRY, "id": "codegraph-2"},
+    ]})
+
+    rows = _run(forwarding.status_block())
+    assert [r["available"] for r in rows] == [True, True]
+    assert in_flight["max"] == 2, "probes ran serially, not concurrently"
 
 
 def test_status_block_empty_registry_when_unconfigured():

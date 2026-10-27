@@ -3,12 +3,31 @@ tool-forwarder.md) — codegraph is the first entry, not a special case.
 
 Each registry entry ({id, transport, app_slug, tools (tool allow-list + per-
 tool arg allow-list), probe, timeout_s}) names an installed workspace app's
-own ``/api/apps/<app_slug>/mcp`` route, reached by loopback HTTP under this
-process's own ``AW_WORKSPACE_API_KEY`` — the exact URL+header every
-self-registering app already writes into its own ``mcp.json`` for the
-gateway (``aw-app-codegraph/codegraph_app/mcp/self_register.py``). Never
-routed through aw-mcp-gateway (zombie-caching + no gateway credential held
-here, design §4).
+MCP surface. ``transport`` selects *how* that surface is reached, and is the
+one field every call below branches on first:
+
+``app-mcp`` (the default, and the only kind before 2026-10-27)
+    The app's own ``/api/apps/<app_slug>/mcp`` route, reached by loopback
+    HTTP under this process's own ``AW_WORKSPACE_API_KEY`` — the exact
+    URL+header every self-registering app already writes into its own
+    ``mcp.json`` for the gateway (``aw-app-codegraph/codegraph_app/mcp/
+    self_register.py``). Only a Tier-1 app with ``routes:register`` can have
+    such a route at all.
+
+``app-mcp-json`` (docs/design/knowledgeable-forwarder-declared-mcp-transport.md)
+    The URL, headers and enabled-state are resolved, fresh per call, from an
+    installed app's **rendered** ``apps/<app_slug>/mcp.json`` — the file
+    ``src/apps/mcp_template.py`` generates and aw-mcp-gateway's app-scan
+    already trusts. The entry names only ``{app_slug, server}`` and can
+    never carry a URL or a header, so this cannot be configured into an
+    arbitrary-outbound-request primitive. **The workspace key is never
+    attached on this transport** (it travels to ``127.0.0.1`` only); the
+    connector sends exactly the headers the app declared. This is the
+    transport a Tier-2 container app needs, because it runs no
+    workspace-side code and therefore has no loopback route to dial.
+
+Never routed through aw-mcp-gateway on either transport (zombie-caching + no
+gateway credential held here, design §4).
 
 Config is resolved through a callable rather than read once, same
 read-fresh-every-call rule ``mcp/client.py`` already follows for its secret
@@ -31,8 +50,11 @@ Per-worker cache only (no cross-worker state, design §4/§12 — 5 workers, 5
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import re
 import time
 from typing import Any, Callable
 
@@ -65,6 +87,22 @@ _availability_cache: dict[str, tuple[bool, str | None, float]] = {}
 #: hardcodes its own codegraph call below) — `POST /source-query` (routes.py)
 #: is the only caller.
 DEFAULT_QUERY_TOOL = {"tool": "codegraph_explore", "arg": "query"}
+
+#: The two ``transport`` kinds this module understands — see the module
+#: docstring. ``app-mcp`` is also the implicit default for an entry saved
+#: before the field was branched on anywhere.
+TRANSPORT_APP_MCP = "app-mcp"
+TRANSPORT_APP_MCP_JSON = "app-mcp-json"
+
+#: Path-traversal guard applied to ``app_slug`` before it is ever joined
+#: into the apps root (declared-transport design §3.1).
+APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+#: Protocol version announced on ``initialize`` — the same value the
+#: gateway's own ``HttpUpstream`` sends (``aw-mcp-gateway/back/gateway/
+#: upstream.py``'s ``DEFAULT_PROTOCOL``), which is the in-estate proof that
+#: it is accepted by the servers this workspace actually dials.
+MCP_PROTOCOL_VERSION = "2024-11-05"
 
 
 def configure(config_resolver: Callable[[], dict]) -> None:
@@ -173,6 +211,201 @@ async def _call_mcp(app_slug: str, tool: str, args: dict, timeout_s: float) -> t
     return result, None
 
 
+def _apps_root() -> str:
+    """Mirror of ``src/apps/fetch.py``'s ``apps_root()`` — the same env var,
+    the same default, so the forwarder reads the very file core rendered."""
+    return workspace_env("AW_APPS_ROOT") or os.path.join(
+        workspace_env("AW_WORKSPACE_CONTAINER_DIR") or "/opt/aw-workspace", "apps")
+
+
+def _declared_server(app_slug: str, server: str) -> tuple[dict | None, str | None]:
+    """Resolve one ``mcpServers`` entry out of an installed app's rendered
+    ``apps/<app_slug>/mcp.json``, read fresh on every call (same
+    read-fresh rule as :func:`_registry`).
+
+    Every state has a declared reason rather than an empty success — the
+    unconfigured case especially: ``mcp_template.py`` sets ``enabled: false``
+    on any server with an unresolved ``${config.x}`` placeholder, so "the
+    operator hasn't filled this in yet" arrives here as a fact, not as a
+    mystery 401 from the far side.
+
+    Stricter than the gateway's own scan on one point, deliberately: the
+    gateway treats a *missing* ``enabled`` as enabled
+    (``server.py``'s ``spec.get("enabled") is not False``), this treats any
+    falsy/absent value as not configured. Every rendered file in this estate
+    writes the key explicitly, so the two agree in practice; where they
+    could differ, a forwarder that holds a credential should fail closed.
+    """
+    if not APP_SLUG_RE.match(app_slug or ""):
+        return None, f"invalid app_slug '{app_slug}' for an app-mcp-json upstream"
+    path = os.path.join(_apps_root(), app_slug, "mcp.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except OSError:
+        return None, f"app '{app_slug}' is not installed (no rendered mcp.json)"
+    except ValueError:
+        return None, f"app '{app_slug}' has an unreadable mcp.json"
+
+    servers = doc.get("mcpServers") if isinstance(doc, dict) else None
+    spec = servers.get(server) if isinstance(servers, dict) else None
+    if not isinstance(spec, dict):
+        return None, f"app '{app_slug}' declares no MCP server '{server}'"
+    if not spec.get("enabled"):
+        return None, (f"upstream '{server}' of app '{app_slug}' is declared but "
+                      "disabled — not configured yet")
+    if spec.get("type") != "http":
+        return None, (f"upstream '{server}' of app '{app_slug}' declares type "
+                      f"'{spec.get('type')}', not 'http'")
+    url = spec.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return None, (f"upstream '{server}' of app '{app_slug}' declares no "
+                      "usable http(s) url")
+    raw_headers = spec.get("headers")
+    headers = ({str(k): str(v) for k, v in raw_headers.items()}
+               if isinstance(raw_headers, dict) else {})
+    return {"url": url, "headers": headers}, None
+
+
+def _parse_declared_body(resp: Any) -> tuple[dict | None, str | None]:
+    """A streamable-HTTP MCP response is either a JSON body or a one-event
+    SSE body — the same two shapes the gateway's ``HttpUpstream._parse_body``
+    handles (``upstream.py:455-466``)."""
+    text = resp.text or ""
+    content_type = resp.headers.get("content-type") or ""
+    if "text/event-stream" in content_type or text.lstrip().startswith("event:"):
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    return json.loads(line[len("data:"):].strip()), None
+                except ValueError:
+                    return None, "returned an SSE event that is not JSON"
+        return None, "returned an SSE body with no data: event"
+    try:
+        return resp.json(), None
+    except ValueError:
+        return None, "returned a non-JSON response"
+
+
+async def _call_declared(
+    app_slug: str, server: str, tool: str, args: dict, timeout_s: float,
+) -> tuple[dict | None, str | None]:
+    """One ``tools/call`` against an app's own declared streamable-HTTP MCP
+    endpoint, including the handshake that endpoint requires.
+
+    The far side is a real MCP-SDK server (``signoz/signoz-mcp-server``),
+    which rejects a bare ``tools/call`` POST: the sequence is ``initialize``
+    → ``notifications/initialized`` → ``tools/call``, with
+    ``Accept: application/json, text/event-stream`` throughout. Reference
+    implementation: ``aw-mcp-gateway/back/gateway/upstream.py:418-510``.
+
+    One :func:`asyncio.timeout` wraps the whole sequence, so the entry's
+    budget is total rather than per-request — three requests each allowed
+    the full ``timeout_s`` would silently treble it. Any ``Mcp-Session-Id``
+    the server issues is honoured for the remaining two requests of *this
+    call only* and never cached across calls (the gateway's recorded
+    session-collision incident, ``upstream.py:113-115``, is the argument
+    against getting clever here).
+
+    Never raises: every failure mode becomes ``(None, reason)``, same rule
+    as :func:`_call_mcp`. The headers are **exactly** the app's declared
+    ones plus content negotiation — ``AW_WORKSPACE_API_KEY`` is never
+    attached on this transport.
+    """
+    spec, reason = _declared_server(app_slug, server)
+    if spec is None:
+        return None, reason
+
+    label = f"{app_slug}/{server}"
+    url = spec["url"]
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **spec["headers"],
+    }
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with httpx.AsyncClient(timeout=timeout_s) as http_client:
+                resp = await http_client.post(url, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "aw-app-knowledgeable", "version": "1"},
+                    },
+                }, headers=headers)
+                if resp.status_code >= 400:
+                    return None, f"{label} initialize failed: HTTP {resp.status_code}"
+                init, parse_err = _parse_declared_body(resp)
+                if parse_err:
+                    return None, f"{label} {parse_err}"
+                init_err = (init or {}).get("error") if isinstance(init, dict) else None
+                if init_err:
+                    msg = (init_err or {}).get("message") or "unknown error"
+                    return None, f"{label} initialize failed: {msg}"
+                session_id = resp.headers.get("mcp-session-id")
+                if session_id:
+                    headers = {**headers, "Mcp-Session-Id": session_id}
+
+                # A notification has no response body to check, and a server
+                # that answers it oddly is not evidence about tools/call —
+                # the call itself is the verdict (design §6's "the forwarded
+                # call is the probe" rule, one layer down).
+                await http_client.post(url, json={
+                    "jsonrpc": "2.0", "method": "notifications/initialized",
+                }, headers=headers)
+
+                resp = await http_client.post(url, json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": args},
+                }, headers=headers)
+                if resp.status_code >= 400:
+                    return None, f"{label} not responding: HTTP {resp.status_code}"
+                data, parse_err = _parse_declared_body(resp)
+                if parse_err:
+                    return None, f"{label} {parse_err}"
+    except (TimeoutError, httpx.TimeoutException):
+        return None, f"timed out after {timeout_s:g}s"
+    except httpx.HTTPError as exc:
+        return None, f"{label} not responding: {exc}"
+    except Exception as exc:  # noqa: BLE001 — last resort, must not 500 the route
+        return None, f"{label} not responding: {exc}"
+
+    result = data.get("result") if isinstance(data, dict) else None
+    if result is None:
+        err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+        return None, err or "unknown error"
+    if result.get("isError"):
+        return None, _extract_text(result) or f"{tool} failed"
+    return result, None
+
+
+async def _call_entry(
+    entry: dict, tool: str, args: dict, timeout_s: float,
+) -> tuple[dict | None, str | None]:
+    """Transport dispatch — the one place ``transport`` is branched on.
+
+    An unknown value is reported **by name** and never falls back to
+    ``app-mcp``: that fallback would dial a loopback route a Tier-2 app
+    cannot have and then misattribute the 404 as "app not installed",
+    which is the exact misdiagnosis this transport exists to end.
+    """
+    transport = entry.get("transport") or TRANSPORT_APP_MCP
+    if transport == TRANSPORT_APP_MCP:
+        return await _call_mcp(
+            entry.get("app_slug") or entry.get("id") or "", tool, args, timeout_s)
+    if transport == TRANSPORT_APP_MCP_JSON:
+        # No fall back to ``id`` for the slug here, unlike ``app-mcp``: this
+        # slug selects which installed app's declaration (and therefore which
+        # URL and credential) is read, so guessing it from the entry's own
+        # name would silently resolve a *different* app. Absent is invalid,
+        # and _call_declared says so by name.
+        return await _call_declared(
+            entry.get("app_slug") or "", entry.get("server") or "", tool, args, timeout_s)
+    return None, (f"unknown transport '{transport}' for upstream "
+                  f"'{entry.get('id')}' — not forwarded")
+
+
 def _cache_get(upstream_id: str, probe_cfg: dict) -> tuple[bool, str | None] | None:
     """Fresh cache hit, honouring the success/failure TTLs — ``None`` means
     "no fresh entry, go probe for real" (design §6's call path)."""
@@ -225,7 +458,7 @@ async def forward(upstream_id: str, tool: str, args: dict) -> dict[str, Any]:
         return _unavailable(cached[1] or "unavailable")
 
     timeout_s = min(20.0, float(entry.get("timeout_s", 10)))
-    result, err = await _call_mcp(entry.get("app_slug", upstream_id), tool, args, timeout_s)
+    result, err = await _call_entry(entry, tool, args, timeout_s)
     if err:
         _cache_put(upstream_id, False, err)
         return _unavailable(err)
@@ -242,9 +475,17 @@ async def forward(upstream_id: str, tool: str, args: dict) -> dict[str, Any]:
 async def status_block() -> list[dict[str, Any]]:
     """``GET /status``'s ``forward_upstreams`` list — a dedicated
     ``probe.tool`` call per registry entry (never ``tools/list`` presence,
-    design §6), sharing the same cache ``forward()`` populates."""
-    out: list[dict[str, Any]] = []
-    for entry in _registry():
+    design §6), sharing the same cache ``forward()`` populates.
+
+    Entries are probed **concurrently**: probe timeouts are deliberately
+    generous (120s, so a slow-not-dead upstream doesn't poison the negative
+    cache — ``bug:knowledgeable-codegraph-probe-timeout-too-low``), and
+    serially that budget is additive — two cold entries would stack to four
+    minutes on one ``GET /status``. No timeout value changes here, only the
+    fact that they no longer queue. ``asyncio.gather`` preserves registry
+    order, so the rendered list is unchanged.
+    """
+    async def _row(entry: dict) -> dict[str, Any]:
         upstream_id = entry["id"]
         probe_cfg = entry.get("probe") or {}
         cached = _cache_get(upstream_id, probe_cfg)
@@ -254,13 +495,14 @@ async def status_block() -> list[dict[str, Any]]:
         else:
             tool = probe_cfg.get("tool") or "status"
             timeout_s = float(probe_cfg.get("timeout_s", 5))
-            _, err = await _call_mcp(entry.get("app_slug", upstream_id), tool, {}, timeout_s)
+            _, err = await _call_entry(entry, tool, {}, timeout_s)
             ok = err is None
             reason = err
             checked_at = time.time()
             _cache_put(upstream_id, ok, reason)
-        out.append({"id": upstream_id, "available": ok, "checked_at": checked_at, "reason": reason})
-    return out
+        return {"id": upstream_id, "available": ok, "checked_at": checked_at, "reason": reason}
+
+    return list(await asyncio.gather(*(_row(entry) for entry in _registry())))
 
 
 async def compose_knowledge_search(args: dict) -> tuple[str, bool]:
@@ -279,8 +521,6 @@ async def compose_knowledge_search(args: dict) -> tuple[str, bool]:
     full fused search into single-worker production aw-knowledgeable for
     nothing. ``code_only`` without ``include_code`` is ignored, same
     byte-identical-legacy rule as every other knob here."""
-    import asyncio
-
     from .mcp import client
 
     if not args.get("include_code"):

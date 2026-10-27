@@ -240,7 +240,7 @@
       "forward_upstreams": {
         "type": "array",
         "title": "Forwardable upstreams",
-        "description": "docs/design/knowledgeable-connector-tool-forwarder.md. Each entry is {id, transport, app_slug, tools (tool allow-list, each with a per-tool argument allow-list), probe {tool, ttl_ok_s, ttl_fail_s, timeout_s}, timeout_s, query_tool} \u2014 a forwarded `knowledge_search(include_code=true)` call reaches `http://127.0.0.1:$AW_PORT/api/apps/<app_slug>/mcp` with `X-Api-Key=$AW_WORKSPACE_API_KEY`, under this connector's own authorization, never the caller's. `transport` must be `app-mcp` (the only kind in v1 \u2014 any other installed app's own self-registered /mcp route; a non-app upstream is a new transport kind and deliberately a code change, aw-mcp-gateway's job instead). An unlisted tool or argument is rejected by name at the boundary, never silently dropped \u2014 `projectPath` is deliberately absent from codegraph's own arg allow-list below, since it would otherwise be a filesystem-read primitive over repos/**. `query_tool` ({tool, arg}, optional \u2014 docs/design/knowledgeable-knowledge-sources-registry.md \u00a74b) names which allow-listed tool and argument `POST /source-query` uses to answer a generic natural-language query for this upstream; absent entries fall back to the codegraph default. Ships with codegraph as the default first entry so this path is exercised, not dormant.",
+        "description": "docs/design/knowledgeable-connector-tool-forwarder.md + docs/design/knowledgeable-forwarder-declared-mcp-transport.md. Each entry is {id, transport, app_slug, tools (tool allow-list, each with a per-tool argument allow-list), probe {tool, ttl_ok_s, ttl_fail_s, timeout_s}, timeout_s, query_tool}. `transport` selects how the app's MCP surface is reached, and is the only field that changes the destination. Two kinds: `app-mcp` reaches `http://127.0.0.1:$AW_PORT/api/apps/<app_slug>/mcp` with `X-Api-Key=$AW_WORKSPACE_API_KEY`, under this connector's own authorization and never the caller's \u2014 only a Tier-1 app with `routes:register` can have that route. `app-mcp-json` adds a `server` field and resolves the URL, headers and enabled-state, fresh per call, from the installed app's rendered `apps/<app_slug>/mcp.json` (the file src/apps/mcp_template.py generates and aw-mcp-gateway's app-scan already trusts) \u2014 the transport a Tier-2 container app needs, since it runs no workspace-side code and so has no loopback route at all. An entry can never carry a URL or a header of its own, and `app-mcp-json` sends ONLY the headers the app declared: `AW_WORKSPACE_API_KEY` travels to 127.0.0.1 only, never to a declared endpoint. An unknown `transport` value is reported by name and never falls back to loopback. An unlisted tool or argument is rejected by name at the boundary, never silently dropped \u2014 `projectPath` is deliberately absent from codegraph's own arg allow-list below, since it would otherwise be a filesystem-read primitive over repos/**, and `filter`/`selectFields`/raw `start`/`end` are absent from signoz's for the same reason. `query_tool` ({tool, arg}, optional \u2014 docs/design/knowledgeable-knowledge-sources-registry.md \u00a74b) names which allow-listed tool and argument `POST /source-query` uses to answer a generic natural-language query for this upstream; absent entries fall back to the codegraph default. Ships with codegraph (app-mcp) and signoz (app-mcp-json) as defaults so both paths are exercised, not dormant.",
         "default": [
           {
             "id": "codegraph",
@@ -279,6 +279,49 @@
             "query_tool": {
               "tool": "codegraph_explore",
               "arg": "query"
+            }
+          },
+          {
+            "id": "signoz",
+            "transport": "app-mcp-json",
+            "app_slug": "signoz-connector",
+            "server": "signoz-query",
+            "tools": {
+              "signoz_list_services": {
+                "args": [
+                  "timeRange",
+                  "limit"
+                ]
+              },
+              "signoz_search_logs": {
+                "args": [
+                  "searchText",
+                  "service",
+                  "severity",
+                  "timeRange",
+                  "limit"
+                ]
+              },
+              "signoz_search_traces": {
+                "args": [
+                  "service",
+                  "operation",
+                  "error",
+                  "timeRange",
+                  "limit"
+                ]
+              }
+            },
+            "probe": {
+              "tool": "signoz_list_services",
+              "ttl_ok_s": 60,
+              "ttl_fail_s": 15,
+              "timeout_s": 120
+            },
+            "timeout_s": 10,
+            "query_tool": {
+              "tool": "signoz_search_logs",
+              "arg": "searchText"
             }
           }
         ],
