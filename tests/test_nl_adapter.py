@@ -800,3 +800,219 @@ def test_an_nl_false_entry_routes_through_the_adapter_and_never_a_500(
     assert body["status"] == "unavailable"
     assert nl_adapter.SECRET_NAME in body["reason"]
     assert body["adapter"] == {"rounds": 0, "tool_calls": []}
+
+
+# ---------------------------------------------------------------------------
+# Part 4 / N5b — the transport wrapper. `stream_solve` plus the route change,
+# and the one property the whole fix rests on: a streamed envelope parses to
+# byte-for-byte what a buffered one parsed to, because the only thing allowed
+# to precede it is JSON-legal whitespace (§22.1).
+# ---------------------------------------------------------------------------
+
+
+def _drain(agen) -> list[bytes]:
+    """Every chunk `stream_solve` yields, in order."""
+
+    async def _collect():
+        return [chunk async for chunk in agen]
+
+    return _run(_collect())
+
+
+def test_stream_solve_commits_the_head_before_awaiting_anything(monkeypatch):
+    """§25.2 — the first byte must leave before the loop is even started, so
+    the head frame crosses the relay's 30s deadline (aw-backend
+    workspace_tunnel_proxy.py:631) in <1s no matter how long the loop takes.
+    Asserted by making `solve` itself fail if it is reached before the first
+    chunk has been pulled."""
+    pulled: list[str] = []
+
+    async def _fake_solve(entry, *, query, code_query=""):
+        pulled.append("solve")
+        return {"status": "ok", "result": "x", "elapsed_ms": 1}
+
+    monkeypatch.setattr(nl_adapter, "solve", _fake_solve)
+
+    async def _first_chunk_only():
+        agen = nl_adapter.stream_solve(SIGNOZ_ENTRY, query="errors?")
+        first = await agen.__anext__()
+        assert pulled == [], "solve must not have been started by the first chunk"
+        await agen.aclose()
+        return first
+
+    assert _run(_first_chunk_only()) == nl_adapter._HEARTBEAT
+
+
+def test_stream_solve_heartbeats_while_the_loop_runs_then_yields_the_envelope(monkeypatch):
+    """The shape on the wire: heartbeat, heartbeats while it works, envelope.
+    Cadence is driven down to make the test fast; the real 10s vs the relay's
+    30s per-frame window is the headroom argument, not something a unit test
+    can observe."""
+    envelope = {"status": "ok", "result": "the real answer", "elapsed_ms": 41200,
+                "adapter": {"rounds": 3, "tool_calls": [{"tool": "signoz_search_logs", "ok": True}]}}
+
+    async def _slow_solve(entry, *, query, code_query=""):
+        await asyncio.sleep(0.07)
+        return envelope
+
+    monkeypatch.setattr(nl_adapter, "solve", _slow_solve)
+    monkeypatch.setattr(nl_adapter, "HEARTBEAT_INTERVAL_S", 0.01)
+
+    chunks = _drain(nl_adapter.stream_solve(SIGNOZ_ENTRY, query="errors?"))
+
+    assert chunks[0] == nl_adapter._HEARTBEAT
+    assert len(chunks) > 2, f"expected heartbeats while the loop ran, got {chunks!r}"
+    assert all(c == nl_adapter._HEARTBEAT for c in chunks[:-1])
+    # The envelope is unchanged, and the whole body still parses as the same
+    # object — that is what keeps the fan-out's `resp.json()`,
+    # `_coerce_source_payload`, the 256KB guard and sources-digest untouched.
+    assert json.loads(b"".join(chunks).decode()) == envelope
+
+
+def test_every_chunk_before_the_envelope_is_json_leading_whitespace(monkeypatch):
+    """The property the fix is cheap because of, pinned directly: emit one
+    byte that is not JSON-leading whitespace and the receiving `resp.json()`
+    stops parsing the same envelope."""
+    async def _slow_solve(entry, *, query, code_query=""):
+        await asyncio.sleep(0.05)
+        return {"status": "ok", "result": "x", "elapsed_ms": 1}
+
+    monkeypatch.setattr(nl_adapter, "solve", _slow_solve)
+    monkeypatch.setattr(nl_adapter, "HEARTBEAT_INTERVAL_S", 0.01)
+
+    chunks = _drain(nl_adapter.stream_solve(SIGNOZ_ENTRY, query="errors?"))
+    prefix = b"".join(chunks[:-1])
+
+    assert prefix, "there should be at least the immediate head byte"
+    assert prefix.strip() == b"", f"non-whitespace reached the wire before the envelope: {prefix!r}"
+    assert chunks[-1].lstrip().startswith(b"{")
+
+
+def test_a_failure_after_the_head_is_committed_is_an_unavailable_envelope(monkeypatch):
+    """§25.4, the sharpest edge in N5b: status 200 is already spent, so an
+    exception from `solve` — which it is not supposed to be able to raise —
+    must still arrive as a well-formed `unavailable` envelope in the BODY,
+    not as an HTTP error and not as a truncated body that the fan-out leg
+    would misreport as "response was not JSON"."""
+    async def _exploding_solve(entry, *, query, code_query=""):
+        raise RuntimeError("boom, after the head")
+
+    monkeypatch.setattr(nl_adapter, "solve", _exploding_solve)
+
+    chunks = _drain(nl_adapter.stream_solve(SIGNOZ_ENTRY, query="errors?"))
+    body = json.loads(b"".join(chunks).decode())
+
+    assert body["status"] == "unavailable"
+    assert "after the response head was committed" in body["reason"]
+    assert "RuntimeError: boom, after the head" in body["reason"]
+    assert body["adapter"] == {"rounds": 0, "tool_calls": []}
+    assert isinstance(body["elapsed_ms"], int)
+
+
+def test_an_unserializable_envelope_still_arrives_as_an_unavailable_envelope(monkeypatch):
+    """Same reason as above, one layer further out — the backstop in
+    `_render_envelope`. A `TypeError` from `json.dumps` after the head is
+    committed would truncate the body too."""
+    async def _bad_envelope(entry, *, query, code_query=""):
+        return {"status": "ok", "result": object(), "elapsed_ms": 1}
+
+    monkeypatch.setattr(nl_adapter, "solve", _bad_envelope)
+
+    body = json.loads(b"".join(_drain(nl_adapter.stream_solve(SIGNOZ_ENTRY, query="x"))).decode())
+
+    assert body["status"] == "unavailable"
+    assert "did not serialize" in body["reason"]
+
+
+def test_closing_the_stream_cancels_the_adapter_loop(monkeypatch):
+    """A client disconnect must abandon the in-flight `/v1` round rather than
+    leave it running against a reader that is gone (§22.1)."""
+    state: dict = {}
+
+    async def _never_finishes(entry, *, query, code_query=""):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        return {}
+
+    monkeypatch.setattr(nl_adapter, "solve", _never_finishes)
+    monkeypatch.setattr(nl_adapter, "HEARTBEAT_INTERVAL_S", 0.01)
+
+    async def _open_then_close():
+        agen = nl_adapter.stream_solve(SIGNOZ_ENTRY, query="errors?")
+        await agen.__anext__()          # head
+        await agen.__anext__()          # first heartbeat — the loop is running
+        await agen.aclose()
+        await asyncio.sleep(0.01)       # let the cancellation land
+
+    _run(_open_then_close())
+
+    assert state.get("cancelled") is True
+
+
+def test_the_adapter_branch_streams_and_parses_to_the_same_envelope(
+        source_query_client, monkeypatch):
+    """End to end through the route: NL-false answers 200 with a whitespace-
+    prefixed body that `resp.json()` reads as the unchanged envelope."""
+    tc, ctx = source_query_client
+    ctx.config = {"forward_upstreams": [SIGNOZ_ENTRY]}
+    envelope = {"status": "ok", "result": "real errors", "elapsed_ms": 45000,
+                "adapter": {"rounds": 4, "tool_calls": []}}
+
+    async def _fake_solve(entry, *, query, code_query=""):
+        assert query == "quais erros estão acontecendo na aplicação"
+        return envelope
+
+    monkeypatch.setattr(nl_adapter, "solve", _fake_solve)
+
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "signoz", "query": "quais erros estão acontecendo na aplicação"},
+        headers={"x-internal-secret": "shh"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.content.startswith(b" "), f"the head byte should lead: {resp.content[:20]!r}"
+    assert resp.json() == envelope
+
+
+def test_the_legacy_branch_is_still_buffered_with_no_leading_whitespace(
+        source_query_client, monkeypatch):
+    """§25.3 — the cheap proxy for "byte-identical": codegraph is the leg that
+    already works and its response must not change shape at all, so byte 0 is
+    still `{` and there is no transfer-encoding change."""
+    tc, ctx = source_query_client
+    ctx.config = {"forward_upstreams": [LEGACY_ENTRY]}
+
+    async def fake_forward(upstream_id, tool, args):
+        return {"status": "ok", "result": "3847 files indexed", "elapsed_ms": 12}
+
+    monkeypatch.setattr(routes_mod.forwarding, "forward", fake_forward)
+    resp = tc.post(
+        "/source-query",
+        json={"source_id": "codegraph", "query": "how does auth work"},
+        headers={"x-internal-secret": "shh"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.content[:1] == b"{"
+    assert resp.headers.get("content-length") is not None
+    assert resp.json() == {"status": "ok", "result": "3847 files indexed", "elapsed_ms": 12}
+
+
+def test_auth_and_validation_still_answer_before_any_stream_begins(source_query_client):
+    """§25.3 — only the adapter execution moved inside the generator; a bad
+    secret is still a real 403 and a missing field still a real 400, not a
+    200 with an envelope."""
+    tc, ctx = source_query_client
+    ctx.config = {"forward_upstreams": [SIGNOZ_ENTRY]}
+
+    bad_secret = tc.post("/source-query", json={"source_id": "signoz", "query": "x"},
+                         headers={"x-internal-secret": "wrong"})
+    assert bad_secret.status_code == 403
+
+    no_query = tc.post("/source-query", json={"source_id": "signoz"},
+                       headers={"x-internal-secret": "shh"})
+    assert no_query.status_code == 400

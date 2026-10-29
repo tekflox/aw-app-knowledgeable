@@ -38,14 +38,23 @@ Both bounds are enforced: ``max_rounds`` AND ``budget_s`` wall clock, checked
 before every round and passed as that round's HTTP timeout — an ap-mt call can
 land minutes late (``apmt-mcp-write-timeouts-can-land-minutes-late``), so a
 round count alone does not bound this (§9.3).
+
+Since Part 4 (N5b) :func:`solve` is not what ``/source-query`` returns on this
+branch — :func:`stream_solve` is, wrapped in a ``StreamingResponse``. The
+envelope is byte-for-byte the same; it just arrives after a leading run of
+JSON-legal whitespace, because the response head has to leave the workspace
+within the relay's 30s head-frame deadline while the loop itself takes ~90s.
+See that function for the whole transport argument.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -495,3 +504,144 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
         # the log, rather than crashing the fan-out leg.
         log.exception("nl adapter %r: unexpected failure", source_id)
         return _unavailable(f"unexpected failure: {type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# The transport wrapper — docs/design/knowledgeable-nl-tool-adapter.md Part 4
+# (N5b), §22.1
+# ---------------------------------------------------------------------------
+
+#: Seconds between keep-alive bytes while the loop runs.
+#:
+#: **Pinned against aw-backend's relay**, which is the only reason this number
+#: exists: ``aw-backend/src/api/routes/workspace_tunnel_proxy.py:195``
+#: ``HTTP_TIMEOUT_S = 30.0`` is a *per-frame idle* deadline — 30s for the head
+#: frame (:631) and a fresh 30s for every body frame after it (:659) — not a
+#: total budget. 10s therefore leaves 3x headroom. If anyone lowers that
+#: constant below this cadence, adapter legs start dying obscurely (§24); the
+#: comment there names this one back.
+HEARTBEAT_INTERVAL_S = 10.0
+
+#: One space. The ONLY thing that may precede the envelope on the wire:
+#: leading whitespace is a JSON-legal prefix, so aw-knowledgeable's fan-out
+#: leg (``backend/app/api/sources.py`` ``_query_one_inside_cap`` → ``resp
+#: .json()``) parses byte-for-byte the envelope it parsed before N5b, and the
+#: 256KB response guard, ``_coerce_source_payload`` passthrough and
+#: sources-digest all keep working untouched. Anything that is not JSON-
+#: leading whitespace would break that property and with it the whole reason
+#: this fix is cheap (§22.1).
+_HEARTBEAT = b" "
+
+
+def _render_envelope(envelope: Any) -> bytes:
+    """The envelope as the bytes ``JSONResponse`` would have produced for it
+    (same ``json.dumps`` kwargs as ``starlette.responses.JSONResponse
+    .render``), so the only difference between a streamed and a buffered
+    envelope on the wire is the leading whitespace.
+
+    Falls back to an ``unavailable`` envelope of its own if the real one will
+    not serialize, for the same reason as §25.4: once the head is committed
+    the body is the only honest failure channel left — a raised
+    ``TypeError`` here would truncate the response and the leg would report
+    "response was not JSON" instead of the reason.
+    """
+    try:
+        return json.dumps(
+            envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        log.exception("nl adapter: the response envelope did not serialize")
+        return json.dumps({
+            "status": "unavailable",
+            "reason": (
+                "nl adapter: the response envelope did not serialize: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "adapter": {"rounds": 0, "tool_calls": []},
+        }).encode("utf-8")
+
+
+async def stream_solve(
+    entry: dict, *, query: str, code_query: str = ""
+) -> AsyncIterator[bytes]:
+    """:func:`solve`, re-shaped as a ``StreamingResponse`` body so the response
+    HEAD leaves this workspace immediately and the adapter's full 90s budget
+    survives the tunnel (Part 4 §22).
+
+    The ~30s ceiling N4 measured is **not** the edge: it is a property of
+    *buffered* responses crossing aw-backend's relay, which grants 30s to the
+    head frame and a fresh 30s per body frame (see
+    :data:`HEARTBEAT_INTERVAL_S`), while the workspace-side Go client
+    deliberately sets no client timeout at all and Caddy allows 3600s. A
+    buffered ``/source-query`` sends no headers for ~90s, so only the head
+    frame misses its deadline — hence QA's 502 at exactly 30042ms. Commit the
+    head now, keep the connection warm with :data:`_HEARTBEAT`, and the
+    existing already-deployed tunnel carries this for as long as the loop
+    needs.
+
+    Three properties this generator has to hold, in the order they bite:
+
+    * **The first byte leaves before anything is awaited** (§25.2). Starlette
+      sends ``http.response.start`` when this generator is first pulled, and
+      an immediate heartbeat also forces the server to flush it onto the
+      socket, so the head frame crosses in <1s regardless of server quirks.
+    * **Nothing after that can become an HTTP error** (§25.4). Status 200 is
+      already promised — which is the never-raise contract anyway (§9.5), now
+      structural rather than merely contractual — so every failure, including
+      one :func:`solve` itself never anticipated, is serialized as an
+      ``unavailable`` envelope in the BODY. An escaped exception would
+      truncate the body and the fan-out leg would report "response was not
+      JSON" instead of the honest reason.
+    * **A client disconnect cancels the loop.** The adapter's in-flight
+      ``/v1`` round is abandoned rather than left running against a reader
+      that is gone (§9.2's negative-probe-cache note still applies to the
+      next caller).
+
+    Auth and request validation stay in the route, BEFORE this generator is
+    ever constructed, so a 403/400 is still a real 403/400 (§25.3). Only the
+    adapter execution moved in here, and only on the NL-false branch: the
+    legacy NL-true branch stays buffered and byte-identical.
+    """
+    # §25.2 — before any await, including the one that starts the loop.
+    yield _HEARTBEAT
+
+    start = time.monotonic()
+    source_id = str(entry.get("id") or "")
+    task = asyncio.ensure_future(solve(entry, query=query, code_query=code_query))
+    envelope: Any
+    try:
+        while not task.done():
+            # `asyncio.wait` returns on timeout and never re-raises the
+            # awaited task's exception, so the heartbeat loop itself can
+            # never be the thing that breaks the stream.
+            await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_S)
+            if not task.done():
+                yield _HEARTBEAT
+        envelope = task.result()
+    except (GeneratorExit, asyncio.CancelledError):
+        task.cancel()
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        # Deliberately BaseException, not Exception: `solve` already catches
+        # every `Exception`, so anything arriving here is by definition
+        # something nobody anticipated — and the one thing it must not do is
+        # escape, because the status code is spent. Cancellation and
+        # generator close are handled above, so they still propagate.
+        log.exception(
+            "nl adapter %r: failure after the response head was committed", source_id
+        )
+        envelope = {
+            "status": "unavailable",
+            "reason": (
+                "nl adapter: failure after the response head was committed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+            "adapter": {"rounds": 0, "tool_calls": []},
+        }
+
+    yield _render_envelope(envelope)

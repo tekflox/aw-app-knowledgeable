@@ -26,7 +26,7 @@ import logging
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from . import (
     bulk_ingest,
@@ -293,6 +293,13 @@ def build_routes(ctx) -> FastAPI:
         plus an additive ``adapter`` telemetry block. Both branches keep this
         route's never-raise contract: a failure is an ``unavailable``
         envelope, never a 500 (§9.5).
+
+        Since Part 4 (N5b) the adapter branch additionally **streams**: the
+        head commits immediately and the envelope arrives after a run of
+        JSON-legal whitespace, so a ~90s adapter call survives the tunnel
+        relay's per-frame deadline. The envelope itself is unchanged, and the
+        legacy branch is untouched — but any consumer of this route must
+        JSON-parse the body and must not assume byte 0 is ``{`` (§24).
         """
         provided = request.headers.get("x-internal-secret", "")
         expected = ctx.secrets.read(SECRET_KEY) or ""
@@ -318,7 +325,19 @@ def build_routes(ctx) -> FastAPI:
         # leg that works end to end today", asserted rather than hoped (§9.6).
         from . import nl_adapter  # noqa: PLC0415
 
-        return await nl_adapter.solve(entry, query=query, code_query=code_query)
+        # Part 4 §22.1 (N5b) — the adapter branch, and ONLY the adapter
+        # branch, streams: status 200 and the headers commit on the first
+        # byte, one whitespace keep-alive every
+        # `nl_adapter.HEARTBEAT_INTERVAL_S` while the ~90s loop runs, then
+        # the unchanged envelope. A buffered response sends no head for 90s,
+        # which is the single reason this leg died HTTP 502 at 30042ms (the
+        # relay's head-frame deadline, not the edge — see `stream_solve`).
+        # Both the auth check and the validation above stay OUTSIDE the
+        # generator, so a 403/400 is still a real 403/400 (§25.3).
+        return StreamingResponse(
+            nl_adapter.stream_solve(entry, query=query, code_query=code_query),
+            media_type="application/json",
+        )
 
     # ------------------------------------------------------------------
     # §13 — the KB bulk-ingest driver. Both doors (the `knowledgeable-ingest`

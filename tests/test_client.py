@@ -44,7 +44,10 @@ class _FakeAsyncClient:
     _QUEUE: list = []
 
     def __init__(self, *args, **kwargs):
-        pass
+        # `timeout=` is a constructor argument on httpx.AsyncClient, not a
+        # per-request one, so it has to be captured here to be assertable at
+        # all (N5b asserts on it — see the omitted-`budget_ms` tests).
+        self._timeout = kwargs.get("timeout")
 
     async def __aenter__(self):
         return self
@@ -66,6 +69,7 @@ class _FakeAsyncClient:
                 "files": files,
                 "params": params,
                 "data": data,
+                "timeout": self._timeout,
             }
         )
         return _FakeAsyncClient._QUEUE.pop(0)
@@ -1110,13 +1114,41 @@ def test_knowledge_sources_requires_a_query():
     assert _FakeAsyncClient._CALLS == []
 
 
-def test_knowledge_sources_posts_query_and_default_budget_ms():
+def test_knowledge_sources_omits_budget_ms_when_the_caller_did_not_send_one():
+    """Part 4 §22.1 root cause 1, inverted from what this test used to assert.
+
+    It pinned `budget_ms: 15000` on every call — and since the server's own
+    default is `body.budget_ms or default_budget_ms`, always sending a number
+    meant aw-knowledgeable's row-aware default (120s when an adapter source
+    is in the resolved set) could never be reached. Absence has to travel.
+    """
     _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"sources": []}))
     _run(client.knowledge_sources({"query": "how does the checkout flow work"}))
     call = _FakeAsyncClient._CALLS[0]
     assert call["method"] == "POST"
     assert call["url"].endswith("/api/knowledge/sources/query")
-    assert call["json"] == {"query": "how does the checkout flow work", "budget_ms": 15000}
+    assert call["json"] == {"query": "how does the checkout flow work"}
+    # §25.5 — the timeout derivation must survive the omitted case rather
+    # than KeyError on the exact call shape the fix above creates, and must
+    # still cover the server's own 150s ceiling.
+    assert call["timeout"] == client.SERVER_CAPPED_BUDGET_TIMEOUT_S
+
+
+def test_knowledge_sources_treats_an_explicit_zero_budget_as_absent():
+    """Same reason the server does: `body.budget_ms or default` reads 0 as
+    "not given", so forwarding it would be a number that changes nothing
+    while looking like an override."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"sources": []}))
+    _run(client.knowledge_sources({"query": "sushi", "budget_ms": 0}))
+    assert _FakeAsyncClient._CALLS[0]["json"] == {"query": "sushi"}
+
+
+def test_knowledge_sources_derives_its_timeout_from_an_explicit_budget():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"sources": []}))
+    _run(client.knowledge_sources({"query": "sushi", "budget_ms": 100000}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["json"] == {"query": "sushi", "budget_ms": 100000}
+    assert call["timeout"] == 110.0
 
 
 def test_knowledge_sources_forwards_every_optional_field():
@@ -1138,7 +1170,7 @@ def test_knowledge_sources_only_forwards_known_fields():
     _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"sources": []}))
     _run(client.knowledge_sources({"query": "sushi", "_gateway_caller_run_id": "run-xyz"}))
     call = _FakeAsyncClient._CALLS[0]
-    assert call["json"] == {"query": "sushi", "budget_ms": 15000}
+    assert call["json"] == {"query": "sushi"}
 
 
 def test_knowledge_sources_reports_the_backend_error_text():

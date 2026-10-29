@@ -27,6 +27,15 @@ import httpx
 
 DEFAULT_BASE_URL = "http://aw-knowledgeable:8090"
 
+#: HTTP timeout for a `knowledge_sources` call that did NOT pass a
+#: `budget_ms`, i.e. one where the server picks its own row-aware default
+#: (docs/design/knowledgeable-nl-tool-adapter.md Part 4 §22.1). There is no
+#: number of ours to derive headroom from in that case, so this covers
+#: aw-knowledgeable's own ceiling — `sources.py MAX_BUDGET_MS = 150_000`,
+#: which no server-side default can exceed — plus 10s of slack, the same
+#: slack the explicit-budget branch adds.
+SERVER_CAPPED_BUDGET_TIMEOUT_S = 160.0
+
 _base_url_resolver: Callable[[], str] = lambda: DEFAULT_BASE_URL
 _secret_resolver: Callable[[], str] = lambda: ""
 
@@ -1320,7 +1329,20 @@ async def knowledge_sources(args: dict) -> tuple[str, bool]:
     if not query:
         return "query is required", True
 
-    body: dict = {"query": query, "budget_ms": args.get("budget_ms") or 15000}
+    body: dict = {"query": query}
+    # `budget_ms` is forwarded ONLY when the caller actually provided one
+    # (docs/design/knowledgeable-nl-tool-adapter.md Part 4 §22.1, root cause
+    # 1). This used to read `args.get("budget_ms") or 15000`, which sent a
+    # number on every single call — and the server's own default is
+    # `body.budget_ms or default_budget_ms`, so that `or` branch could never
+    # be taken and aw-knowledgeable's row-aware default (sources.py
+    # `ADAPTER_DEFAULT_BUDGET_MS = 120_000` when the resolved set contains an
+    # adapter source, 15_000 otherwise) was permanently defeated: every leg
+    # stayed capped at 15s no matter what the registry declared. An explicit
+    # 0 counts as absent here for exactly the same reason it does
+    # server-side.
+    if args.get("budget_ms"):
+        body["budget_ms"] = args["budget_ms"]
     if args.get("code_query"):
         body["code_query"] = args["code_query"]
     if args.get("workspace_slugs"):
@@ -1329,10 +1351,21 @@ async def knowledge_sources(args: dict) -> tuple[str, bool]:
         body["source_ids"] = args["source_ids"]
 
     # Same headroom rule `knowledge_search_data` follows: the server clamps
-    # budget at 20s and per-source at 10s (aw-knowledgeable's sources.py), so
-    # this connector's own timeout must never be the thing that cuts the
-    # request short. No upper cap.
-    timeout = max(30.0, body["budget_ms"] / 1000.0 + 10.0)
+    # budget at `MAX_BUDGET_MS` (150s since N3) and derives each per-source
+    # timeout from it, so this connector's own timeout must never be the
+    # thing that cuts the request short. No upper cap.
+    #
+    # With `budget_ms` omitted there is no number of ours to derive from —
+    # the server picks its own, up to that same 150s cap — so cover the cap
+    # plus slack rather than a value we did not send. (Reading
+    # `body["budget_ms"]` here is what would KeyError on the exact call shape
+    # the fix above creates; §25.5.)
+    budget_ms = body.get("budget_ms")
+    timeout = (
+        max(30.0, budget_ms / 1000.0 + 10.0)
+        if budget_ms is not None
+        else SERVER_CAPPED_BUDGET_TIMEOUT_S
+    )
 
     data, err = await _post_json("/api/knowledge/sources/query", body, timeout=timeout)
     if err:
@@ -1785,8 +1818,10 @@ TOOLS_SCHEMA = [
             "required, the question as asked. code_query: optional code-side "
             "phrasing (a symbol, file or function name) when it should differ from "
             "query. workspace_slugs / source_ids: optional narrowing; omitted asks "
-            "every enabled source. budget_ms: wall-clock budget, default 15000 "
-            "(service caps at 20000). Returns the raw envelope {\"sources\": "
+            "every enabled source. budget_ms: wall-clock budget — omit it and the "
+            "service picks per the sources it resolves (120000 when one of them is "
+            "a tool-calling adapter source, 15000 otherwise), which is almost "
+            "always what you want; it caps at 150000. Returns the raw envelope {\"sources\": "
             "[{workspace_slug, source_id, app_slug, status, result|reason}, ...]} "
             "— one section per source, never fused with knowledge-graph chunks. "
             "Zero registered sources is a normal {\"sources\": []} answer, not an "
@@ -1822,8 +1857,12 @@ TOOLS_SCHEMA = [
                 "budget_ms": {
                     "type": "integer",
                     "description": (
-                        "Wall-clock budget for the whole fan-out. Default 15000; the "
-                        "service itself caps at 20000."
+                        "Wall-clock budget for the whole fan-out. OMIT to get the "
+                        "service's row-aware default — 120000 when the resolved set "
+                        "contains a tool-calling adapter source (which needs several "
+                        "LLM rounds), 15000 when it does not. Sending a value "
+                        "overrides that for every source in the fan-out; the service "
+                        "caps it at 150000."
                     ),
                 },
             },
