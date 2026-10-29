@@ -101,12 +101,13 @@ def _fresh_fake_client(monkeypatch):
     client.configure(lambda: client.DEFAULT_BASE_URL, lambda: "")
 
 
-def test_all_fourteen_tools_are_advertised_and_dispatchable():
+def test_all_fifteen_tools_are_advertised_and_dispatchable():
     names = {t["name"] for t in client.TOOLS_SCHEMA}
     assert names == {
         "upload_document", "create_node", "create_link",
         "get_graph", "list_documents", "search_nodes", "search_graph",
-        "knowledge_search", "knowledge_sources", "search_execution_graph", "exec_run_detail",
+        "knowledge_search", "knowledge_sources", "knowledge_sources_catalog",
+        "search_execution_graph", "exec_run_detail",
         "list_pending_deletions", "approve_pending_deletions",
         "decline_pending_deletions",
     }
@@ -990,7 +991,7 @@ def test_initialize_and_tools_list():
     init = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
     assert init["result"]["serverInfo"]["name"] == "aw-knowledgeable"
     listed = _run(http_handler.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
-    assert len(listed["result"]["tools"]) == 14
+    assert len(listed["result"]["tools"]) == 15
 
 
 def test_initialized_notification_gets_no_response():
@@ -1152,3 +1153,65 @@ def test_knowledge_sources_returns_empty_envelope_without_an_error_flag():
     text, is_error = _run(client.knowledge_sources({"query": "sushi"}))
     assert not is_error
     assert json.loads(text) == {"sources": [], "reason": "no enabled sources"}
+
+
+# ---------------------------------------------------------------------------
+# knowledge_sources_catalog (S1, docs/design/knowledgeable-nl-tool-adapter.md
+# §13.2) — GET /api/knowledge/sources/catalog, no arguments, no tool
+# execution. 1:1 HTTP mapping, same shape as list_documents' `_get` call.
+# ---------------------------------------------------------------------------
+
+
+def test_knowledge_sources_catalog_takes_no_arguments_and_gets_the_catalog():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"workspaces": []}))
+    text, is_error = _run(client.knowledge_sources_catalog({}))
+    assert is_error is False
+    assert json.loads(text) == {"workspaces": []}
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://aw-knowledgeable:8090/api/knowledge/sources/catalog"
+    assert call["headers"] == {"X-Internal-Secret": "s3cr3t"}
+
+
+def test_knowledge_sources_catalog_ignores_gateway_injected_extras():
+    """Same D2-risk-4 rule as every other tool here — this one has no real
+    arguments to begin with, so the only thing worth proving is that an
+    extra key never changes the request `_get` sends."""
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"workspaces": []}))
+    _run(client.knowledge_sources_catalog({"_gateway_caller_run_id": "run-xyz"}))
+    call = _FakeAsyncClient._CALLS[0]
+    assert call["params"] is None
+
+
+def test_knowledge_sources_catalog_reports_the_backend_error_text():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(403, {"detail": "bucket hidden from this key"}))
+    text, is_error = _run(client.knowledge_sources_catalog({}))
+    assert is_error
+    assert "bucket hidden from this key" in text
+
+
+def test_knowledge_sources_catalog_returns_the_real_shape_from_the_route():
+    body = {
+        "workspaces": [
+            {"workspace_slug": "aw", "reachable": True, "sources": [
+                {"source_id": "signoz", "app_slug": "signoz-connector", "enabled": True,
+                 "accepts_natural_language": False, "problem_domain": "observability"},
+                {"source_id": "codegraph", "app_slug": "codegraph", "enabled": True,
+                 "accepts_natural_language": True, "problem_domain": "code structure"},
+            ]},
+        ]
+    }
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, body))
+    text, is_error = _run(client.knowledge_sources_catalog({}))
+    assert not is_error
+    assert json.loads(text) == body
+
+
+def test_knowledge_sources_catalog_dispatches_through_the_mcp_handler():
+    _FakeAsyncClient._QUEUE.append(_FakeResponse(200, {"workspaces": []}))
+    resp = _run(http_handler.handle_request({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "knowledge_sources_catalog", "arguments": {}},
+    }))
+    assert resp["result"]["isError"] is False
+    assert "workspaces" in resp["result"]["content"][0]["text"]

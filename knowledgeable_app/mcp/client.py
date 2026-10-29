@@ -1340,6 +1340,20 @@ async def knowledge_sources(args: dict) -> tuple[str, bool]:
     return _as_text(data), False
 
 
+async def knowledge_sources_catalog(args: dict) -> tuple[str, bool]:
+    """GET /api/knowledge/sources/catalog — the read-only, no-tool-execution
+    sibling of `knowledge_sources` (docs/design/knowledgeable-nl-tool-
+    adapter.md §13.2), for the pre-synthesis planner's gap analysis: which
+    sources this tenant has registered, and each one's `problem_domain` /
+    `accepts_natural_language` to route on. Takes no arguments; every
+    request is the same question.
+    """
+    data, err = await _get("/api/knowledge/sources/catalog")
+    if err:
+        return f"knowledge_sources_catalog failed: {err}", True
+    return _as_text(data), False
+
+
 def _as_text(data) -> str:
     import json
 
@@ -1815,6 +1829,19 @@ TOOLS_SCHEMA = [
             },
             "required": ["query"],
         },
+    },
+    {
+        "name": "knowledge_sources_catalog",
+        "description": (
+            "Read-only catalog of every external knowledge source this tenant has "
+            "registered, across every workspace that has synced — no tool execution, "
+            "no query sent anywhere. Takes no arguments. Returns {\"workspaces\": "
+            "[{workspace_slug, reachable, sources: [{source_id, app_slug, enabled, "
+            "accepts_natural_language, problem_domain}]}]}. Use this to decide WHICH "
+            "registered sources (by problem_domain) are worth asking before calling "
+            "`knowledge_sources` — it never answers a question itself."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "search_execution_graph",

@@ -326,7 +326,7 @@
               "signoz_get_field_values": {
                 "args": [
                   "signal",
-                  "key",
+                  "name",
                   "searchText",
                   "limit"
                 ],

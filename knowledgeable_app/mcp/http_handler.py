@@ -36,6 +36,10 @@ _DISPATCH = {
     # /api/knowledge/sources/query, composes nothing, so it dispatches
     # straight to client.py like every other non-composed tool above.
     "knowledge_sources": client.knowledge_sources,
+    # S1 (docs/design/knowledgeable-nl-tool-adapter.md §13.2) — the catalog's
+    # key-auth GET mirrored 1:1, same dispatch shape as `knowledge_sources`
+    # above: no composition, straight to client.py.
+    "knowledge_sources_catalog": client.knowledge_sources_catalog,
     # §9 step 4 (docs/design/execution-history-in-production-neo4j.md) — the
     # agent-facing surface over the exec subgraph the sync engine's own calls
     # in client.py already populate. Same dispatch shape as every read-only
