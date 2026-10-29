@@ -571,9 +571,12 @@ def test_an_unlabelled_forced_final_is_labelled_in_code(monkeypatch):
     assert out["adapter"]["partial"] is True
 
 
-def test_the_model_is_told_its_round_and_remaining_budget_every_round(monkeypatch):
-    """§32 D2's self-pacing. Today the model cannot know it is near a cliff —
-    both failing legs were still mid-exploration at 90s."""
+def test_self_pacing_was_removed_the_model_is_not_told_its_round_or_budget(monkeypatch):
+    """Self-pacing taxed the easy path by about one extra round for a benefit
+    the forced final already delivers in code (card
+    fix:knowledgeable-adapter-self-pacing-easy-path-tax) — deleted, not made
+    conditional. Neither the first message nor a round's feedback may carry
+    the per-round round/budget disclosure any more."""
     _script_clock(monkeypatch, [0.0, 0.0, 12.0, 12.0, 12.0])
     chat = _script_chat(monkeypatch, [
         _action("signoz_list_services", timeRange="24h"),
@@ -583,10 +586,13 @@ def test_the_model_is_told_its_round_and_remaining_budget_every_round(monkeypatc
 
     _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
 
-    assert "Round 1 of 6; about 90s of budget remain." in chat[0]["messages"][1]["content"]
+    assert "Round" not in chat[0]["messages"][1]["content"]
+    assert "budget remain" not in chat[0]["messages"][1]["content"]
     feedback = chat[1]["messages"][-1]["content"]
-    assert "Round 2 of 6; about 78s of budget remain." in feedback
-    assert "at most 4 more tool call(s) will be executed" in feedback
+    assert "Round" not in feedback
+    assert "budget remain" not in feedback
+    assert "more tool call(s) will be executed" not in feedback
+    assert feedback.endswith("Reply with ONE JSON object: another action, or the final answer.")
 
 
 def test_a_tiny_budget_still_gets_one_exploring_round_before_it_lands(monkeypatch):

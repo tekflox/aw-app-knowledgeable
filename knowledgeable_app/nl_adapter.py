@@ -45,8 +45,7 @@ are reserved for one forced final — "answer now from what you have" — whose
 result is labelled as partial and flagged ``adapter.partial``. It is gated in
 code on at least one successful tool call (§32 D2), because a confident partial
 synthesised from nothing is a worse failure than the honest ``unavailable`` it
-would replace. Each round also tells the model where it is and what is left, so
-it can wrap up on its own rather than being cut off mid-exploration.
+would replace.
 
 Since Part 4 (N5b) :func:`solve` is not what ``/source-query`` returns on this
 branch — :func:`stream_solve` is, wrapped in a ``StreamingResponse``. The
@@ -415,20 +414,6 @@ def _final_out(text: str) -> dict[str, Any]:
     return out
 
 
-def _pacing_line(round_number: int, max_rounds: int, remaining: float) -> str:
-    """§32 D2's self-pacing, the one option-3 change with evidence behind it.
-
-    Today the model cannot know it is near a cliff — the two legs that failed
-    the measurement were still mid-exploration at 90s — so it has no way to
-    wrap up. One line per round, stating where it is and what is left.
-    """
-    return (
-        f"Round {round_number} of {max_rounds}; about {max(0.0, remaining):.0f}s of budget "
-        f"remain. The last round is reserved for your final answer, so at most "
-        f"{max(0, max_rounds - round_number)} more tool call(s) will be executed."
-    )
-
-
 def _forced_kind(rounds: int, max_rounds: int, remaining: float) -> str:
     """Why this round must be the forced final — ``"budget"``, ``"rounds"``, or
     ``""`` when the loop may keep exploring (§32 D2).
@@ -542,9 +527,7 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
             {"role": "system", "content": system_prompt(entry)},
             {
                 "role": "user",
-                "content": _first_user_message(query, code_query)
-                + "\n\n"
-                + _pacing_line(1, max_rounds, budget_s),
+                "content": _first_user_message(query, code_query),
             },
         ]
         unparsable_streak = 0
@@ -661,9 +644,6 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
                 "role": "user",
                 "content": (
                     feedback
-                    + "\n\n"
-                    + _pacing_line(rounds + 1, max_rounds,
-                                   budget_s - (time.monotonic() - start))
                     + "\nReply with ONE JSON object: another action, or the final answer."
                 ),
             })

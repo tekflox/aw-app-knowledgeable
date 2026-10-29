@@ -47,12 +47,9 @@ with no answer.
    call (an inventory, the real values of an attribute), make it first rather
    than guessing a workspace-specific name. A guessed value that does not exist
    returns an empty result that is indistinguishable from a real absence.
-5. **You have very few rounds, and you are told where you are.** Every round
-   ends with a line like `Round 3 of 8; about 71s of budget remain.` — read it.
-   Every round is one call, and the **last round is reserved for your final
-   answer**, so a declared 8 rounds means at most 7 tool calls. Plan for two or
-   three: discover, query, answer. Spending rounds on speculative variations
-   leaves you with a thin answer or none.
+5. **You have very few rounds.** The last round is reserved for your final
+   answer. Plan for two or three: discover, query, answer. Spending rounds on
+   speculative variations leaves you with a thin answer or none.
 6. **Finish with what you have.** When the results answer the problem — even
    partially — emit `final` and say plainly what you found and what you could
    not establish. A partial, evidenced answer is useful; running out of rounds
