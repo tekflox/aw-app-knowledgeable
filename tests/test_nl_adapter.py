@@ -174,10 +174,43 @@ def test_an_unknown_source_is_nl_true_so_it_still_falls_through_to_forward():
 
 
 def test_adapter_bounds_default_and_are_floored():
-    assert forwarding.adapter_bounds({}) == (6, 90.0)
+    """Part 6 §32 D3 recalibrated the defaults 6/90 → 8/105. The two knobs are
+    calibrated to each other (≤7 tool rounds ≈ 84s ≈ 105 − the 20s final
+    reserve) and move together or not at all, so they are pinned together."""
+    assert forwarding.adapter_bounds({}) == (8, 105.0)
     assert forwarding.adapter_bounds({"adapter": {"max_rounds": 2, "budget_s": 30}}) == (2, 30.0)
-    assert forwarding.adapter_bounds({"adapter": {"max_rounds": 0, "budget_s": 0}}) == (6, 90.0)
-    assert forwarding.adapter_bounds({"adapter": {"max_rounds": "nope"}}) == (6, 90.0)
+    assert forwarding.adapter_bounds({"adapter": {"max_rounds": 0, "budget_s": 0}}) == (8, 105.0)
+    assert forwarding.adapter_bounds({"adapter": {"max_rounds": "nope"}}) == (8, 105.0)
+
+
+def test_the_recalibrated_inner_budget_still_fits_under_aw_knowledgeables_outer_wall():
+    """§35's cross-repo invariant with no compiler, asserted on this side.
+
+    aw-knowledgeable's `_per_source_timeout` gives an NL-false leg
+    `min(min(budget_s, ADAPTER_BUDGET_S_CAP=120) + ADAPTER_ENVELOPE_GRACE_S=15,
+    request budget)`, with `ADAPTER_DEFAULT_BUDGET_MS=135_000`. Raising the
+    default inner budget past the cap, or past `request − grace`, silently
+    clips the grace back off and re-blinds the instrument (N6a's whole point).
+    """
+    inner = forwarding.DEFAULT_ADAPTER_BUDGET_S
+    cap, grace, request_budget_s = 120.0, 15.0, 135.0
+    assert inner <= cap, "a default past the cap is capped, so the grace shrinks"
+    outer = min(min(inner, cap) + grace, request_budget_s)
+    assert outer > inner, f"outer wall {outer}s must outlive the inner budget {inner}s"
+    assert outer == 120.0
+
+
+def test_the_last_round_is_reserved_so_max_rounds_yields_one_fewer_tool_call():
+    """§35 — `max_rounds: N` now means at most N−1 tool calls. Pinned because
+    an operator tuning from §2's original description is off by one, and
+    because this is what keeps the forced final from being squeezed out."""
+    assert nl_adapter._forced_kind(0, 8, 105.0) == ""          # round 1: explore
+    assert nl_adapter._forced_kind(6, 8, 60.0) == ""           # round 7: last tool call
+    assert nl_adapter._forced_kind(7, 8, 60.0) == "rounds"     # round 8: landing
+    assert nl_adapter._forced_kind(2, 8, 19.0) == "budget"     # seconds bind first
+    # Never on the very first round: a budget smaller than the reserve must not
+    # land before a single tool call has been made (§36.7c's `budget_s: 5`).
+    assert nl_adapter._forced_kind(0, 8, 5.0) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -370,23 +403,56 @@ def test_a_rejected_apikey_names_the_secret_and_the_agent_scope(monkeypatch):
     assert nl_adapter.AGENT_SLUG in out["reason"]
 
 
-def test_rounds_exhausted_is_unavailable_with_the_round_count(monkeypatch):
+def test_rounds_exhausted_with_no_successful_tool_call_is_unavailable(monkeypatch):
+    """The exhaustion reason operators already know, unchanged — reached now
+    through the evidence gate rather than by falling out of the loop. Zero
+    successful tool calls means there is nothing to land, so the forced final
+    is not even issued (§36.5)."""
     entry = {**SIGNOZ_ENTRY, "adapter": {"max_rounds": 2, "budget_s": 90}}
-    _script_chat(monkeypatch, [
-        _action("signoz_list_services", timeRange="24h"),
-        _action("signoz_list_services", timeRange="1h"),
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_execute_builder_query", query="SELECT *"),
     ])
     _script_forward(monkeypatch, [
-        {"status": "ok", "result": "svc", "elapsed_ms": 1},
-        {"status": "ok", "result": "svc", "elapsed_ms": 1},
+        {"status": "unavailable",
+         "reason": "tool 'signoz_execute_builder_query' is not allow-listed for upstream 'signoz'",
+         "elapsed_ms": 0},
     ])
 
     out = _run(nl_adapter.solve(entry, query="application errors"))
 
     assert out["status"] == "unavailable"
     assert "exhausted 2 round(s) without a final answer" in out["reason"]
+    assert out["adapter"]["tool_calls"] == [
+        {"tool": "signoz_execute_builder_query", "ok": False}]
+    assert "partial" not in out["adapter"], "no partial may be fabricated from no evidence"
+    assert len(chat) == 1, "a forced final the gate will reject is not worth a round"
+
+
+def test_rounds_exhausted_lands_a_forced_final_instead_of_one_more_tool_call(monkeypatch):
+    """§36.6 — rounds exhaust → forced final on the last round, not another
+    tool call. `max_rounds: 2` therefore buys exactly one tool call."""
+    entry = {**SIGNOZ_ENTRY, "adapter": {"max_rounds": 2, "budget_s": 90}}
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_list_services", timeRange="24h"),
+        _final("Partial answer (budget exhausted after 2 round(s)):\n\nTwo services ran in "
+               "the window; their error counts were not established.",
+               ["signoz_list_services: aw-knowledgeable, aw-backend"]),
+    ])
+    forwards = _script_forward(monkeypatch, [
+        {"status": "ok", "result": "aw-knowledgeable\naw-backend", "elapsed_ms": 1},
+    ])
+
+    out = _run(nl_adapter.solve(entry, query="application errors"))
+
+    assert out["status"] == "ok"
+    assert out["result"].startswith("Partial answer (budget exhausted after 2 round(s)):")
     assert out["adapter"]["rounds"] == 2
-    assert len(out["adapter"]["tool_calls"]) == 2
+    assert out["adapter"]["partial"] is True
+    assert len(forwards) == 1, "the reserved round must not be spent on a tool call"
+    forced = chat[1]["messages"][-1]["content"]
+    assert forced.startswith("BUDGET EXHAUSTED")
+    assert "round 2 of 2, the last one" in forced
+    assert "no further tool call will be executed" in forced
 
 
 def test_budget_exhausted_stops_the_loop_even_with_rounds_left(monkeypatch):
@@ -403,6 +469,144 @@ def test_budget_exhausted_stops_the_loop_even_with_rounds_left(monkeypatch):
     assert "exhausted 90s without a final answer" in out["reason"]
     assert "1 round(s) run" in out["reason"]
     assert len(chat) == 1
+
+
+def test_budget_exhaustion_lands_a_labelled_partial_when_a_tool_call_succeeded(monkeypatch):
+    """§36.6, the case the whole card exists for: the seconds bind mid-question
+    and the user gets the labelled partial instead of a timeout notice.
+
+    Round 1 runs with the full budget; at round 2's pre-check only 15s remain,
+    inside `FINAL_RESERVE_S`, so that round is the landing maneuver.
+    """
+    _script_clock(monkeypatch, [0.0, 0.0, 75.0, 75.0, 75.0])
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_search_logs", severity="ERROR", timeRange="24h"),
+        _final("Partial answer (budget exhausted after 2 round(s)):\n\n33944 ERROR lines in "
+               "24h, mostly aw-knowledgeable. Which call site raised them is not established.",
+               ["signoz_search_logs: 33944 rows, severity=ERROR"]),
+    ])
+    _script_forward(monkeypatch, [{"status": "ok", "result": "33944 rows", "elapsed_ms": 900}])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="what errors did mark_flow_done throw"))
+
+    assert out["status"] == "ok"
+    assert out["result"].startswith("Partial answer (budget exhausted after 2 round(s)):")
+    assert "33944 ERROR lines" in out["result"]
+    # `partial` rides INSIDE the adapter block (§36.4) — `_coerce_source_payload`
+    # passes that dict through verbatim, so this needs zero aw-knowledgeable
+    # changes, and `status: ok` alone no longer implies complete (§35).
+    assert out["adapter"] == {
+        "rounds": 2,
+        "tool_calls": [{"tool": "signoz_search_logs", "ok": True}],
+        "partial": True,
+    }
+    forced = chat[1]["messages"][-1]["content"]
+    assert forced.startswith("BUDGET EXHAUSTED")
+    assert "only about 15s of budget remain" in forced
+    # §36.1 — the landing call's HTTP timeout is `remaining`, never `budget_s`:
+    # reusing the full budget here recreates the §9.3 hang inside the maneuver.
+    assert chat[1]["timeout_s"] == pytest.approx(15.0)
+
+
+def test_budget_exhaustion_with_no_successful_tool_call_fabricates_nothing(monkeypatch):
+    """The gate with teeth (§36.5): the timeout path survives, but only
+    genuinely empty-handed. A user must never be handed a confident-sounding
+    partial synthesised from nothing."""
+    _script_clock(monkeypatch, [0.0, 0.0, 75.0, 75.0, 75.0])
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_search_logs", filter="severity='ERROR'"),
+    ])
+    _script_forward(monkeypatch, [
+        {"status": "unavailable",
+         "reason": "argument(s) not allow-listed for signoz_search_logs: filter",
+         "elapsed_ms": 0},
+    ])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
+
+    assert out["status"] == "unavailable"
+    assert "exhausted 90s without a final answer" in out["reason"]
+    assert "1 round(s) run" in out["reason"]
+    assert "result" not in out
+    assert "partial" not in out["adapter"]
+    assert len(chat) == 1
+
+
+def test_a_forced_final_that_is_not_a_usable_answer_degrades_to_unavailable(monkeypatch):
+    """The model may spend its one landing reply on another tool call, or on
+    prose. There is no correction round left — by construction the budget or
+    the rounds are gone — so this is the honest exhaustion envelope again,
+    never an empty `ok`."""
+    _script_clock(monkeypatch, [0.0, 0.0, 75.0, 75.0, 75.0])
+    _script_chat(monkeypatch, [
+        _action("signoz_search_logs", severity="ERROR"),
+        _action("signoz_list_services", timeRange="24h"),
+    ])
+    forwards = _script_forward(monkeypatch, [{"status": "ok", "result": "rows", "elapsed_ms": 1}])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
+
+    assert out["status"] == "unavailable"
+    assert "exhausted 90s without a final answer" in out["reason"]
+    assert "forced final reply was not a usable answer" in out["reason"]
+    assert len(forwards) == 1, "a tool call proposed in the reserved round is not executed"
+
+
+def test_an_unlabelled_forced_final_is_labelled_in_code(monkeypatch):
+    """The design calls the label prompt-enforced and therefore soft. It is
+    cheap to make it hard on the way out, and the product guarantee is that a
+    partial can never read as a complete answer."""
+    _script_clock(monkeypatch, [0.0, 0.0, 75.0, 75.0, 75.0])
+    _script_chat(monkeypatch, [
+        _action("signoz_search_logs", severity="ERROR"),
+        _final("33944 ERROR lines in 24h."),
+    ])
+    _script_forward(monkeypatch, [{"status": "ok", "result": "33944 rows", "elapsed_ms": 1}])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
+
+    assert out["result"] == (
+        "Partial answer (budget exhausted after 2 round(s)):\n\n33944 ERROR lines in 24h."
+    )
+    assert out["adapter"]["partial"] is True
+
+
+def test_the_model_is_told_its_round_and_remaining_budget_every_round(monkeypatch):
+    """§32 D2's self-pacing. Today the model cannot know it is near a cliff —
+    both failing legs were still mid-exploration at 90s."""
+    _script_clock(monkeypatch, [0.0, 0.0, 12.0, 12.0, 12.0])
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_list_services", timeRange="24h"),
+        _final("done"),
+    ])
+    _script_forward(monkeypatch, [{"status": "ok", "result": "svc", "elapsed_ms": 1}])
+
+    _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
+
+    assert "Round 1 of 6; about 90s of budget remain." in chat[0]["messages"][1]["content"]
+    feedback = chat[1]["messages"][-1]["content"]
+    assert "Round 2 of 6; about 78s of budget remain." in feedback
+    assert "at most 4 more tool call(s) will be executed" in feedback
+
+
+def test_a_tiny_budget_still_gets_one_exploring_round_before_it_lands(monkeypatch):
+    """§36.7c's instrument probe is a scratch entry with `budget_s: 5` — below
+    `FINAL_RESERVE_S`. The reserve must not swallow round 1, or that probe
+    returns zero rounds and zero evidence and measures nothing."""
+    entry = {**SIGNOZ_ENTRY, "adapter": {"max_rounds": 8, "budget_s": 5}}
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_list_services", timeRange="24h"),
+        _final("two services ran"),
+    ])
+    forwards = _script_forward(monkeypatch, [{"status": "ok", "result": "svc", "elapsed_ms": 1}])
+
+    out = _run(nl_adapter.solve(entry, query="x"))
+
+    assert len(forwards) == 1, "round 1 must still be a real exploring round"
+    assert len(chat) == 2, "round 2 is then the landing maneuver"
+    assert out["status"] == "ok"
+    assert out["adapter"]["rounds"] == 2, "the instrument must report real rounds"
+    assert out["adapter"]["partial"] is True
 
 
 def test_the_remaining_budget_is_also_the_rounds_http_timeout(monkeypatch):

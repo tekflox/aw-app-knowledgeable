@@ -39,6 +39,15 @@ before every round and passed as that round's HTTP timeout — an ap-mt call can
 land minutes late (``apmt-mcp-write-timeouts-can-land-minutes-late``), so a
 round count alone does not bound this (§9.3).
 
+Since Part 6 (N6b) **neither bound ends the call empty-handed when it does not
+have to**: the last allowed round and the last :data:`FINAL_RESERVE_S` seconds
+are reserved for one forced final — "answer now from what you have" — whose
+result is labelled as partial and flagged ``adapter.partial``. It is gated in
+code on at least one successful tool call (§32 D2), because a confident partial
+synthesised from nothing is a worse failure than the honest ``unavailable`` it
+would replace. Each round also tells the model where it is and what is left, so
+it can wrap up on its own rather than being cut off mid-exploration.
+
 Since Part 4 (N5b) :func:`solve` is not what ``/source-query`` returns on this
 branch — :func:`stream_solve` is, wrapped in a ``StreamingResponse``. The
 envelope is byte-for-byte the same; it just arrives after a leading run of
@@ -82,7 +91,7 @@ AGENT_SLUG = "knowledgeable-nl-adapter"
 APMT_MODEL = f"agent/{AGENT_SLUG}"
 
 #: Each round's fed-back tool result is truncated to this, on top of the 32KB
-#: cap ``forward()`` already applies per result — six rounds must not be able
+#: cap ``forward()`` already applies per result — the rounds must not be able
 #: to build an unbounded prompt (§3.2).
 MAX_FED_BACK_CHARS = 8_000
 
@@ -94,6 +103,23 @@ MAX_FINAL_CHARS = forwarding.MAX_RESULT_CHARS
 #: the budget check below rather than issue a call that cannot possibly
 #: complete, but if it gets here, a sub-second timeout is still honest.
 MIN_ROUND_TIMEOUT_S = 1.0
+
+#: Part 6 §32 D2 — the tail of the budget that is never spent on another tool
+#: call, because it is the landing maneuver: one call that turns whatever was
+#: gathered into a labelled partial answer instead of a timeout notice. ≈1.5
+#: rounds at the measured 11-12s pace. The last *allowed round* is reserved the
+#: same way, which is why a declared ``max_rounds: N`` now yields at most N−1
+#: tool calls (§35 — operators tuning from §2's original description are off by
+#: one).
+FINAL_RESERVE_S = 20.0
+
+#: The opening the forced final must carry, so the user-facing label rides
+#: ``result`` itself and sources-digest, the synthesize template and every other
+#: consumer need zero changes (§32 D2). Prompt-mandated AND code-applied: the
+#: prompt asks for it, :func:`_label_partial` puts it there when the model did
+#: not, because a partial that reads as a complete answer is the failure this
+#: whole shape exists to avoid.
+PARTIAL_LABEL = "Partial answer (budget exhausted after {rounds} round(s)):"
 
 #: Two *consecutive* unparsable replies end the call (§3.2). One is a
 #: correction opportunity — the model is told what it did wrong and asked
@@ -379,6 +405,94 @@ def _final_text(action: dict) -> str:
     return text
 
 
+def _final_out(text: str) -> dict[str, Any]:
+    """The ``ok`` half of the envelope for a final answer, forced or not — one
+    truncation rule for both landing paths rather than two that can drift."""
+    out: dict[str, Any] = {"status": "ok", "result": text}
+    if len(text) > MAX_FINAL_CHARS:
+        out["result"] = text[:MAX_FINAL_CHARS]
+        out["truncated"] = True
+    return out
+
+
+def _pacing_line(round_number: int, max_rounds: int, remaining: float) -> str:
+    """§32 D2's self-pacing, the one option-3 change with evidence behind it.
+
+    Today the model cannot know it is near a cliff — the two legs that failed
+    the measurement were still mid-exploration at 90s — so it has no way to
+    wrap up. One line per round, stating where it is and what is left.
+    """
+    return (
+        f"Round {round_number} of {max_rounds}; about {max(0.0, remaining):.0f}s of budget "
+        f"remain. The last round is reserved for your final answer, so at most "
+        f"{max(0, max_rounds - round_number)} more tool call(s) will be executed."
+    )
+
+
+def _forced_kind(rounds: int, max_rounds: int, remaining: float) -> str:
+    """Why this round must be the forced final — ``"budget"``, ``"rounds"``, or
+    ``""`` when the loop may keep exploring (§32 D2).
+
+    Never on the very first round: a declared budget smaller than
+    :data:`FINAL_RESERVE_S` (the ``budget_s: 5`` scratch entry of §36.7c is the
+    live one) would otherwise land before a single tool call had been made,
+    which is strictly worse than today — zero evidence, zero rounds, nothing
+    for the instrument to report.
+    """
+    if rounds < 1:
+        return ""
+    if remaining <= FINAL_RESERVE_S:
+        return "budget"
+    if rounds + 1 >= max_rounds:
+        return "rounds"
+    return ""
+
+
+def _exhaustion_reason(kind: str, *, rounds: int, max_rounds: int, budget_s: float) -> str:
+    """The operator-facing exhaustion reason, worded exactly as it was before
+    the forced final existed — an exhausted leg that produced no usable partial
+    must still be recognizable in a log and in the synthesis."""
+    if kind == "rounds":
+        return f"adapter exhausted {max_rounds} round(s) without a final answer"
+    return (
+        f"adapter exhausted {budget_s:g}s without a final answer "
+        f"({rounds} round(s) run)"
+    )
+
+
+def _forced_final_message(kind: str, *, round_number: int, max_rounds: int, remaining: float) -> str:
+    """The landing instruction. Says plainly that no further tool call will be
+    executed, so the model spends its one remaining reply on the answer rather
+    than on another action it will never see the result of."""
+    why = (
+        f"only about {max(0.0, remaining):.0f}s of budget remain"
+        if kind == "budget"
+        else f"this is round {round_number} of {max_rounds}, the last one"
+    )
+    return (
+        f"BUDGET EXHAUSTED — {why}. This is your LAST reply and no further tool "
+        "call will be executed, so do not propose one.\n\n"
+        "Answer the PROBLEM NOW from the evidence you already gathered, as ONE "
+        'JSON object: {"final": "<answer>", "evidence": ["<tool>: <what it showed>"]}.\n\n'
+        f"Open `final` with exactly this line:\n{PARTIAL_LABEL.format(rounds=round_number)}\n\n"
+        "Then state what the evidence DOES establish and what it does NOT. Never "
+        "invent a number, a name or a time range no tool result showed you — if "
+        "you learned nothing usable, say exactly that instead of guessing."
+    )
+
+
+def _label_partial(text: str, rounds: int) -> str:
+    """Put the label on, unless the model already did (§32 D2).
+
+    The design calls this convention prompt-enforced and therefore soft; it is
+    cheap to make it hard on the way out, and the whole product guarantee of
+    this change is that a partial can never read as a complete answer.
+    """
+    if text.lower().lstrip().startswith("partial answer"):
+        return text
+    return f"{PARTIAL_LABEL.format(rounds=rounds)}\n\n{text}"
+
+
 async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, Any]:
     """Answer ``query`` against one NL-false source, and never raise.
 
@@ -392,12 +506,21 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
     max_rounds, budget_s = forwarding.adapter_bounds(entry)
     tool_calls: list[dict[str, Any]] = []
     rounds = 0
+    partial = False
 
     def _envelope(extra: dict[str, Any]) -> dict[str, Any]:
+        # `partial` lives INSIDE the adapter block, never as a new top-level
+        # envelope key (§36.4): the telemetry card's test pins the leg key set
+        # and `_coerce_source_payload` only passes the adapter dict through, so
+        # this is how a machine-readable completeness flag reaches a caller
+        # with zero aw-knowledgeable changes.
+        adapter: dict[str, Any] = {"rounds": rounds, "tool_calls": tool_calls}
+        if partial:
+            adapter["partial"] = True
         return {
             **extra,
             "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "adapter": {"rounds": rounds, "tool_calls": tool_calls},
+            "adapter": adapter,
         }
 
     def _unavailable(reason: str) -> dict[str, Any]:
@@ -417,7 +540,12 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt(entry)},
-            {"role": "user", "content": _first_user_message(query, code_query)},
+            {
+                "role": "user",
+                "content": _first_user_message(query, code_query)
+                + "\n\n"
+                + _pacing_line(1, max_rounds, budget_s),
+            },
         ]
         unparsable_streak = 0
 
@@ -428,12 +556,54 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
             remaining = budget_s - (time.monotonic() - start)
             if remaining <= 0:
                 return _unavailable(
-                    f"adapter exhausted {budget_s:g}s without a final answer "
-                    f"({rounds} round(s) run)"
+                    _exhaustion_reason("budget", rounds=rounds, max_rounds=max_rounds,
+                                       budget_s=budget_s)
                 )
+
+            # §32 D2 — the last allowed round and the last FINAL_RESERVE_S of
+            # budget are the landing maneuver, never another tool call.
+            forced = _forced_kind(rounds, max_rounds, remaining)
+            if forced:
+                if not any(call.get("ok") for call in tool_calls):
+                    # THE EVIDENCE GATE, in code and not in the prompt (§36.5).
+                    # The model will happily produce a confident "partial" from
+                    # nothing, and a fabricated partial is a worse failure than
+                    # the timeout notice this replaces. No tool call can happen
+                    # from here on, so the verdict is already final: today's
+                    # honest `unavailable` stands, and the round is not even
+                    # worth spending.
+                    return _unavailable(
+                        _exhaustion_reason(forced, rounds=rounds, max_rounds=max_rounds,
+                                           budget_s=budget_s)
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": _forced_final_message(
+                        forced, round_number=rounds + 1, max_rounds=max_rounds,
+                        remaining=remaining,
+                    ),
+                })
+
             rounds += 1
+            # The forced final's HTTP timeout is `remaining`, never `budget_s`
+            # — §36.1: reusing the full budget here recreates the §9.3 hang
+            # inside the landing maneuver itself.
             reply = await _chat(api_key, messages, max(MIN_ROUND_TIMEOUT_S, remaining))
             action = json_object(reply)
+
+            if forced:
+                # One reply, no correction round: the budget or the rounds are
+                # gone by construction. A forced final that did not produce a
+                # usable answer degrades to the same honest exhaustion reason.
+                text = _final_text(action or {})
+                if not text:
+                    return _unavailable(
+                        _exhaustion_reason(forced, rounds=rounds, max_rounds=max_rounds,
+                                           budget_s=budget_s)
+                        + " — the forced final reply was not a usable answer"
+                    )
+                partial = True
+                return _envelope(_final_out(_label_partial(text, rounds)))
 
             if action is None or not (action.get("final") or action.get("tool")):
                 unparsable_streak += 1
@@ -455,12 +625,11 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
             unparsable_streak = 0
 
             if action.get("final"):
-                text = _final_text(action)
-                out: dict[str, Any] = {"status": "ok", "result": text}
-                if len(text) > MAX_FINAL_CHARS:
-                    out["result"] = text[:MAX_FINAL_CHARS]
-                    out["truncated"] = True
-                return _envelope(out)
+                # The easy path: a leg that finds its answer returns the moment
+                # it does, byte-identically to before — no label, no `partial`
+                # key, no extra round (§32's "the easy questions cannot get
+                # slower, by construction").
+                return _envelope(_final_out(_final_text(action)))
 
             tool = str(action.get("tool") or "")
             args = action.get("args")
@@ -490,11 +659,20 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
             messages.append({"role": "assistant", "content": reply})
             messages.append({
                 "role": "user",
-                "content": feedback + "\n\nReply with ONE JSON object: another action, or the final answer.",
+                "content": (
+                    feedback
+                    + "\n\n"
+                    + _pacing_line(rounds + 1, max_rounds,
+                                   budget_s - (time.monotonic() - start))
+                    + "\nReply with ONE JSON object: another action, or the final answer."
+                ),
             })
 
+        # Reachable only when the forced final could not be issued — a
+        # `max_rounds` of 1 leaves no round to reserve for it.
         return _unavailable(
-            f"adapter exhausted {max_rounds} round(s) without a final answer"
+            _exhaustion_reason("rounds", rounds=rounds, max_rounds=max_rounds,
+                               budget_s=budget_s)
         )
     except _Unavailable as exc:
         return _unavailable(exc.reason)

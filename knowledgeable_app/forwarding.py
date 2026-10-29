@@ -92,8 +92,25 @@ DEFAULT_QUERY_TOOL = {"tool": "codegraph_explore", "arg": "query"}
 #: entry — ``docs/design/knowledgeable-nl-tool-adapter.md`` §2. The ``adapter``
 #: block is optional on an entry precisely because these exist. Read through
 #: :func:`adapter_bounds` below, never directly.
-DEFAULT_ADAPTER_MAX_ROUNDS = 6
-DEFAULT_ADAPTER_BUDGET_S = 90.0
+#:
+#: Recalibrated from 6/90 by Part 6 §32 D3: measured pace is ~11-12s per round,
+#: so 6 rounds ≈ 72s stranded 18s of a 90s budget — the two knobs are
+#: calibrated to each other and move together or not at all. With the last
+#: round reserved for the forced final (``nl_adapter.FINAL_RESERVE_S``), ≤7
+#: tool rounds ≈ 84s ≈ 105 − 20, so rounds and seconds now reach the landing
+#: maneuver together.
+#:
+#: **Cross-repo invariant, no compiler (Part 6 §35).** ``budget_s`` here is the
+#: INNER clock; aw-knowledgeable's ``backend/app/api/sources.py`` wraps this
+#: leg in an OUTER wall of ``min(budget_s, ADAPTER_BUDGET_S_CAP=120) +
+#: ADAPTER_ENVELOPE_GRACE_S=15``, itself capped by the request's
+#: ``ADAPTER_DEFAULT_BUDGET_MS=135_000``. At 105 that is 120s outer vs 105s
+#: inner — the gap is what lets an exhausted leg's envelope (and its ``adapter``
+#: telemetry, and the forced final) land instead of being cancelled mid-round.
+#: Raising this past 120 re-blinds that instrument; the comment in
+#: ``sources.py`` names this one back.
+DEFAULT_ADAPTER_MAX_ROUNDS = 8
+DEFAULT_ADAPTER_BUDGET_S = 105.0
 
 #: The two ``transport`` kinds this module understands — see the module
 #: docstring. ``app-mcp`` is also the implicit default for an entry saved
