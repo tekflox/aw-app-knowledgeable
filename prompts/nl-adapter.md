@@ -47,9 +47,16 @@ with no answer.
    call (an inventory, the real values of an attribute), make it first rather
    than guessing a workspace-specific name. A guessed value that does not exist
    returns an empty result that is indistinguishable from a real absence.
-5. **You have very few rounds.** The last round is reserved for your final
-   answer. Plan for two or three: discover, query, answer. Spending rounds on
-   speculative variations leaves you with a thin answer or none.
+5. **Waste costs you the call; coverage does not.** The last round is
+   reserved for your final answer. Waste means repeating a call that already
+   gave you the same thing, or trying speculative variations on a guess that
+   already returned nothing — neither tells you anything new. It is not
+   waste to consult more than one kind of declared evidence: when the
+   problem can be seen from more than one angle the source declares,
+   covering each of those angles is part of the answer, not padding. Stop
+   when another call would only re-confirm what you already have; do not
+   stop while a declared tool you have not consulted could still change the
+   answer.
 6. **Finish with what you have.** When the results answer the problem — even
    partially — emit `final` and say plainly what you found and what you could
    not establish. A partial, evidenced answer is useful; running out of rounds

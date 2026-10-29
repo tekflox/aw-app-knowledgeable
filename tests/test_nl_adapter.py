@@ -815,6 +815,18 @@ def test_the_shipped_prompt_states_the_protocol_and_the_arg_cap():
     assert str(forwarding.MAX_ARG_CHARS) in text
 
 
+def test_rule_5_no_longer_prescribes_a_round_count():
+    """"Plan for two or three" was the sole surviving number in rule 5 once
+    self-pacing was deleted, and the model took it literally (card
+    fix:knowledgeable-adapter-self-pacing-easy-path-tax, QA run
+    fb02d58ef1bc411da44a2eec2bff09fe): 3 rounds, logs-only, one service, one
+    error class, every single run. Rule 5 is rewritten count-free."""
+    text = nl_adapter.PROMPT_PATH.read_text(encoding="utf-8")
+    assert "two or three" not in text
+    assert "Plan for" not in text
+    assert "reserved for your final answer" in text
+
+
 # ---------------------------------------------------------------------------
 # ap-mt transport details
 # ---------------------------------------------------------------------------

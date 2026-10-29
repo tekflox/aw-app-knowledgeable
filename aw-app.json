@@ -314,7 +314,7 @@
                   "timeRange",
                   "limit"
                 ],
-                "hint": "error=true narrows to failing spans"
+                "hint": "error=true narrows to failing spans; HTTP status codes and latency live here, not in logs"
               },
               "signoz_get_field_keys": {
                 "args": [
@@ -346,7 +346,7 @@
             },
             "accepts_natural_language": false,
             "problem_domain": "observability for this workspace's own services: application logs, traces, service inventory (SigNoz). Ask it about runtime errors, exceptions, latency, what services exist and how they behave in a time window.",
-            "query_guidance": "You cannot send natural language to any tool here. searchText is literal CONTAINS over raw log text \u2014 use it only for exact tokens you expect verbatim in a log line (an error class, an id), never for a restated question. Start broad: severity + timeRange (+ service when known), then narrow. Discover real attribute values with signoz_get_field_values before filtering on anything workspace-specific. Time ranges like '1h'/'24h'/'7d'.",
+            "query_guidance": "You cannot send natural language to any tool here. searchText is literal CONTAINS over raw log text \u2014 use it only for exact tokens you expect verbatim in a log line (an error class, an id), never for a restated question. Start broad: severity + timeRange (+ service when known), then narrow. Discover real attribute values with signoz_get_field_values before filtering on anything workspace-specific. Time ranges like '1h'/'24h'/'7d'. Errors live in BOTH logs and traces: HTTP-level failures (4xx/5xx, timeouts) usually surface only as failing spans, so for any question about errors, failures or latency consult signoz_search_traces (error=true) as well as signoz_search_logs before answering, and cover the services that show problems rather than stopping at the first one.",
             "adapter": {
               "max_rounds": 8,
               "budget_s": 105
