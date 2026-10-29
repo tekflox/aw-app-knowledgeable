@@ -102,6 +102,12 @@ VAULT_COVERAGE_REGISTRY: dict[str, tuple[str, ...]] = {
     "knowledgeable-explorer-apmt-key": ("authorization-header", "env-assignment"),
     "knowledgeable-extractor-apmt-key": ("authorization-header", "env-assignment"),
     "knowledgeable-labeller-apmt-key": ("authorization-header", "env-assignment"),
+    # Fifth member of the family, and the only one consumed LOCALLY — the
+    # NL→tool-calling adapter reads it in-process and never pushes it to
+    # production aw-knowledgeable (docs/design/knowledgeable-nl-tool-adapter.md
+    # §3.5). Same shape as its four siblings, so the same two families cover
+    # it: a Bearer credential when sent, a `…_KEY=` assignment when configured.
+    "knowledgeable-nl-adapter-apmt-key": ("authorization-header", "env-assignment"),
     "knowledgeable-playground-apmt-key": ("authorization-header", "env-assignment"),
     # VNC password with no shape of its own, caught by `env-assignment` on a
     # `…VNC_PASSWORD=`-style name.

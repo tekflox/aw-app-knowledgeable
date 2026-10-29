@@ -161,7 +161,26 @@ async def _current_sources() -> list[dict]:
     availability probe (``forwarding.status_block()``, the same cache
     ``forward()`` populates) — a synced row is not a live source (design §9
     risk 3), but both facts travel in one push so the server can store them
-    as the two separate columns it already has."""
+    as the two separate columns it already has.
+
+    Since ``docs/design/knowledgeable-nl-tool-adapter.md`` §3.6 each row also
+    carries the source's **capability declaration**:
+    ``accepts_natural_language``, ``problem_domain`` and ``adapter_budget_s``.
+    aw-knowledgeable needs those to make its per-source fan-out timeout
+    row-aware — an adapter source running 3-6 LLM rounds cannot answer inside
+    the flat 10s every source gets today.
+
+    Safe to ship before aw-knowledgeable has the columns (§6): that endpoint
+    ignores unknown payload fields additively, so a server that predates N3
+    stores what it knows and drops the rest. ``state_hash`` is deliberately
+    NOT touched — it stays id-only on both sides, so a flipped declaration
+    propagates on the ~6 min unconditional reconcile rather than needing a
+    lockstep hash migration across two repos.
+
+    ``problem_domain`` is emitted for NL-true sources too: today it
+    documents, and it is the field a workflow-level source planner would
+    route on the moment one exists.
+    """
     registry = forwarding._registry()
     status_rows = {row["id"]: row for row in await forwarding.status_block()}
     sources: list[dict] = []
@@ -170,6 +189,7 @@ async def _current_sources() -> list[dict]:
         if not source_id:
             continue
         status = status_rows.get(source_id) or {}
+        nl = forwarding.accepts_natural_language(entry)
         sources.append(
             {
                 "id": source_id,
@@ -178,6 +198,12 @@ async def _current_sources() -> list[dict]:
                 "available": bool(status.get("available")),
                 "reason": status.get("reason"),
                 "checked_at": _iso(status.get("checked_at")),
+                "accepts_natural_language": nl,
+                "problem_domain": (entry.get("problem_domain") or "").strip() or None,
+                # Only meaningful for an adapter source, and `None` otherwise
+                # rather than the default 90: a NL-true row must not look to
+                # the server like it is asking for a 90s fan-out leg.
+                "adapter_budget_s": None if nl else int(forwarding.adapter_bounds(entry)[1]),
             }
         )
     return sources

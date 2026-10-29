@@ -88,6 +88,13 @@ _availability_cache: dict[str, tuple[bool, str | None, float]] = {}
 #: is the only caller.
 DEFAULT_QUERY_TOOL = {"tool": "codegraph_explore", "arg": "query"}
 
+#: ``adapter.max_rounds`` / ``adapter.budget_s`` defaults for an NL-false
+#: entry — ``docs/design/knowledgeable-nl-tool-adapter.md`` §2. The ``adapter``
+#: block is optional on an entry precisely because these exist. Read through
+#: :func:`adapter_bounds` below, never directly.
+DEFAULT_ADAPTER_MAX_ROUNDS = 6
+DEFAULT_ADAPTER_BUDGET_S = 90.0
+
 #: The two ``transport`` kinds this module understands — see the module
 #: docstring. ``app-mcp`` is also the implicit default for an entry saved
 #: before the field was branched on anywhere.
@@ -155,6 +162,43 @@ def query_tool_for(upstream_id: str) -> dict:
         "tool": query_tool.get("tool") or DEFAULT_QUERY_TOOL["tool"],
         "arg": query_tool.get("arg") or DEFAULT_QUERY_TOOL["arg"],
     }
+
+
+def accepts_natural_language(entry: dict | None) -> bool:
+    """Whether this registry entry's source can be asked a natural-language
+    question directly — ``docs/design/knowledgeable-nl-tool-adapter.md`` §2.
+
+    **Absent or truthy is today's path; only an explicit false activates the
+    NL→tool-calling adapter.** That one rule is the whole migration story
+    (§6): every existing entry, on this workspace and on every other one,
+    keeps the exact current behavior with no edit. A missing entry (an unknown
+    ``source_id``) is NL-true too, so it still falls through to
+    :func:`forward`, which rejects it by name — unchanged (§3.1).
+
+    Lives here rather than in ``nl_adapter`` because it reads a *registry*
+    entry, and because ``/source-query``'s legacy branch must be able to
+    decide without importing the adapter at all (§9.6).
+    """
+    if entry is None:
+        return True
+    return bool(entry.get("accepts_natural_language", True))
+
+
+def adapter_bounds(entry: dict) -> tuple[int, float]:
+    """``(max_rounds, budget_s)`` for an NL-false entry, defaulted and
+    floored. Read by ``nl_adapter`` to bound its loop and by ``sources_sync``
+    to tell aw-knowledgeable how long this source's fan-out leg may take
+    (§3.6) — one reader of the declaration, not two that can disagree."""
+    adapter = entry.get("adapter") or {}
+    try:
+        max_rounds = int(adapter.get("max_rounds") or DEFAULT_ADAPTER_MAX_ROUNDS)
+    except (TypeError, ValueError):
+        max_rounds = DEFAULT_ADAPTER_MAX_ROUNDS
+    try:
+        budget_s = float(adapter.get("budget_s") or DEFAULT_ADAPTER_BUDGET_S)
+    except (TypeError, ValueError):
+        budget_s = DEFAULT_ADAPTER_BUDGET_S
+    return max(1, max_rounds), max(1.0, budget_s)
 
 
 def _aw_port() -> str:

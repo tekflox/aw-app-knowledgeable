@@ -133,6 +133,13 @@ def test_sync_incremental_with_no_ack_does_a_full_sync(monkeypatch):
             "available": True,
             "reason": None,
             "checked_at": sources_sync._iso(1700000000.0),
+            # docs/design/knowledgeable-nl-tool-adapter.md §3.6 — the
+            # capability declaration rides along so aw-knowledgeable can size
+            # this source's fan-out timeout from the row. An entry with no
+            # declaration is NL-true, which is every entry that exists today.
+            "accepts_natural_language": True,
+            "problem_domain": None,
+            "adapter_budget_s": None,
         }
     ]
     assert call["headers"]["X-Internal-Secret"] == "shh"
@@ -295,3 +302,82 @@ def test_workspace_slug_defaults_to_aw_when_unset(monkeypatch):
     _FakeSyncAsyncClient._QUEUE.append(_FakeSyncResponse(200, {"synced": True}))
     _run(sources_sync.sync_full())
     assert _FakeSyncAsyncClient._CALLS[0]["json"]["workspace_slug"] == "aw"
+
+
+# ---------------------------------------------------------------------------
+# The capability declaration in the sync payload — docs/design/
+# knowledgeable-nl-tool-adapter.md §3.6, folded into N1 so N3 becomes
+# aw-knowledgeable-only (no second Tier-1 release, no second core restart).
+# ---------------------------------------------------------------------------
+
+
+def _one_adapter_source(monkeypatch):
+    monkeypatch.setattr(sources_sync.forwarding, "_registry", lambda: [
+        {
+            "id": "signoz",
+            "app_slug": "signoz-connector",
+            "accepts_natural_language": False,
+            "problem_domain": "  observability for this workspace's own services  ",
+            "query_guidance": "searchText is literal CONTAINS.",
+            "adapter": {"max_rounds": 6, "budget_s": 90},
+            "tools": {"signoz_search_logs": {"args": ["severity"], "hint": "not semantic"}},
+        },
+    ])
+
+    async def fake_status_block():
+        return [{"id": "signoz", "available": True, "reason": None, "checked_at": 1700000000.0}]
+
+    monkeypatch.setattr(sources_sync.forwarding, "status_block", fake_status_block)
+
+
+def test_an_nl_false_source_syncs_its_flag_domain_and_adapter_budget(monkeypatch):
+    _one_adapter_source(monkeypatch)
+    _FakeSyncAsyncClient._QUEUE.append(_FakeSyncResponse(200, {"synced": True}))
+
+    _run(sources_sync.sync_full())
+
+    row = _FakeSyncAsyncClient._CALLS[0]["json"]["sources"][0]
+    assert row["accepts_natural_language"] is False
+    assert row["problem_domain"] == "observability for this workspace's own services"
+    assert row["adapter_budget_s"] == 90
+
+
+def test_an_nl_true_source_syncs_no_adapter_budget(monkeypatch):
+    """`None`, not the default 90 — an NL-true row must not look to the server
+    like it is asking for a 90s fan-out leg when 10s is still correct for it."""
+    _one_codegraph_source(monkeypatch)
+    _FakeSyncAsyncClient._QUEUE.append(_FakeSyncResponse(200, {"synced": True}))
+
+    _run(sources_sync.sync_full())
+
+    row = _FakeSyncAsyncClient._CALLS[0]["json"]["sources"][0]
+    assert row["accepts_natural_language"] is True
+    assert row["adapter_budget_s"] is None
+
+
+def test_the_declaration_never_enters_state_hash(monkeypatch):
+    """§3.6's byte-identical rule: `state_hash` stays id-only on BOTH sides, so
+    a flipped flag propagates on the ~6 min unconditional reconcile instead of
+    409-ing every delta until aw-knowledgeable ships a matching hash. Flipping
+    the declaration must therefore not move the hash at all."""
+    _one_adapter_source(monkeypatch)
+    _FakeSyncAsyncClient._QUEUE.append(_FakeSyncResponse(200, {"synced": True}))
+    _run(sources_sync.sync_full())
+    with_flag = _FakeSyncAsyncClient._CALLS[0]["json"]["state_hash"]
+
+    assert with_flag == sources_sync.state_hash(["signoz"])
+
+
+def test_query_guidance_and_per_tool_hints_never_leave_the_workspace(monkeypatch):
+    """The deliberate boundary (§1.4): the loop that consumes them runs where
+    they live, and syncing them up would create a second, driftable copy of
+    each source's tool semantics."""
+    _one_adapter_source(monkeypatch)
+    _FakeSyncAsyncClient._QUEUE.append(_FakeSyncResponse(200, {"synced": True}))
+
+    _run(sources_sync.sync_full())
+
+    body = json.dumps(_FakeSyncAsyncClient._CALLS[0]["json"])
+    assert "query_guidance" not in body
+    assert "literal CONTAINS" not in body
+    assert "not semantic" not in body

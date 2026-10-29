@@ -281,6 +281,18 @@ def build_routes(ctx) -> FastAPI:
         response is returned verbatim — ``{status: "ok", result, elapsed_ms}``
         or ``{status: "unavailable", reason, elapsed_ms}`` — which is also
         the envelope shape C1's fan-out already knows how to read.
+
+        Since ``docs/design/knowledgeable-nl-tool-adapter.md`` §3.1 this is a
+        **two-way branch** on the source's own capability declaration. An
+        entry that is absent, or that does not say
+        ``accepts_natural_language: false``, takes the path above
+        byte-identically — codegraph included, pinned by
+        ``tests/test_forwarding.py`` and by the legacy-branch test in
+        ``tests/test_nl_adapter.py``. Only an explicit ``false`` goes through
+        the bounded tool-calling adapter, which answers in the same envelope
+        plus an additive ``adapter`` telemetry block. Both branches keep this
+        route's never-raise contract: a failure is an ``unavailable``
+        envelope, never a 500 (§9.5).
         """
         provided = request.headers.get("x-internal-secret", "")
         expected = ctx.secrets.read(SECRET_KEY) or ""
@@ -295,9 +307,18 @@ def build_routes(ctx) -> FastAPI:
             return JSONResponse({"detail": "query is required"}, status_code=400)
         code_query = (data.get("code_query") or "").strip()
 
-        query_tool = forwarding.query_tool_for(source_id)
-        value = code_query or query
-        return await forwarding.forward(source_id, query_tool["tool"], {query_tool["arg"]: value})
+        entry = forwarding._find_upstream(source_id)
+        if forwarding.accepts_natural_language(entry):
+            query_tool = forwarding.query_tool_for(source_id)
+            value = code_query or query
+            return await forwarding.forward(source_id, query_tool["tool"], {query_tool["arg"]: value})
+
+        # Imported here, not at module top, so a legacy-branch request never
+        # loads the adapter at all — §4's "zero regression risk to the only
+        # leg that works end to end today", asserted rather than hoped (§9.6).
+        from . import nl_adapter  # noqa: PLC0415
+
+        return await nl_adapter.solve(entry, query=query, code_query=code_query)
 
     # ------------------------------------------------------------------
     # §13 — the KB bulk-ingest driver. Both doors (the `knowledgeable-ingest`

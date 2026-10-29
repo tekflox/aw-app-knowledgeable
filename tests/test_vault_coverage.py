@@ -128,6 +128,14 @@ _REPRESENTATIVE_SHAPES = {
             "KNOWLEDGEABLE_LABELLER_APMT_KEY=invented-registry-test-apmt-key-labeller"
         ),
     },
+    "knowledgeable-nl-adapter-apmt-key": {
+        "authorization-header": (
+            "Authorization: Bearer invented-registry-test-apmt-key-nl-adapter"
+        ),
+        "env-assignment": (
+            "KNOWLEDGEABLE_NL_ADAPTER_APMT_KEY=invented-registry-test-apmt-key-nl-adapter"
+        ),
+    },
     "knowledgeable-playground-apmt-key": {
         "authorization-header": (
             "Authorization: Bearer invented-registry-test-apmt-key-playground"
