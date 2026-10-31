@@ -47,3 +47,22 @@ def test_signoz_get_field_values_declares_name_not_key():
 def test_signoz_get_field_values_hint_does_not_name_the_wrong_arg():
     hint = _signoz_default_entry()["tools"]["signoz_get_field_values"].get("hint") or ""
     assert "key" not in hint.split()
+
+
+def test_signoz_get_field_values_hint_states_signal_enum():
+    """The real tool's `signal` arg is a strict 3-value enum, confirmed from
+    its own JSON schema. The hint is the model's only source of truth for
+    valid values (it has no MCP access of its own) — omitting the enum is
+    exactly what let the adapter guess a value the tool rejects with
+    'Parameter validation failed: "signal" must be one of: "metrics",
+    "traces", "logs"' (bug:signoz-nl-adapter-invalid-signal-poisons-whole-source).
+    """
+    hint = _signoz_default_entry()["tools"]["signoz_get_field_values"].get("hint") or ""
+    for value in ("metrics", "traces", "logs"):
+        assert value in hint, f"hint must state the real tool's signal enum value {value!r}"
+
+
+def test_signoz_get_field_keys_hint_states_signal_enum():
+    hint = _signoz_default_entry()["tools"]["signoz_get_field_keys"].get("hint") or ""
+    for value in ("metrics", "traces", "logs"):
+        assert value in hint, f"hint must state the real tool's signal enum value {value!r}"

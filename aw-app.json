@@ -321,7 +321,7 @@
                   "signal",
                   "limit"
                 ],
-                "hint": "which log/trace attributes exist; call before filtering on workspace-specific fields"
+                "hint": "signal must be one of \"metrics\", \"traces\", \"logs\" (the tool rejects any other value); which log/trace attributes exist; call before filtering on workspace-specific fields"
               },
               "signoz_get_field_values": {
                 "args": [
@@ -330,7 +330,7 @@
                   "searchText",
                   "limit"
                 ],
-                "hint": "real values of one attribute, e.g. actual service names"
+                "hint": "signal must be one of \"metrics\", \"traces\", \"logs\" (the tool rejects any other value); real values of one attribute, e.g. actual service names"
               }
             },
             "probe": {

@@ -215,6 +215,53 @@ def test_forward_negative_cache_short_circuits():
     assert len(_FakeForwardAsyncClient._CALLS) == 1  # no second network call
 
 
+def test_forward_negative_cache_is_scoped_per_tool_not_per_upstream():
+    """bug:signoz-nl-adapter-invalid-signal-poisons-whole-source — a
+    transport failure on one tool must never serve a cached "unavailable"
+    to a sibling tool on the same upstream that was never attempted."""
+    _FakeForwardAsyncClient._QUEUE.append(httpx.ConnectError("refused"))
+    first = _run(forwarding.forward("codegraph", "codegraph_explore", {"query": "x"}))
+    assert first["status"] == "unavailable"
+    assert len(_FakeForwardAsyncClient._CALLS) == 1
+
+    _FakeForwardAsyncClient._QUEUE.append(_ok_tools_call("codegraph is up"))
+    second = _run(forwarding.forward("codegraph", "codegraph_status", {}))
+    assert second["status"] == "ok", (
+        "codegraph_status was never attempted and must not be served "
+        "codegraph_explore's cached failure"
+    )
+    assert len(_FakeForwardAsyncClient._CALLS) == 2  # the second call really dialed out
+
+
+def test_forward_tool_level_error_does_not_poison_the_cache():
+    """A tool-side `isError` rejection proves the source IS reachable — a
+    response was received — so it must not populate the negative probe
+    cache the way a genuine transport failure does. A same-tool retry
+    (the model self-correcting) must reach the network again, not be served
+    a stale cached failure."""
+    _FakeForwardAsyncClient._QUEUE.append(_error_tools_call('"query" is required'))
+    first = _run(forwarding.forward("codegraph", "codegraph_explore", {"query": "x"}))
+    assert first["status"] == "unavailable"
+    assert first.get("transport_error") is False
+    assert len(_FakeForwardAsyncClient._CALLS) == 1
+
+    _FakeForwardAsyncClient._QUEUE.append(_ok_tools_call("fixed"))
+    second = _run(forwarding.forward("codegraph", "codegraph_explore", {"query": "y"}))
+    assert second["status"] == "ok"
+    assert len(_FakeForwardAsyncClient._CALLS) == 2  # retry really dialed out, not cache-served
+
+
+def test_forward_transport_failure_carries_no_transport_error_false_flag():
+    """The flip side of the above: a genuine transport failure (never
+    reached the tool at all) keeps the default — ``transport_error`` is
+    absent/true — so callers that only check for an explicit ``False`` (the
+    correctable case) still treat this as terminal."""
+    _FakeForwardAsyncClient._QUEUE.append(httpx.ConnectError("refused"))
+    result = _run(forwarding.forward("codegraph", "codegraph_explore", {"query": "x"}))
+    assert result["status"] == "unavailable"
+    assert result.get("transport_error") is not False
+
+
 def test_forward_oversized_argument_rejected():
     result = _run(forwarding.forward("codegraph", "codegraph_explore", {"query": "x" * 2001}))
     assert result["status"] == "unavailable"

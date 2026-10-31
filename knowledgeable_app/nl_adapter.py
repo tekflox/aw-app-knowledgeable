@@ -309,17 +309,33 @@ def _allowlist_violation(entry: dict, tool: str, args: dict) -> bool:
     """Would ``forward()`` have rejected this call on the allow-list, before
     reaching any transport at all?
 
-    This is how a *correction signal* is told apart from a *terminal transport
-    failure*, both of which arrive as the same ``{status: "unavailable",
-    reason}`` envelope. The distinction matters because of the negative probe
-    cache: one transport failure populates it for ``ttl_fail_s`` (15s on
-    signoz), so every subsequent round would get an instant cached
-    "unavailable" and the adapter would spin its whole budget against a cache
-    rather than a source (§9.2). A transport failure is therefore terminal.
+    This is one of two ways a *correction signal* is told apart from a
+    *terminal transport failure* (the other is ``result["transport_error"]``
+    — see ``forward()`` and the call site in :func:`solve`), both of which
+    arrive as the same ``{status: "unavailable", reason}`` envelope. The
+    distinction matters because of the negative probe cache: a genuine
+    transport failure populates it for ``ttl_fail_s`` (15s on signoz), so
+    every subsequent round would get an instant cached "unavailable" and the
+    adapter would spin its whole budget against a cache rather than a source
+    (§9.2). A transport failure is therefore terminal; an allow-list
+    rejection never even reached the transport, so it is always safe to
+    retry.
 
     Deliberately predicated on the entry's own declaration rather than on
     matching ``forward()``'s reason strings: the registry is the single source
     of truth, and a reworded reason must not silently reclassify a failure.
+
+    What this function does NOT cover (by design, not oversight): a tool-side
+    parameter-VALUE rejection — the key was allow-listed, the value was
+    wrong, and the real tool said so via its own ``isError`` text. That is
+    also correctable (the model can read the tool's own error and retry with
+    a fixed value), but it is not an allow-list matter, so it is classified
+    separately in :func:`solve` from ``forward()``'s structural
+    ``transport_error`` flag rather than folded into this check
+    (bug:signoz-nl-adapter-invalid-signal-poisons-whole-source) — and
+    ``forward()`` deliberately does NOT populate the negative probe cache for
+    it either, since a response was received at all, which is itself proof
+    the source is up.
     """
     tool_cfg = (entry.get("tools") or {}).get(tool)
     if tool_cfg is None:
@@ -626,13 +642,22 @@ async def solve(entry: dict, *, query: str, code_query: str = "") -> dict[str, A
 
             if not ok:
                 reason = str(result.get("reason") or "unavailable")
-                if not _allowlist_violation(entry, tool, args):
+                if _allowlist_violation(entry, tool, args):
+                    feedback = f"REJECTED by the allow-list for `{tool}`: {reason}"
+                elif result.get("transport_error") is False:
+                    # The key was allow-listed and the call reached the tool
+                    # — this is the upstream's own parameter-VALUE rejection
+                    # (e.g. an enum check), not a connectivity problem, so
+                    # it is just as correctable as an allow-list violation
+                    # (§_allowlist_violation's docstring). forward() already
+                    # declined to poison the negative probe cache for it.
+                    feedback = f"REJECTED by `{tool}` itself: {reason}"
+                else:
                     return _unavailable(
                         f"transport failure calling {tool} on {source_id}: {reason} — "
                         "terminal for this call, the negative probe cache would serve it "
                         "to every remaining round"
                     )
-                feedback = f"REJECTED by the allow-list for `{tool}`: {reason}"
             else:
                 body = str(result.get("result") or "")
                 if len(body) > MAX_FED_BACK_CHARS:

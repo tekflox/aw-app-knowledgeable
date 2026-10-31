@@ -45,6 +45,16 @@ no separate pre-flight check). ``status_block()`` is the one place that
 e.g. ``codegraph_status``) for ``GET /status`` operator visibility, sharing
 the same per-worker cache.
 
+The negative cache is scoped per ``(upstream_id, tool)``, not per upstream
+(since 2026-10-31,
+bug:signoz-nl-adapter-invalid-signal-poisons-whole-source): one tool
+failing must never serve a cached "unavailable" to a sibling tool on the
+same source that was never attempted. It is also populated only for a
+genuine transport/connectivity failure — a tool-side parameter-VALUE
+rejection (the far side's own ``isError`` text) proves the source IS
+reachable and is cached *positive* instead, so a caller's corrected retry
+of that same tool is never blocked by its own prior mistake.
+
 Per-worker cache only (no cross-worker state, design §4/§12 — 5 workers, 5
 ``activate()``s): worst case is 5 probes/min, acceptable for a cache.
 """
@@ -75,8 +85,14 @@ MAX_RESULT_CHARS = 32_000
 
 _config_resolver: Callable[[], dict] = lambda: {}
 
-#: Per-worker availability cache: upstream_id -> (ok, reason, checked_at).
-_availability_cache: dict[str, tuple[bool, str | None, float]] = {}
+#: Per-worker availability cache: (upstream_id, tool) -> (ok, reason,
+#: checked_at). Scoped by tool, not just upstream, since 2026-10-31
+#: (bug:signoz-nl-adapter-invalid-signal-poisons-whole-source): one tool
+#: failing must never serve a cached "unavailable" to a sibling tool on the
+#: same source that was never even attempted — see :func:`forward`'s cache
+#: population for the other half of that fix (a tool-side value rejection
+#: does not populate this negatively at all).
+_availability_cache: dict[tuple[str, str], tuple[bool, str | None, float]] = {}
 
 #: docs/design/knowledgeable-knowledge-sources-registry.md §4b — which
 #: allow-listed tool answers a generic natural-language query for an
@@ -232,12 +248,23 @@ def _extract_text(result: dict) -> str:
     return "\n".join(parts) if parts else json.dumps(result, ensure_ascii=False)
 
 
-async def _call_mcp(app_slug: str, tool: str, args: dict, timeout_s: float) -> tuple[dict | None, str | None]:
+async def _call_mcp(
+    app_slug: str, tool: str, args: dict, timeout_s: float,
+) -> tuple[dict | None, str | None, bool]:
     """One loopback ``tools/call`` against an installed app's own ``/mcp``
-    route. Never raises — every failure mode becomes ``(None, reason)`` so a
-    caller never has to guess which exceptions are possible (design's "never
-    a 500" rule, same as ``http_handler.handle_request``'s own last-resort
-    catch)."""
+    route. Never raises — every failure mode becomes ``(None, reason,
+    is_tool_error)`` so a caller never has to guess which exceptions are
+    possible (design's "never a 500" rule, same as
+    ``http_handler.handle_request``'s own last-resort catch).
+
+    ``is_tool_error`` is ``True`` only for the ``isError`` branch below — a
+    response was actually received from the tool, so the source IS
+    reachable; the tool itself rejected the call (e.g. a bad argument
+    value). Every other failure here never got a response at all and is a
+    genuine transport/availability problem. See :func:`forward` for why
+    this distinction, not just the reason string, is what the negative
+    probe cache and the NL adapter's terminal-vs-correctable classification
+    key off (bug:signoz-nl-adapter-invalid-signal-poisons-whole-source)."""
     url = f"http://127.0.0.1:{_aw_port()}/api/apps/{app_slug}/mcp"
     body = {
         "jsonrpc": "2.0",
@@ -250,26 +277,26 @@ async def _call_mcp(app_slug: str, tool: str, args: dict, timeout_s: float) -> t
         async with httpx.AsyncClient(timeout=timeout_s) as http_client:
             resp = await http_client.post(url, json=body, headers=headers)
     except httpx.TimeoutException:
-        return None, f"timed out after {timeout_s:g}s"
+        return None, f"timed out after {timeout_s:g}s", False
     except httpx.HTTPError as exc:
-        return None, f"{app_slug} app not installed or not responding: {exc}"
+        return None, f"{app_slug} app not installed or not responding: {exc}", False
     except Exception as exc:  # noqa: BLE001 — last resort, must not 500 the route
-        return None, f"{app_slug} app not installed or not responding: {exc}"
+        return None, f"{app_slug} app not installed or not responding: {exc}", False
 
     if resp.status_code >= 400:
-        return None, f"{app_slug} app not installed or not responding: HTTP {resp.status_code}"
+        return None, f"{app_slug} app not installed or not responding: HTTP {resp.status_code}", False
     try:
         data = resp.json()
     except ValueError:
-        return None, f"{app_slug} returned a non-JSON response"
+        return None, f"{app_slug} returned a non-JSON response", False
 
     result = data.get("result")
     if result is None:
         err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        return None, err or "unknown error"
+        return None, err or "unknown error", False
     if result.get("isError"):
-        return None, _extract_text(result) or f"{tool} failed"
-    return result, None
+        return None, _extract_text(result) or f"{tool} failed", True
+    return result, None, False
 
 
 def _apps_root() -> str:
@@ -350,9 +377,12 @@ def _parse_declared_body(resp: Any) -> tuple[dict | None, str | None]:
 
 async def _call_declared(
     app_slug: str, server: str, tool: str, args: dict, timeout_s: float,
-) -> tuple[dict | None, str | None]:
+) -> tuple[dict | None, str | None, bool]:
     """One ``tools/call`` against an app's own declared streamable-HTTP MCP
     endpoint, including the handshake that endpoint requires.
+
+    Returns ``(result, reason, is_tool_error)`` — see :func:`_call_mcp` for
+    what ``is_tool_error`` means and why it matters.
 
     The far side is a real MCP-SDK server (``signoz/signoz-mcp-server``),
     which rejects a bare ``tools/call`` POST: the sequence is ``initialize``
@@ -368,14 +398,14 @@ async def _call_declared(
     session-collision incident, ``upstream.py:113-115``, is the argument
     against getting clever here).
 
-    Never raises: every failure mode becomes ``(None, reason)``, same rule
-    as :func:`_call_mcp`. The headers are **exactly** the app's declared
-    ones plus content negotiation — ``AW_WORKSPACE_API_KEY`` is never
-    attached on this transport.
+    Never raises: every failure mode becomes ``(None, reason, False)``, same
+    rule as :func:`_call_mcp`. The headers are **exactly** the app's
+    declared ones plus content negotiation — ``AW_WORKSPACE_API_KEY`` is
+    never attached on this transport.
     """
     spec, reason = _declared_server(app_slug, server)
     if spec is None:
-        return None, reason
+        return None, reason, False
 
     label = f"{app_slug}/{server}"
     url = spec["url"]
@@ -396,14 +426,14 @@ async def _call_declared(
                     },
                 }, headers=headers)
                 if resp.status_code >= 400:
-                    return None, f"{label} initialize failed: HTTP {resp.status_code}"
+                    return None, f"{label} initialize failed: HTTP {resp.status_code}", False
                 init, parse_err = _parse_declared_body(resp)
                 if parse_err:
-                    return None, f"{label} {parse_err}"
+                    return None, f"{label} {parse_err}", False
                 init_err = (init or {}).get("error") if isinstance(init, dict) else None
                 if init_err:
                     msg = (init_err or {}).get("message") or "unknown error"
-                    return None, f"{label} initialize failed: {msg}"
+                    return None, f"{label} initialize failed: {msg}", False
                 session_id = resp.headers.get("mcp-session-id")
                 if session_id:
                     headers = {**headers, "Mcp-Session-Id": session_id}
@@ -421,35 +451,37 @@ async def _call_declared(
                     "params": {"name": tool, "arguments": args},
                 }, headers=headers)
                 if resp.status_code >= 400:
-                    return None, f"{label} not responding: HTTP {resp.status_code}"
+                    return None, f"{label} not responding: HTTP {resp.status_code}", False
                 data, parse_err = _parse_declared_body(resp)
                 if parse_err:
-                    return None, f"{label} {parse_err}"
+                    return None, f"{label} {parse_err}", False
     except (TimeoutError, httpx.TimeoutException):
-        return None, f"timed out after {timeout_s:g}s"
+        return None, f"timed out after {timeout_s:g}s", False
     except httpx.HTTPError as exc:
-        return None, f"{label} not responding: {exc}"
+        return None, f"{label} not responding: {exc}", False
     except Exception as exc:  # noqa: BLE001 — last resort, must not 500 the route
-        return None, f"{label} not responding: {exc}"
+        return None, f"{label} not responding: {exc}", False
 
     result = data.get("result") if isinstance(data, dict) else None
     if result is None:
         err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-        return None, err or "unknown error"
+        return None, err or "unknown error", False
     if result.get("isError"):
-        return None, _extract_text(result) or f"{tool} failed"
-    return result, None
+        return None, _extract_text(result) or f"{tool} failed", True
+    return result, None, False
 
 
 async def _call_entry(
     entry: dict, tool: str, args: dict, timeout_s: float,
-) -> tuple[dict | None, str | None]:
+) -> tuple[dict | None, str | None, bool]:
     """Transport dispatch — the one place ``transport`` is branched on.
 
     An unknown value is reported **by name** and never falls back to
     ``app-mcp``: that fallback would dial a loopback route a Tier-2 app
     cannot have and then misattribute the 404 as "app not installed",
     which is the exact misdiagnosis this transport exists to end.
+
+    Returns ``(result, reason, is_tool_error)`` — see :func:`_call_mcp`.
     """
     transport = entry.get("transport") or TRANSPORT_APP_MCP
     if transport == TRANSPORT_APP_MCP:
@@ -464,13 +496,14 @@ async def _call_entry(
         return await _call_declared(
             entry.get("app_slug") or "", entry.get("server") or "", tool, args, timeout_s)
     return None, (f"unknown transport '{transport}' for upstream "
-                  f"'{entry.get('id')}' — not forwarded")
+                  f"'{entry.get('id')}' — not forwarded"), False
 
 
-def _cache_get(upstream_id: str, probe_cfg: dict) -> tuple[bool, str | None] | None:
-    """Fresh cache hit, honouring the success/failure TTLs — ``None`` means
-    "no fresh entry, go probe for real" (design §6's call path)."""
-    cached = _availability_cache.get(upstream_id)
+def _cache_get(upstream_id: str, tool: str, probe_cfg: dict) -> tuple[bool, str | None] | None:
+    """Fresh cache hit for this ``(upstream_id, tool)`` pair, honouring the
+    success/failure TTLs — ``None`` means "no fresh entry, go probe for
+    real" (design §6's call path)."""
+    cached = _availability_cache.get((upstream_id, tool))
     if cached is None:
         return None
     ok, reason, checked_at = cached
@@ -480,19 +513,36 @@ def _cache_get(upstream_id: str, probe_cfg: dict) -> tuple[bool, str | None] | N
     return None
 
 
-def _cache_put(upstream_id: str, ok: bool, reason: str | None) -> None:
-    _availability_cache[upstream_id] = (ok, reason, time.time())
+def _cache_put(upstream_id: str, tool: str, ok: bool, reason: str | None) -> None:
+    _availability_cache[(upstream_id, tool)] = (ok, reason, time.time())
 
 
 async def forward(upstream_id: str, tool: str, args: dict) -> dict[str, Any]:
     """Enforce the allow-list, then perform the forwarded call — the call
     itself is the availability probe (design §6). Returns
     ``{status: "ok", result, elapsed_ms[, truncated]}`` or
-    ``{status: "unavailable", reason, elapsed_ms}``, never raises."""
+    ``{status: "unavailable", reason, elapsed_ms[, transport_error]}``,
+    never raises.
+
+    ``transport_error`` is omitted (truthy default) for a genuine
+    connectivity/availability failure — the kind the negative probe cache
+    exists for. It is explicitly ``False`` for a tool-side parameter-VALUE
+    rejection (the upstream's own ``isError`` text): a response was
+    received, so the source IS reachable, this one call's arguments were
+    just wrong. Callers (``nl_adapter``'s round loop) use this to tell a
+    correctable mistake from a terminal one, instead of guessing from the
+    reason string (bug:signoz-nl-adapter-invalid-signal-poisons-whole-source).
+    """
     start = time.monotonic()
 
-    def _unavailable(reason: str) -> dict[str, Any]:
-        return {"status": "unavailable", "reason": reason, "elapsed_ms": int((time.monotonic() - start) * 1000)}
+    def _unavailable(reason: str, *, transport_error: bool = True) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "status": "unavailable", "reason": reason,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+        }
+        if not transport_error:
+            out["transport_error"] = False
+        return out
 
     entry = _find_upstream(upstream_id)
     if entry is None:
@@ -514,17 +564,25 @@ async def forward(upstream_id: str, tool: str, args: dict) -> dict[str, Any]:
         return _unavailable(f"argument(s) exceed {MAX_ARG_CHARS} chars: {', '.join(oversized)}")
 
     probe_cfg = entry.get("probe") or {}
-    cached = _cache_get(upstream_id, probe_cfg)
+    cached = _cache_get(upstream_id, tool, probe_cfg)
     if cached is not None and not cached[0]:
         return _unavailable(cached[1] or "unavailable")
 
     timeout_s = min(20.0, float(entry.get("timeout_s", 10)))
-    result, err = await _call_entry(entry, tool, args, timeout_s)
+    result, err, is_tool_error = await _call_entry(entry, tool, args, timeout_s)
     if err:
-        _cache_put(upstream_id, False, err)
-        return _unavailable(err)
+        if is_tool_error:
+            # The call reached the tool and got a response — proof the
+            # source is up, not evidence it's down. Cache it positive so a
+            # same-tool retry with corrected arguments (the whole point of
+            # feeding this back as correctable) is never served a stale
+            # negative entry for the tool it is about to fix.
+            _cache_put(upstream_id, tool, True, None)
+        else:
+            _cache_put(upstream_id, tool, False, err)
+        return _unavailable(err, transport_error=not is_tool_error)
 
-    _cache_put(upstream_id, True, None)
+    _cache_put(upstream_id, tool, True, None)
     text = _extract_text(result)
     out: dict[str, Any] = {"status": "ok", "result": text, "elapsed_ms": int((time.monotonic() - start) * 1000)}
     if len(text) > MAX_RESULT_CHARS:
@@ -549,18 +607,18 @@ async def status_block() -> list[dict[str, Any]]:
     async def _row(entry: dict) -> dict[str, Any]:
         upstream_id = entry["id"]
         probe_cfg = entry.get("probe") or {}
-        cached = _cache_get(upstream_id, probe_cfg)
+        tool = probe_cfg.get("tool") or "status"
+        cached = _cache_get(upstream_id, tool, probe_cfg)
         if cached is not None:
             ok, reason = cached
-            checked_at = _availability_cache[upstream_id][2]
+            checked_at = _availability_cache[(upstream_id, tool)][2]
         else:
-            tool = probe_cfg.get("tool") or "status"
             timeout_s = float(probe_cfg.get("timeout_s", 5))
-            _, err = await _call_entry(entry, tool, {}, timeout_s)
+            _, err, _is_tool_error = await _call_entry(entry, tool, {}, timeout_s)
             ok = err is None
             reason = err
             checked_at = time.time()
-            _cache_put(upstream_id, ok, reason)
+            _cache_put(upstream_id, tool, ok, reason)
         return {"id": upstream_id, "available": ok, "checked_at": checked_at, "reason": reason}
 
     return list(await asyncio.gather(*(_row(entry) for entry in _registry())))

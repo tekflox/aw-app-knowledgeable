@@ -695,6 +695,62 @@ def test_an_oversized_argument_is_a_correction_not_a_terminal_failure(monkeypatc
     assert "exceed 2000 chars" in chat[1]["messages"][-1]["content"]
 
 
+def test_a_tool_side_value_rejection_is_fed_back_as_a_correction_and_retried(monkeypatch):
+    """bug:signoz-nl-adapter-invalid-signal-poisons-whole-source — the key
+    (`timeRange`) IS allow-listed, so this is not an allow-list violation;
+    the real tool's own schema rejected the *value*. forward() signals this
+    structurally with `transport_error: False` (a response was received, the
+    source is up), and that alone — not a reworded reason string — is what
+    makes the adapter treat it as correctable instead of ending the call."""
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_list_services", timeRange="last day"),
+        _action("signoz_list_services", timeRange="24h"),
+        _final("two services, both healthy"),
+    ])
+    _script_forward(monkeypatch, [
+        {"status": "unavailable",
+         "reason": 'Parameter validation failed: "timeRange" must be a duration like "24h"',
+         "elapsed_ms": 5, "transport_error": False},
+        {"status": "ok", "result": "aw-knowledgeable\naw-backend", "elapsed_ms": 20},
+    ])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="which services exist?"))
+
+    assert out["status"] == "ok"
+    assert out["result"].startswith("two services, both healthy")
+    assert out["adapter"]["tool_calls"] == [
+        {"tool": "signoz_list_services", "ok": False},
+        {"tool": "signoz_list_services", "ok": True},
+    ]
+    feedback = chat[1]["messages"][-1]["content"]
+    assert "REJECTED by `signoz_list_services` itself" in feedback
+    assert 'must be a duration like "24h"' in feedback
+
+
+def test_a_tool_side_value_rejection_without_the_flag_still_ends_the_call(monkeypatch):
+    """The structural signal is required, not inferred from wording: a
+    failure that reads exactly like a parameter-validation message but
+    carries no `transport_error: False` (e.g. an older forwarding.py, or a
+    transport failure that merely happens to mention "must be") stays
+    terminal — guessing from the reason string is the thing §9.2's design
+    intent explicitly rejects."""
+    chat = _script_chat(monkeypatch, [
+        _action("signoz_list_services", timeRange="last day"),
+        _final("should never be asked for"),
+    ])
+    _script_forward(monkeypatch, [
+        {"status": "unavailable",
+         "reason": 'Parameter validation failed: "timeRange" must be a duration like "24h"',
+         "elapsed_ms": 5},
+    ])
+
+    out = _run(nl_adapter.solve(SIGNOZ_ENTRY, query="x"))
+
+    assert out["status"] == "unavailable"
+    assert "transport failure calling signoz_list_services on signoz" in out["reason"]
+    assert len(chat) == 1
+
+
 def test_a_transport_failure_is_terminal_for_the_whole_call(monkeypatch):
     """§9.2 — one transport failure populates the negative probe cache for
     ``ttl_fail_s`` (15s on signoz), so every remaining round would get an
