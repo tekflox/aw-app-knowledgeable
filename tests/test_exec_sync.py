@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1425,9 +1426,16 @@ def test_free_disk_bytes_measures_the_host_mounted_workspace_tree():
     """The probe path has to be the host-mounted tree, not `/` (a container
     overlay in some topologies here) and not the Neo4j data dir, which this
     process cannot see at all — it never speaks Bolt and has no mount into
-    that container (§4)."""
+    that container (§4).
+
+    The constant is pinned here; the success path below is exercised against
+    a directory guaranteed to exist everywhere this suite runs instead of the
+    pinned path itself — `/opt/aw-workspace` exists inside the workspace
+    container this app is developed in, but not on a CI runner, which is
+    exactly the "test that could only be green here" trap this file's own
+    conftest.py guards against for a different path (`_apps_root`)."""
     assert exec_sync._DISK_PROBE_PATH == "/opt/aw-workspace"
-    free, err = exec_sync.free_disk_bytes()
+    free, err = exec_sync.free_disk_bytes(tempfile.gettempdir())
     assert err is None, err
     assert isinstance(free, int) and free > 0
 
