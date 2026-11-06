@@ -35,6 +35,12 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Least-privilege: this job only checks out code and runs pytest, so it
+    # never needs more than read access — scoped explicitly rather than
+    # inheriting the repo/org default GITHUB_TOKEN permissions, same
+    # discipline code-review.yml/ai-review.yml already apply in this PR.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -63,6 +69,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
