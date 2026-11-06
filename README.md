@@ -102,3 +102,7 @@ silence is degraded, not healthy. Rollback is `POST /api/exec/wipe` on
 aw-knowledgeable (one batched, label-scoped delete); Postgres is the system of
 record, so the projection is always rebuildable and never the thing to repair
 by hand.
+
+<!-- aw-app-* fleet CI/PR migration (Batch 6) — follow-up no-op PR proving the
+     comment (/aw-review) and workflow_run merge paths now that code-review.yml
+     exists on the default branch. Knowledgeable connector app — CI/PR migration follow-up (Batch 6). -->
