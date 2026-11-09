@@ -108,6 +108,9 @@ _REPRESENTATIVE_SHAPES = {
     "knowledge_base_git_token": {
         "provider-token": "ghp_" + "Fk9Tn2Rm7Qz4Xc1LWb6Yd3Hp",
     },
+    "aw_devteam_merge_token_classic": {
+        "provider-token": "ghp_" + "Rv8Qn3Km5Pz1Yc7LWb2Xd9Hs",
+    },
     "knowledgeable-explorer-apmt-key": {
         "authorization-header": "Authorization: Bearer invented-registry-test-apmt-key-explorer",
         "env-assignment": (
@@ -142,6 +145,12 @@ _REPRESENTATIVE_SHAPES = {
         ),
         "env-assignment": (
             "KNOWLEDGEABLE_PLAYGROUND_APMT_KEY=invented-registry-test-apmt-key-playground"
+        ),
+    },
+    "knowledgeable-apmt-search-key": {
+        "secret-header": "X-Knowledgeable-Api-Key: invented-registry-test-apmt-search-key",
+        "env-assignment": (
+            "KNOWLEDGEABLE_READ_API_KEY=invented-registry-test-apmt-search-key"
         ),
     },
     "mac_home_vnc_password": {
