@@ -96,6 +96,16 @@ VAULT_COVERAGE_REGISTRY: dict[str, tuple[str, ...]] = {
     # Classic GitHub PAT (`ghp_…`) — `provider-token` matches the literal
     # prefix with no context needed.
     "knowledge_base_git_token": ("provider-token",),
+    # Second classic GitHub PAT (`list_secrets` description confirms the
+    # `ghp_…` shape: "Classic GitHub PAT (fredericowu, scopes: repo +
+    # workflow)"), minted for the Dev Team PR-first merge rollout. Pushed into
+    # each rollout repo's GH Actions secrets and read by
+    # aw-shared-workflows/.github/workflows/code-review-reusable.yml as
+    # `GH_TOKEN`/`MERGE_TOKEN` for the squash-merge step. Same reasoning as
+    # `knowledge_base_git_token` above: the literal `ghp_…` prefix is the
+    # shape, so `provider-token` matches it with no context needed, whether it
+    # surfaces as an env assignment, a `gh`/`git` auth header, or a bare echo.
+    "aw_devteam_merge_token_classic": ("provider-token",),
     # AP-MT scoped API keys: pushed into an app's own config and used as a
     # Bearer credential against AP-MT's OpenAI-compatible API — caught by
     # `authorization-header` when sent, `env-assignment` when configured.
@@ -109,6 +119,16 @@ VAULT_COVERAGE_REGISTRY: dict[str, tuple[str, ...]] = {
     # it: a Bearer credential when sent, a `…_KEY=` assignment when configured.
     "knowledgeable-nl-adapter-apmt-key": ("authorization-header", "env-assignment"),
     "knowledgeable-playground-apmt-key": ("authorization-header", "env-assignment"),
+    # NOT a sibling of the `knowledgeable-*-apmt-key` family above despite the
+    # name — `list_secrets`' own description and both consumers
+    # (agents-platform-multitenant's `knowledge.search` tool,
+    # aw-knowledgeable's `identity.py::has_valid_knowledgeable_read_api_key`)
+    # confirm it travels as a custom `X-Knowledgeable-Api-Key` header, never an
+    # `Authorization: Bearer …` one — so `secret-header` is the matching
+    # family, not `authorization-header`. `env-assignment` covers it
+    # configured either side: `KNOWLEDGEABLE_READ_API_KEY=` on aw-knowledgeable,
+    # `AGENTS_KNOWLEDGEABLE_API_KEY=` on agents-platform-multitenant.
+    "knowledgeable-apmt-search-key": ("secret-header", "env-assignment"),
     # VNC password with no shape of its own, caught by `env-assignment` on a
     # `…VNC_PASSWORD=`-style name.
     "mac_home_vnc_password": ("env-assignment",),
